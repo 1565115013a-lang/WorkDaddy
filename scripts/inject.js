@@ -145,7 +145,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var c = a && a.checkin;
     if (!c) return '<span class="wbs-ck pending">正在领取中</span>';
     if (c.ok) return '<span class="wbs-ck ok">' + (c.already ? '今日已签 ✓' : '已领取 ✓') + '</span>';
-    return '<span class="wbs-ck fail">' + (c.message || '失败') + '</span>';
+    // 认证类错误（401/未授权）统一显示友好文案（daemon 已产出，缓存残留旧文案时兜底）
+    var msg = c.message || '失败';
+    if (/401|Unauthorized|未授权|登录身份过期/.test(msg)) msg = '登录身份过期';
+    return '<span class="wbs-ck fail">' + msg + '</span>';
   }
 
   function el(tag, cls, html) {
@@ -517,7 +520,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '</div>',
       '<div class="wbs-panel">',
       '<div class="wbs-head">',
+      '<div class="wbs-head-left">',
       '<div class="wbs-title" id="wbs-title" title="连续点击 5 次呼出元素检查">WorkDaddy</div>',
+      '<a class="wbs-ghbtn" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" title="GitHub 仓库">',
+      '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>',
+      '</a>',
+      '</div>',
       '<button class="wbs-btn-close" type="button" data-act="close">✕</button>',
       '</div>',
       '<div class="wbs-tabs">',
@@ -614,10 +622,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function removeStash() {
       stashBtn.style.display = 'none';
     }
+    // 是否在欢迎页（wb-home-page 或 main-content--welcome 存在即欢迎页）：
+    // 用户要求欢迎页不展示暂存提示词按钮（欢迎页输入框只是快速提问入口，不需要暂存）。
+    function isWelcomePage() {
+      try {
+        return !!(document.querySelector('.wb-home-page') || document.querySelector('.main-content--welcome'));
+      } catch (_) { return false; }
+    }
     // 是否该显示暂存按钮：直接看真正输入框是否有内容（修后 findComposer 不再误命中消息历史）。
     // WorkBuddy v5.3.8：空输入框下官方发送按钮 DOM 上不显式设置 disabled / is-disabled，
     // 显隐完全由「输入框是否有内容」决定，isSendDisabled 在空状态下检测不到。
+    // 欢迎页一律不显示。
     function shouldShowStash() {
+      if (isWelcomePage()) return false;
       var ed = findComposer();
       return composerHasContent(ed);
     }
@@ -627,6 +644,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       clearTimeout(stashSyncThrottle);
       // 节流 30ms：比 120ms 响应更快（接近原生 React 按钮的体感），仍能合并快速连续触发
       stashSyncThrottle = setBuildTimeout(function () {
+        // 欢迎页强制隐藏（进入欢迎页/切回欢迎页时兜底，避免上一会话残留按钮）
+        if (isWelcomePage()) { stashBtn.style.display = 'none'; return; }
         if (shouldShowStash()) {
           insertStash();
           stashBtn.style.display = 'flex';
@@ -682,6 +701,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       guardSessionChange();
       scheduleFabPos();
       watchRow();
+      syncStash(); // 页面切换（欢迎页↔聊天页）后立即重算暂存按钮显隐
       if (!findActionRow()) return;
       watchSend();
       syncQueueTags();
@@ -781,6 +801,37 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 轮询兜底：queue 显隐 / 输入框高度变化可能漏触发 observer
     fabPosTimer = setBuildInterval(function () { if (alive) scheduleFabPos(); }, 1500);
     setBuildTimeout(scheduleFabPos, 600); // 首屏定位
+
+    // ===== chat widget 预览 iframe 背景透明（用户要求）=====
+    // 场景：AI 生成的 widget（_widgetRendererWrapper/_widgetContainer 内的 iframe）在深色主题下
+    // 自带黑底，与毛玻璃主题不协调；且元素拾取器无法进入 iframe 内部定位样式来源。
+    // 两层兜底：
+    //  1) iframe 元素级背景透明 —— 由 theme-patches.js 的 CSS 补丁处理（html[data-theme="dark"]）；
+    //  2) 本 JS 对同源 iframe（srcdoc/blob，contentDocument 可访问）注入 html,body 透明样式，
+    //     覆盖 iframe 内部文档自带的黑底（跨域 iframe 无法注入内部，仅靠元素级 CSS）。
+    var WIDGET_IFRAME_STYLE_ID = 'wbs-iframe-transparent';
+    function fixWidgetIframeBg() {
+      if (!alive) return;
+      try {
+        var h = document.documentElement;
+        var dark = h && (h.getAttribute('data-theme') === 'dark' || h.classList.contains('cb-dark'));
+        if (!dark) return; // 仅深色主题需要处理（浅色下 widget 保持自身渲染）
+        var frames = document.querySelectorAll('[class*="_widgetRendererWrapper_"] iframe,[class*="_widgetContainer_"] iframe');
+        for (var i = 0; i < frames.length; i++) {
+          try {
+            var doc = frames[i].contentDocument;
+            if (!doc || !doc.documentElement) continue;
+            if (doc.getElementById(WIDGET_IFRAME_STYLE_ID)) continue;
+            var st = doc.createElement('style');
+            st.id = WIDGET_IFRAME_STYLE_ID;
+            st.textContent = 'html,body{background:transparent !important;background-color:transparent !important;}';
+            (doc.head || doc.documentElement).appendChild(st);
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    setBuildInterval(fixWidgetIframeBg, 1500);
+    setBuildTimeout(fixWidgetIframeBg, 800);
 
     // ===== 暂存提示词：优先入队到 WorkBuddy 的 message queue（完整富文本 + 暂停自动发送）=====
     // 通过 React fiber 提取 adapter（含 enqueueConversationMessageQueueItem / pauseConversationMessageQueue）。
@@ -2270,19 +2321,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // ===== 主题系统（WorkDaddy 换肤）：segmented 切换 =====
     // 主题 = CSS 变量覆盖（--wb-* / --dc-*），daemon 通过 CDP 注入 <style>。
     // 只提供两个入口：官方主题(default) 与 WorkDaddy 官方主题(nebula)，其余自定义主题不展示
+    // 默认选中「WorkBuddy 默认主题」(default)：未设置/异常时回退到 default 而非 nebula（用户要求）
     var ALLOWED_THEMES = ['default', 'nebula'];
     function loadThemes() {
       api('/api/themes')
         .then(function (d) {
           var seg = root.querySelector('.wbs-theme-seg');
           if (!seg) return;
-          var cur = d.current && ALLOWED_THEMES.indexOf(d.current) >= 0 ? d.current : 'nebula';
+          var cur = d.current && ALLOWED_THEMES.indexOf(d.current) >= 0 ? d.current : 'default';
           seg.querySelectorAll('.wbs-theme-opt').forEach(function (b) {
             b.classList.toggle('active', b.getAttribute('data-theme') === cur);
           });
-          // 若当前主题不在允许列表（如之前应用了自定义主题），回退到 nebula
-          if (d.current && ALLOWED_THEMES.indexOf(d.current) < 0 && cur === 'nebula') {
-            applyTheme('nebula').catch(function () {});
+          // 若当前主题不在允许列表（如之前应用了自定义主题），回退到默认主题
+          if (d.current && ALLOWED_THEMES.indexOf(d.current) < 0 && cur === 'default') {
+            applyTheme('default').catch(function () {});
           }
         })
         .catch(function () {});
@@ -3315,7 +3367,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-panel{position:absolute;right:0;bottom:0;width:460px;max-height:min(78vh,660px);background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
     '.wbs-panel.show{display:flex}',
     '.wbs-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 12px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 30%,transparent)}',
+    '.wbs-head-left{display:flex;align-items:center;gap:9px;min-width:0}',
     '.wbs-title{font-size:16px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);letter-spacing:.3px;cursor:default;user-select:none}',
+    '.wbs-ghbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;flex-shrink:0;color:var(--wb-icon-tertiary,#999);border-radius:6px;text-decoration:none;transition:color .15s,background .15s}',
+    '.wbs-ghbtn:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
+    '.wbs-ghbtn svg{display:block}',
     '.wbs-btn-close{border:none;background:none;color:var(--wb-icon-tertiary,#999);font-size:16px;cursor:pointer;padding:4px 6px;border-radius:6px;line-height:1}',
     '.wbs-btn-close:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;max-height:calc(min(78vh,660px) - 170px)}',

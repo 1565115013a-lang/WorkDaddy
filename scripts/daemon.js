@@ -61,8 +61,14 @@ const DATA_DIR = defaultDataDir();
 // 1.0.0：正式统一版本号（Info.plist / daemon / dmg 对齐 1.0.0），关于页改单行紧凑布局
 // 1.0.1：自动更新（业界标准链路：GitHub Releases API 检查 → dmg 下载+SHA256 校验 → 辅助脚本替换 → relaunch）
 // 1.0.2：代码块容器 /.cb-markdown-pre-container 毛玻璃 + chat widget 容器毛玻璃 + 表头半透明（theme-patches patch-77/78）
-const DAEMON_VERSION = '1.0.3';
+// 1.0.3：欢迎页隐藏暂存提示词按钮（inject isWelcomePage）；chat widget 预览 iframe 背景透明（patch-80 + inject 同源注入兜底）；
+//       默认主题改为「WorkBuddy 默认主题」（首次初始化/面板回退不再指向 nebula）
+const DAEMON_VERSION = '1.0.4';
 const HOST = '127.0.0.1';
+const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
+// Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
+const WORKDADDY_DIR_WIN = process.env.WBSWITCH_APP_DIR ||
+  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'WorkDaddy');
 const UI_PORT_BASE = parseInt(process.env.WBSWITCH_PORT || '47832', 10);
 let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（被占用时 +1）
 const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
@@ -150,7 +156,13 @@ function checkUpdate(force) {
       updateState.hasUpdate = semverCompare(latest, DAEMON_VERSION) > 0;
       updateState.releaseUrl = rel.html_url || null;
       updateState.notes = (rel.body || '').slice(0, 2000);
-      const asset = (rel.assets || []).find((a) => /\.dmg$/i.test(a.name || ''));
+      // 资产按平台选取：macOS 找 .dmg；Windows 优先官方便携包（-win64.zip），再回退任意 .zip，
+      // 绝不选 Setup.exe（IExpress 自解压包，当 .zip 下载后 Expand-Archive 会失败 → 更新中断）
+      const assets = rel.assets || [];
+      const asset = IS_WIN
+        ? (assets.find((a) => /-win64\.zip$/i.test(a.name || '')) ||
+           assets.find((a) => /\.zip$/i.test(a.name || '')) || null)
+        : (assets.find((a) => /\.dmg$/i.test(a.name || '')) || null);
       updateState.dmgUrl = asset ? asset.browser_download_url : null;
       updateState.dmgSize = asset ? asset.size : 0;
       updateState.checkedAt = Date.now();
@@ -178,11 +190,12 @@ function checkUpdate(force) {
     });
 }
 
-// 下载 dmg（流式写文件，更新 progress），返回本地路径；带 SHA-256 校验
+// 下载安装包（macOS .dmg / Windows .zip），流式写文件更新 progress，带 SHA-256 校验
 function downloadUpdate() {
   if (!updateState.dmgUrl) return Promise.reject(new Error('无可用安装包'));
   fs.mkdirSync(UPDATE_DIR, { recursive: true });
-  const target = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.dmg');
+  const ext = IS_WIN ? '.zip' : '.dmg';
+  const target = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + ext);
   if (fs.existsSync(target)) {
     // 已有同版本文件：直接校验后复用
     const digest = sha256File(target);
@@ -273,19 +286,35 @@ function extractAppFromDmg(dmgPath) {
   });
 }
 
-// 安装：调用独立 apply-update.sh 接管替换（先停 launchd + 杀旧 daemon → 脚本替换 → relaunch）
-// 独立脚本放 scripts/apply-update.sh（可维护），daemon 只需把参数传过去
+// 安装：macOS 调 apply-update.sh（launchctl 停服 → 备份 → 替换 → relaunch）；
+// Windows 调 apply-update.ps1（杀 watchdog/daemon → 释放文件锁 → 替换目录 → 重启）
 function applyUpdate() {
   if (!updateState.downloaded) return Promise.reject(new Error('尚未下载完成'));
+  updateState.status = 'installing';
+  updateState.message = '正在安装新版本…';
+  const { execFile } = require('child_process');
+  if (IS_WIN) {
+    // Windows 安装位置由 install.ps1 铺好（%LOCALAPPDATA%\Programs\WorkDaddy）
+    const scriptPath = path.join(__dirname, 'apply-update.ps1');
+    const appDir = WORKDADDY_DIR_WIN;
+    const srcZip = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.zip');
+    if (!fs.existsSync(scriptPath)) return Promise.reject(new Error('缺少 apply-update.ps1'));
+    if (!fs.existsSync(srcZip)) return Promise.reject(new Error('缺少解压后的新版本包'));
+    log('[update] 执行 apply-update.ps1，daemon 即将退出');
+    const child = require('child_process').spawn(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, srcZip, appDir, String(ACTUAL_PORT)],
+      { detached: true, stdio: 'ignore', windowsHide: true }
+    );
+    child.unref();
+    return Promise.resolve({ ok: true, message: '更新已启动，WorkDaddy 即将重启' });
+  }
   const scriptPath = path.join(__dirname, 'apply-update.sh');
   const appPath = '/Applications/WorkDaddy.app';
   const srcApp = path.join(UPDATE_DIR, 'WorkDaddy.app');
   if (!fs.existsSync(scriptPath)) return Promise.reject(new Error('缺少 apply-update.sh'));
   if (!fs.existsSync(srcApp)) return Promise.reject(new Error('缺少解包后的新应用'));
-  updateState.status = 'installing';
-  updateState.message = '正在安装新版本…';
   // 停掉自身 launchd 服务（KeepAlive 会在新版本启动后接管）
-  const { execFile } = require('child_process');
   execFile('launchctl', ['bootout', 'gui/' + process.getuid(), 'com.workbuddy.workdaddy'], () => {
     execFile('launchctl', ['remove', 'com.workbuddy.workdaddy'], () => {});
   });
@@ -533,12 +562,65 @@ async function reloadWorkBuddyPage() {
   await cdpSend('Page.reload', { ignoreCache: false });
 }
 
-const WORKBUDDY_APP = '/Applications/WorkBuddy.app';
-const WORKBUDDY_BINARY = `${WORKBUDDY_APP}/Contents/MacOS/Electron`;
+const WORKBUDDY_APP = IS_WIN ? '' : '/Applications/WorkBuddy.app';
+const WORKBUDDY_BINARY = IS_WIN ? '' : `${WORKBUDDY_APP}/Contents/MacOS/Electron`;
 
-/** 退出 WorkBuddy（按应用路径精确匹配，不误杀其他 Electron 应用） */
+// Windows：解析 WorkBuddy 可执行文件真实路径（安装盘可自定义，必须动态查）
+// 优先级：WBSWITCH_WORKBUDDY_BIN > 运行进程 Path > 注册表卸载项 > 常见路径
+let wbBinaryCache = null;
+function resolveWorkBuddyBinary() {
+  if (!IS_WIN) return WORKBUDDY_BINARY;
+  if (wbBinaryCache) return wbBinaryCache;
+  const tryFile = (p) => { try { if (p && fs.existsSync(p)) return p; } catch (_) {} return null; };
+  const { execFileSync } = require('child_process');
+  const psCmd = (cmd) => execFileSync('powershell', ['-NoProfile', '-Command', cmd], { encoding: 'utf8', timeout: 8000, windowsHide: true });
+  // 1) 显式指定（launcher/install 传入最可靠）
+  const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
+  if (envBin) return (wbBinaryCache = envBin);
+  // 2) 运行中的 WorkBuddy 进程 Path（最权威：多实例共享同一 exe）
+  try {
+    const out = psCmd('Get-Process WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path');
+    const p = out.trim().split(/\r?\n/).filter(Boolean).pop();
+    const hit = tryFile(p);
+    if (hit) return (wbBinaryCache = hit);
+  } catch (_) {}
+  // 3) 注册表卸载项（DisplayIcon = "D:\xxx\WorkBuddy.exe,0" 取逗号前）
+  try {
+    const out = psCmd("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | Select-Object -First 1 DisplayIcon,InstallLocation | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }");
+    const p = out.trim().split(/\r?\n/).filter(Boolean).pop();
+    const hit = tryFile(p);
+    if (hit) return (wbBinaryCache = hit);
+  } catch (_) {}
+  // 4) 常见路径兜底（含探测机实际安装位）
+  const cands = [
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    'D:\\workbody\\WorkBuddy\\WorkBuddy.exe',
+  ];
+  for (const c of cands) {
+    const hit = tryFile(c);
+    if (hit) return (wbBinaryCache = hit);
+  }
+  return null;
+}
+
+/** 退出 WorkBuddy：macOS 按应用路径精确匹配；Windows 按进程名 taskkill（先优雅 WM_CLOSE，超时强杀） */
 function quitWorkBuddy() {
   return new Promise((resolve) => {
+    if (IS_WIN) {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      const run = (args) => {
+        const p = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
+        p.on('error', finish);
+        p.on('exit', () => setTimeout(finish, 700));
+      };
+      run(['/IM', 'WorkBuddy.exe']);
+      setTimeout(() => { if (!done) run(['/F', '/T', '/IM', 'WorkBuddy.exe']); }, 2500);
+      setTimeout(finish, 8000); // 极端兜底，绝不悬挂
+      return;
+    }
     // 先尝试正常退出（给 Electron 一次处理机会），再强制 kill
     const p1 = spawn('osascript', ['-e', 'tell application "WorkBuddy" to quit'], { stdio: 'ignore' });
     p1.on('error', () => {});
@@ -552,8 +634,9 @@ function quitWorkBuddy() {
   });
 }
 
-/** 探测 WorkDaddy.app 位置（退出登录后打开它，由其 launcher 以 CDP 模式重启 WorkBuddy 并注入组件） */
+/** 探测 WorkDaddy.app 位置（macOS 专用：退出登录后打开它，由其 launcher 以 CDP 模式重启 WorkBuddy 并注入组件） */
 function findWorkDaddyApp() {
+  if (IS_WIN) return null;
   const cands = [
     '/Applications/WorkDaddy.app',
     path.join(os.homedir(), 'Applications', 'WorkDaddy.app'),
@@ -569,9 +652,18 @@ function findWorkDaddyApp() {
   return null;
 }
 
-/** 重新启动 WorkBuddy：优先打开 WorkDaddy.app（其 launcher 自动带 CDP 重启 WorkBuddy + 注入组件），找不到时回退直接启动 WorkBuddy */
+/** 重新启动 WorkBuddy：macOS 优先走 WorkDaddy.app launcher；Windows 直接带 CDP 参数重启 exe */
 function relaunchWorkBuddy() {
   return new Promise((resolve, reject) => {
+    if (IS_WIN) {
+      const bin = resolveWorkBuddyBinary();
+      if (!bin) return reject(new Error('未找到 WorkBuddy.exe（可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定）'));
+      log(`[logout] 以 --remote-debugging-port=9222 重启 WorkBuddy: ${bin}`);
+      const child = spawn(bin, ['--remote-debugging-port=9222'], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.on('error', (e) => reject(e));
+      child.unref();
+      return resolve();
+    }
     const workDaddy = findWorkDaddyApp();
     if (workDaddy) {
       log(`[logout] 正在打开 WorkDaddy (${workDaddy})，由其 launcher 重启 WorkBuddy`);
@@ -775,7 +867,9 @@ async function dailyCheckin(accessToken) {
       const code = o.code;
       const already = code === 10001;
       const ok = already || (r.ok && (code === 0 || code === undefined || code === null));
-      return { ok, already, code, message: o.msg || o.message || (r.ok ? 'ok' : 'HTTP ' + r.status), url };
+      // 401 = token 过期/未授权：直接给友好文案，避免面板显示裸 "HTTP 401"
+      const failMsg = r.status === 401 ? '登录身份过期' : 'HTTP ' + r.status;
+      return { ok, already, code, message: o.msg || o.message || (r.ok ? 'ok' : failMsg), url };
     } catch (e) {
       lastErr = e.message;
     }
@@ -876,7 +970,30 @@ function injectWidget(reason) {
 
 // ===== SESSIONS_API_MARK：会话管理（读 WorkBuddy workbuddy.db）=====
 const SESSIONS_DB = path.join(os.homedir(), '.workbuddy', 'workbuddy.db');
+// Windows：无系统 sqlite3 CLI，优先用 Node 内置 node:sqlite（需 --experimental-sqlite 启动，launcher/install 已统一加）
+let NodeSqlite = null;
+if (IS_WIN) { try { NodeSqlite = require('node:sqlite'); } catch (_) { NodeSqlite = null; } }
+// 输出统一为 "header|header2\nval|val2" 格式，sqliteQuery 的解析两种后端通用
 function sqliteRun(sql) {
+  if (IS_WIN && NodeSqlite) {
+    return new Promise((resolve, reject) => {
+      let db = null;
+      try {
+        db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: true });
+        const rows = db.prepare(sql).all();
+        db.close(); db = null;
+        if (!rows.length) return resolve('');
+        const header = Object.keys(rows[0]).join('|');
+        const lines = rows.map((r) =>
+          Object.values(r).map((v) => (v === null || v === undefined ? '' : String(v))).join('|')
+        );
+        resolve([header].concat(lines).join('\n'));
+      } catch (e) {
+        if (db) { try { db.close(); } catch (_) {} }
+        reject(new Error('sqlite 查询失败: ' + e.message));
+      }
+    });
+  }
   return new Promise((resolve, reject) => {
     const p = spawn('sqlite3', ['-header', SESSIONS_DB], { stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '', err = '';
@@ -1348,11 +1465,11 @@ function initBuiltinAssets() {
       fs.writeFileSync(maskFile, JSON.stringify({ opacity: 0.1 }, null, 2));
       log('[init] 首次初始化：背景蒙版默认 10% -> mask.json');
     }
-    // 4) 默认主题 → nebula（仅当未设置过）
+    // 4) 默认主题 → WorkBuddy 默认主题（仅当未设置过；用户要求默认选中官方浅色，不再默认 nebula）
     const curFile = path.join(DATA_DIR, 'current-theme.json');
     if (!fs.existsSync(curFile)) {
-      fs.writeFileSync(curFile, JSON.stringify({ id: 'nebula', at: new Date().toISOString() }, null, 2));
-      log('[init] 首次初始化：默认主题 -> nebula');
+      fs.writeFileSync(curFile, JSON.stringify({ id: 'default', at: new Date().toISOString() }, null, 2));
+      log('[init] 首次初始化：默认主题 -> WorkBuddy 默认主题（default）');
     }
   } catch (e) {
     log('[init] 首次初始化失败: ' + e.message);
@@ -2720,7 +2837,7 @@ function handleApi(req, res) {
       license: 'AGPL-3.0',
       repository: 'https://github.com/babygoton/WorkDaddy',
       principle: '本机回环 CDP 注入 · 不改官方安装包',
-      platform: 'macOS 11+（Windows 敬请期待）',
+      platform: IS_WIN ? 'Windows 10+（x64）' : 'macOS 11+',
       author: 'WorkDaddy',
       nodeVersion: process.version,
       ...platform,
@@ -2919,7 +3036,11 @@ function handleApi(req, res) {
 
   if (req.method === 'GET' && p === '/api/open-dir') {
     try {
-      require('child_process').execFile('/usr/bin/open', [DATA_DIR]);
+      if (IS_WIN) {
+        require('child_process').execFile('explorer.exe', [DATA_DIR]);
+      } else {
+        require('child_process').execFile('/usr/bin/open', [DATA_DIR]);
+      }
       return json(res, 200, { ok: true });
     } catch (e) {
       return json(res, 500, { ok: false, error: e.message });
@@ -2983,7 +3104,14 @@ function handleApi(req, res) {
 let sleepCaffeinate = null;
 let sleepUserActivity = null; // 防锁屏：caffeinate -u -t 300（UserIsActive 断言，阻止屏保启动/空闲锁屏）
 let sleepUserActivityTimer = null; // -u 断言每 240s 续期一次（-t 300 超时前续期，保持无间隙）
+let sleepPowershell = null; // Windows: 常驻 powershell 进程持有 SetThreadExecutionState
 function stopCaffeinate() {
+  if (IS_WIN) {
+    const c = sleepPowershell;
+    sleepPowershell = null; // 先置 null 再 kill，避免 exit 回调把旧引用覆盖
+    if (c) { try { c.kill(); } catch (_) {} }
+    return;
+  }
   const c = sleepCaffeinate;
   sleepCaffeinate = null; // 先置 null 再 kill，避免旧进程 exit 回调把新引用覆盖
   if (c) { try { c.kill(); } catch (_) {} }
@@ -2999,6 +3127,7 @@ function stopUserActivity() {
 // 系统认为用户一直在操作，屏保与空闲锁屏便不会触发；每 240s 重启一个 -t 300 的断言实现无间隙续期。
 // 无需辅助功能权限（-u 走系统 IOKit 用户活动断言）。
 function startUserActivityLoop() {
+  if (IS_WIN) return; // Windows 无 caffeinate -u 等价；防锁屏由系统电源策略控制
   stopUserActivity();
   const tick = () => {
     if (!sleepCaffeinate) return; // 防休眠已停止（allow 模式），不再续期
@@ -3013,6 +3142,17 @@ function startUserActivityLoop() {
   if (sleepUserActivityTimer.unref) sleepUserActivityTimer.unref();
 }
 function startCaffeinate(displaySleep) {
+  if (IS_WIN) {
+    // Windows：常驻 powershell 循环调用 SetThreadExecutionState。
+    // 0x80000000 ES_CONTINUOUS | 0x1 ES_SYSTEM_REQUIRED | 0x2 ES_DISPLAY_REQUIRED
+    const flags = displaySleep ? '0x80000001' : '0x80000003';
+    const ps = "Add-Type -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint e);' -Name WSleep -Namespace WB -PassThru | Out-Null; while($true){ [WB.WSleep]::SetThreadExecutionState(" + flags + "); Start-Sleep -Seconds 90 }";
+    const child = spawn('powershell', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], { stdio: 'ignore', windowsHide: true });
+    child.on('error', (e) => { log('[sleep] 防休眠进程启动失败: ' + e.message); if (sleepPowershell === child) sleepPowershell = null; });
+    child.on('exit', () => { if (sleepPowershell === child) sleepPowershell = null; });
+    sleepPowershell = child;
+    return child;
+  }
   const child = spawn('caffeinate', displaySleep ? ['-i', '-s', '-m'] : ['-d', '-i', '-s', '-m'], { stdio: 'ignore' });
   child.on('error', (e) => { log('[sleep] caffeinate 启动失败: ' + e.message); if (sleepCaffeinate === child) sleepCaffeinate = null; });
   child.on('exit', () => { if (sleepCaffeinate === child) sleepCaffeinate = null; });
@@ -3024,6 +3164,15 @@ function startCaffeinate(displaySleep) {
 function applySleepMode(mode, displaySleep) {
   const preventing = mode === 'keep' || mode === 'until-done';
   if (preventing) {
+    if (IS_WIN) {
+      // Windows：powershell 持有进程参数固定，无法比较 spawnargs，直接重启（低频操作，代价可接受）
+      stopCaffeinate();
+      try {
+        startCaffeinate(!!displaySleep);
+        log('[sleep] 禁止休眠已开启（Windows，模式=' + mode + (displaySleep ? '，允许显示器休眠' : '，显示器保持唤醒') + '）');
+      } catch (e) { log('[sleep] 开启失败: ' + e.message); return false; }
+      return true;
+    }
     const wantArgs = displaySleep ? '-i-s-m' : '-d-i-s-m';
     const curArgs = sleepCaffeinate ? sleepCaffeinate.spawnargs.slice(1).join('-') : null;
     const wantLock = !displaySleep; // 防锁屏仅在显示器保持唤醒时有效
@@ -3043,6 +3192,13 @@ function applySleepMode(mode, displaySleep) {
 }
 function sleepNow() {
   try {
+    if (IS_WIN) {
+      // Windows：SetSuspendState(Hibernate=0, ForceCritical=0, DisableWakeEvent=0) → 睡眠
+      const c = spawn('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,1,0'], { stdio: 'ignore', windowsHide: true });
+      c.on('error', (e) => log('[sleep] 立即休眠失败: ' + e.message));
+      c.on('exit', () => log('[sleep] 已请求立即休眠（Windows SetSuspendState）'));
+      return true;
+    }
     const c = spawn('pmset', ['sleepnow'], { stdio: 'ignore' });
     c.on('error', (e) => log('[sleep] 立即休眠失败: ' + e.message));
     c.on('exit', () => log('[sleep] 已请求立即休眠'));

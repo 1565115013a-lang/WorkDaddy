@@ -7,7 +7,7 @@
 零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。
 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blueviolet)
-![Platform](https://img.shields.io/badge/platform-macOS%2011%2B-lightgrey)
+![Platform](https://img.shields.io/badge/platform-macOS%2011%2B%20%7C%20Windows%2010%2F11-lightgrey)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518-green)
 
 ---
@@ -33,7 +33,7 @@
 
 ## 安装
 
-### macOS（已支持）
+### macOS
 
 1. 在 [Releases](../../releases) 下载最新 `WorkDaddy-x.y.z.dmg`
 2. 打开 dmg，把 `WorkDaddy.app` 拖进 **应用程序** 文件夹
@@ -46,12 +46,13 @@
 4. 双击 `WorkDaddy.app` 启动：它会自带守护进程并把组件注入到 WorkBuddy 右下角
 5. 看到机器人按钮？**搞定**。
 
-> 守护进程会通过 launchd 登录自启，崩溃自动拉起；完全无感。
+### Windows
 
-### Windows（敬请期待）
+1. 在 [Releases](../../releases) 下载最新 `WorkDaddy-x.y.z-win64.zip`
+2. **解压到桌面以外的文件夹，双击一键安装脚本 `Install-WorkDaddy.cmd`**：
+3. 以后只需**双击桌面 WorkDaddy 图标** 即可手动启动
+4. 回到 WorkBuddy 看到右下角机器人按钮即成功；
 
-> **马上上线。** 当前所有功能基于 Electron 渲染进程 CDP 注入，跨平台移植中。
-> 想第一时间知道？[Watch](../../watchers) 本仓库的 Releases。
 
 ### 从源码运行（开发者）
 
@@ -148,5 +149,9 @@ WorkBuddy 右下角的机器人按钮 → 弹出面板 → 选你要的操作：
 ## 兼容性说明
 
 - macOS 11+（Big Sur 起），Apple Silicon 与 Intel 均支持
+- Windows 10/11 64 位（需 WorkBuddy Windows 版；node 使用 WorkBuddy 自带托管运行时或 PATH 中的 Node 18+）
 - WorkBuddy 桌面端 0.6.6+（daemon 与 inject 同步升级后覆盖更新）
-- Windows 端正在开发，**敬请期待，马上上线**
+
+## 社区支持
+
+[Linux](https://linux.do/)

@@ -397,4 +397,9 @@ module.exports = [
     desc: 'chat widget 内层容器 _widgetContainer（_widgetRendererWrapper 毛玻璃内部）改透明背景（用户要求）：透出外层毛玻璃，避免双层实底',
     css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetRendererWrapper_"] [class*="_widgetContainer_"]{background:transparent !important;background-color:transparent !important;}',
   },
+  {
+    id: 'patch-80',
+    desc: 'chat widget 预览 iframe 背景改透明（用户要求）：widget 容器内的 iframe 在深色下自带黑底（元素级背景），改透明让外层毛玻璃透出；iframe 内部文档自带黑底由 inject.js 同源注入兜底（跨域内部无法用 CSS 触达）',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetRendererWrapper_"] iframe,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetContainer_"] iframe,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetRendererWrapper_"] iframe[class*="chromeless"]{background:transparent !important;background-color:transparent !important;border:none !important;box-shadow:none !important;}',
+  },
 ];

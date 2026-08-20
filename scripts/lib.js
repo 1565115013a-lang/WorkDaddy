@@ -16,17 +16,34 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const IS_WIN = process.platform === 'win32';
+
+// macOS: ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
+// Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info（真机已确认）
 const AUTH_FILE =
   process.env.WBSWITCH_AUTH_FILE ||
-  path.join(
-    os.homedir(),
-    'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
-  );
+  (IS_WIN
+    ? path.join(
+        process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+        'CodeBuddyExtension',
+        'Data',
+        'Public',
+        'auth',
+        'workbuddy-desktop.info'
+      )
+    : path.join(
+        os.homedir(),
+        'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
+      ));
 
 function defaultDataDir() {
+  // macOS: ~/Library/Application Support/WorkDaddy
+  // Windows: %APPDATA%\WorkDaddy
   return (
     process.env.WBSWITCH_DATA_DIR ||
-    path.join(os.homedir(), 'Library/Application Support/HelloBuddy')
+    (IS_WIN
+      ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy')
+      : path.join(os.homedir(), 'Library', 'Application Support', 'WorkDaddy'))
   );
 }
 
@@ -199,9 +216,13 @@ function switchTo(dataDir, uid, log = () => {}) {
     fs.chmodSync(AUTH_FILE, 0o600);
   } catch (e) {
     // 沙箱环境（如从 WorkBuddy 托管后台运行）直接写系统目录会 EPERM。
-    // 回退方案：先把内容写到本 daemon 可写的临时文件（数据目录），
-    // 再委托 GUI 会话（osascript do shell script）把文件复制到 auth 目录，
-    // 复制命令不涉及内容转义，只传路径，稳妥可靠。
+    // macOS 回退：osascript 委托 GUI 会话复制（不涉及内容转义，只传路径）。
+    // Windows：目录在 %LOCALAPPDATA% 用户可写区，直写失败即如实报错。
+    if (IS_WIN) {
+      throw new Error(
+        `写入登录文件失败(${e.code || ''}): ${(e.message || e).toString().slice(0, 200)}`
+      );
+    }
     log(`[switch] 直写失败(${e.code})，改用 osascript 委托写入`);
     const bridge = path.join(dataDir, '.auth-switch-bridge.tmp');
     const authBridge = AUTH_FILE + '.wbswitch.tmp';
