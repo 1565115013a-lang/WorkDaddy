@@ -6,9 +6,17 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LABEL="com.workbuddy.hellobuddy"
+LABEL="com.workbuddy.workdaddy"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-DATA_DIR="${WBSWITCH_DATA_DIR:-$HOME/Library/Application Support/HelloBuddy}"
+LEGACY_LABEL="com.workbuddy.hellobuddy"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
+DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy"
+LEGACY_DATA_DIR="$HOME/Library/Application Support/HelloBuddy"
+if [ "${WBSWITCH_DATA_DIR:-}" = "$LEGACY_DATA_DIR" ]; then
+  DATA_DIR="$DEFAULT_DATA_DIR"
+else
+  DATA_DIR="${WBSWITCH_DATA_DIR:-$DEFAULT_DATA_DIR}"
+fi
 UI_PORT="${WBSWITCH_PORT:-47832}"
 CDP_PORT="${WBSWITCH_CDP_PORT:-}"
 
@@ -27,6 +35,12 @@ fi
 echo "==> 创建备份目录: $DATA_DIR"
 mkdir -p "$DATA_DIR/accounts"
 chmod 700 "$DATA_DIR"
+
+echo "==> 停止旧版 HelloBuddy 守护进程（保留旧备份，首次同步时自动迁移）"
+launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST" 2>/dev/null || true
+launchctl remove "$LEGACY_LABEL" 2>/dev/null || true
+rm -f "$LEGACY_PLIST"
+pkill -f "$DIR/scripts/daemon.js" 2>/dev/null || true
 
 echo "==> 首次同步当前登录账号"
 "$NODE" "$DIR/scripts/sync.js" || echo "   (首次同步失败，守护进程启动后会自动重试)"
@@ -78,7 +92,7 @@ if [ "$LAUNCHD_OK" = "1" ]; then
 fi
 
 echo "==> 启动守护进程（后台）"
-nohup "$NODE" "$DIR/scripts/daemon.js" >> "$DATA_DIR/daemon.log" 2>&1 &
+WBSWITCH_DATA_DIR="$DATA_DIR" nohup "$NODE" "$DIR/scripts/daemon.js" >> "$DATA_DIR/daemon.log" 2>&1 &
 disown 2>/dev/null || true
 echo "   pid: $!"
 

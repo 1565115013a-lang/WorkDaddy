@@ -24,7 +24,9 @@ const DATA_DIR =
   process.env.WBSWITCH_DATA_DIR ||
   path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy');
 const UI_PORT = parseInt(process.env.WBSWITCH_PORT || '47832', 10);
-const CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || '9222', 10);
+const cliCdpPort = process.argv.find((arg) => /^--cdp-port=\d+$/i.test(arg));
+const CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || (cliCdpPort ? cliCdpPort.split('=')[1] : '') || '9222', 10);
+const ELEVATED_HELPER_MODE = process.argv.includes('--inject-helper');
 
 function log(...args) {
   const line = `[launcher] ${new Date().toISOString()} ${args.join(' ')}\n`;
@@ -51,17 +53,31 @@ function spawnElevatedHelper() {
   const nodeBin = process.execPath;                 // 当前 node
   const childJs = path.join(SCRIPTS_DIR, 'win-inject-helper.js');
   if (!fs.existsSync(childJs)) return false;
+  // 用 UTF-16LE 编码 PowerShell 命令，避免安装目录含中文时经过当前代码页导致路径乱码；
+  // Node 参数顺序必须是「脚本路径 → 脚本参数」，否则 --inject-helper 会被 Node 当成自身选项。
+  const childArg = '"' + childJs + '"';
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    'Start-Process -FilePath ' + psQuote(nodeBin) + ' ' +
+      '-ArgumentList @(' + [psQuote(childArg), psQuote('--inject-helper'), psQuote(String(CDP_PORT))].join(', ') + ') ' +
+      '-Verb RunAs -WindowStyle Hidden',
+  ].join('; ');
+  const encodedCommand = Buffer.from(command, 'utf16le').toString('base64');
   const ps = [
     '-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-Command',
-    'Start-Process -FilePath "' + nodeBin.replace(/"/g, '\\"') + '" ' +
-      '-ArgumentList @("--inject-helper","' + childJs + '",' + CDP_PORT + ') ' +
-      '-Verb RunAs'
+    '-EncodedCommand', encodedCommand,
   ];
   try {
-    spawnSync('powershell', ps, { stdio: 'ignore', windowsHide: true, timeout: 15000 });
+    const r = spawnSync('powershell', ps, { stdio: 'ignore', windowsHide: true, timeout: 15000 });
+    if (r.error || r.status !== 0) {
+      log('提权助手派发失败: ' + (r.error ? r.error.message : 'powershell exit ' + r.status));
+      return false;
+    }
     return true;
-  } catch (_) { return false; }
+  } catch (e) {
+    log('提权助手派发异常: ' + e.message);
+    return false;
+  }
 }
 
 function portOpen(port) {
@@ -95,6 +111,15 @@ function httpPost(port, p) {
     req.on('error', () => resolve(null));
     req.end();
   });
+}
+
+async function isWorkBuddyCdp() {
+  const version = await httpGet(CDP_PORT, '/json/version');
+  if (!version || version.status !== 200) return false;
+  try {
+    const info = JSON.parse(version.body || '{}');
+    return /workbuddy|codebuddy/i.test([info.Browser, info['User-Agent']].filter(Boolean).join(' '));
+  } catch (_) { return false; }
 }
 
 function psOut(cmd) {
@@ -233,19 +258,99 @@ function stopDaemonByPort() {
 }
 
 // ---------- 2/3. WorkBuddy CDP 处理 ----------
-function quitWorkBuddy() {
+function workBuddyRunning() {
+  try {
+    const r = spawnSync(
+      'tasklist',
+      ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true }
+    );
+    return r.status === 0 && /"WorkBuddy\.exe"/i.test(r.stdout || '');
+  } catch (_) {
+    return true;
+  }
+}
+
+function runTaskkill(args) {
   return new Promise((resolve) => {
-    let done = false;
-    const finish = () => { if (!done) { done = true; resolve(); } };
-    const run = (args) => {
-      const p = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
-      p.on('error', finish);
-      p.on('exit', () => setTimeout(finish, 700));
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
     };
-    run(['/IM', 'WorkBuddy.exe']);
-    setTimeout(() => { if (!done) run(['/F', '/T', '/IM', 'WorkBuddy.exe']); }, 2500);
-    setTimeout(finish, 8000);
+    const p = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
+    p.on('error', (error) => finish({ code: null, error }));
+    p.on('exit', (code, signal) => finish({ code, signal, error: null }));
+    timer = setTimeout(() => finish({ code: null, error: new Error('taskkill 超时') }), 10000);
   });
+}
+
+async function waitForWorkBuddyExit(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!workBuddyRunning()) return true;
+    await sleep(200);
+  }
+  return !workBuddyRunning();
+}
+
+async function quitWorkBuddy() {
+  if (!workBuddyRunning()) return true;
+  await runTaskkill(['/IM', 'WorkBuddy.exe']);
+  if (await waitForWorkBuddyExit(1800)) return true;
+  await runTaskkill(['/F', '/T', '/IM', 'WorkBuddy.exe']);
+  if (await waitForWorkBuddyExit(4000)) return true;
+  throw new Error('无法确认 WorkBuddy 已退出');
+}
+
+function psQuote(value) {
+  return "'" + String(value).replace(/'/g, "''") + "'";
+}
+
+/**
+ * 从管理员 launcher 启动 WorkBuddy 时，不能直接 spawn 子进程：Electron/Chromium
+ * 在部分 Windows 环境以高完整性令牌启动会出现白屏。通过 Explorer 的 ShellExecute
+ * 让桌面 shell 以当前用户令牌创建 GUI 进程；普通权限 launcher 仍走同一条路径。
+ */
+function launchWorkBuddy(wb) {
+  const args = '--remote-debugging-port=' + CDP_PORT;
+  if (isElevated()) {
+    const command = [
+      '$shell = New-Object -ComObject Shell.Application',
+      '$shell.ShellExecute(' + [
+        psQuote(wb),
+        psQuote(args),
+        psQuote(path.dirname(wb)),
+        "'open'",
+        '1',
+      ].join(', ') + ')',
+    ].join('; ');
+    const result = spawnSync(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+      { stdio: 'ignore', windowsHide: true, timeout: 15000 }
+    );
+    if (result.status === 0) {
+      log('WorkBuddy 已通过 Explorer ShellExecute 以当前用户权限启动');
+      return true;
+    }
+    log('ShellExecute 启动 WorkBuddy 失败，改用 explorer.exe 兜底 (code=' + result.status + ')');
+    try {
+      const shell = spawn('explorer.exe', [wb, args], { detached: true, stdio: 'ignore', windowsHide: true });
+      shell.unref();
+      return true;
+    } catch (e) {
+      log('explorer.exe 启动 WorkBuddy 失败: ' + e.message);
+    }
+  }
+
+  const child = spawn(wb, [args], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.on('error', (e) => { log('启动 WorkBuddy 失败: ' + e.message); });
+  child.unref();
+  return true;
 }
 
 async function injectNow() {
@@ -255,6 +360,10 @@ async function injectNow() {
 
 // ---------- main ----------
 (async () => {
+  // 入口级 breadcrumb 必须先于 Node/PowerShell/进程探测写出，避免管理员启动时
+  // 探测耗时让 Windows Terminal 看起来像“空白无响应”；同一行也会落到 launcher.log。
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+  log('启动入口: scripts=' + SCRIPTS_DIR + ' data=' + DATA_DIR + ' pid=' + process.pid);
   const nodeBin = findNode();
   if (!nodeBin) {
     log('未找到 Node.js（需 .workbuddy\\binaries 托管 node 或 PATH 中的 node）');
@@ -262,10 +371,17 @@ async function injectNow() {
     process.exit(1);
   }
 
+  // 提权助手接管时，先停掉普通权限启动的 watchdog/daemon，避免两个权限级别的
+  // daemon 同时占用端口；WorkBuddy GUI 后续仍由 ShellExecute 以用户权限启动。
+  if (ELEVATED_HELPER_MODE) {
+    log('提权流程：接管普通权限 daemon');
+    stopDaemonByPort();
+    await sleep(800);
+  }
   await ensureDaemon(nodeBin);
 
   // 已在 CDP 模式 → 幂等注入
-  if (await portOpen(CDP_PORT)) {
+  if (await isWorkBuddyCdp()) {
     await injectNow();
     log('WorkBuddy 已在调试模式（端口 ' + CDP_PORT + '），组件已注入');
     console.log('WorkDaddy：WorkBuddy 已在调试模式，组件已注入 ✓');
@@ -280,7 +396,7 @@ async function injectNow() {
     process.exit(2);
   }
 
-  // WorkBuddy 常装在 C:\Program Files（受保护特权目录），重启它需要管理员权限。
+  // WorkBuddy 常装在 C:\Program Files（受保护特权目录），结束已提升的旧进程可能需要管理员权限。
   // 若当前非管理员：派发提权助手（触发一次 UAC）后立即退出，由助手完成重启+注入，
   // 避免普通双击时卡在黑屏空转等 20 秒。
   if (!isElevated()) {
@@ -294,19 +410,17 @@ async function injectNow() {
     log('提权派发失败，退回当前进程直接重启');
   }
 
-  log('重启 WorkBuddy（带 --remote-debugging-port=' + CDP_PORT + '）: ' + wb);
+  log('重启 WorkBuddy（带 --remote-debugging-port=' + CDP_PORT + '，GUI 使用当前用户权限）: ' + wb);
   console.log('正在以调试模式重启 WorkBuddy（约几秒）...');
 
   await quitWorkBuddy();
   await sleep(500);
-  const child = spawn(wb, ['--remote-debugging-port=' + CDP_PORT], { detached: true, stdio: 'ignore', windowsHide: true });
-  child.on('error', (e) => { log('启动 WorkBuddy 失败: ' + e.message); });
-  child.unref();
+  launchWorkBuddy(wb);
 
   let ok = false;
   for (let i = 0; i < 20; i++) {
     await sleep(1000);
-    if (await portOpen(CDP_PORT)) { ok = true; break; }
+    if (await isWorkBuddyCdp()) { ok = true; break; }
   }
   if (ok) {
     await sleep(1500);

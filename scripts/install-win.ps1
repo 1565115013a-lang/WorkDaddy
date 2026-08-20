@@ -22,11 +22,19 @@ if (-not (Test-Path (Join-Path $SrcDir 'daemon.js'))) {
   exit 1
 }
 New-Item -ItemType Directory -Force -Path $targetScripts | Out-Null
-robocopy $SrcDir $targetScripts /E /XF *.log .DS_Store /XD win\probe
-$rc = $LASTEXITCODE
-if ($rc -ge 8) {
-  Write-Host "复制失败（robocopy=$rc）"
-  exit 2
+$sourceFull = [IO.Path]::GetFullPath($SrcDir).TrimEnd('\')
+$targetFull = [IO.Path]::GetFullPath($targetScripts).TrimEnd('\')
+if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
+  # 从已安装目录重复运行安装脚本时，源和目标相同；robocopy 会尝试覆盖正在执行的脚本，
+  # 在 Windows 上容易出现“文件正被另一个进程使用”。此时只需继续执行后续注册/快捷方式步骤。
+  Write-Host '  源目录与安装目录相同，跳过自拷贝。'
+} else {
+  robocopy $SrcDir $targetScripts /E /XF *.log .DS_Store /XD win\probe /R:2 /W:1
+  $rc = $LASTEXITCODE
+  if ($rc -ge 8) {
+    Write-Host "复制失败（robocopy=$rc）"
+    exit 2
+  }
 }
 
 # 2) 数据目录
@@ -52,15 +60,20 @@ try {
 
 # 4) 启动（daemon + 以 CDP 模式重启 WorkBuddy + 注入）
 Write-Host '  正在启动 WorkDaddy（如果 WorkBuddy 正在运行，会重启它以开启调试模式）...'
+$launcherVbs = Join-Path $targetScripts 'launcher-hidden.vbs'
 if (Test-Path $launcher) {
-  Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
+  if (Test-Path $launcherVbs) {
+    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $launcherVbs + '"') -WorkingDirectory (Split-Path $launcher)
+  } else {
+    Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
+  }
 } else {
   Write-Host '  警告：launcher.cmd 不存在，跳过自动启动（请到安装目录手动双击）'
 }
 
 # 5) 创建桌面快捷方式「WorkDaddy」
-#    用 cmd.exe 作为目标程序 + /c 调用脚本，绕开 .cmd/.bat 文件关联被改（如被篡改成记事本）的坑，
-#    保证在任何 Windows 上双击桌面图标都能正常启动。
+#    优先使用 wscript.exe 隐藏入口，避免 Windows Terminal 为管理员 cmd 创建空白窗口；
+#    缺少隐藏入口时回退到 cmd.exe，兼容旧包/手工安装目录。
 $desktopDir = [Environment]::GetFolderPath('Desktop')
 if (-not $desktopDir) { $desktopDir = Join-Path $env:USERPROFILE 'Desktop' }
 $lnkPath = Join-Path $desktopDir 'WorkDaddy.lnk'
@@ -69,10 +82,15 @@ $logoIco = Join-Path $AppDir 'WorkDaddy.ico'
 try {
   $ws = New-Object -ComObject WScript.Shell
   $sc = $ws.CreateShortcut($lnkPath)
-  $sc.TargetPath       = "$env:ComSpec"                       # cmd.exe —— 与文件关联无关，始终可执行
-  $sc.Arguments        = '/d /c call "' + $launcher + '"'  # 由当前 cmd 解释执行，不触发 Explorer 关联
+  if (Test-Path $launcherVbs) {
+    $sc.TargetPath       = Join-Path $env:WINDIR 'System32\wscript.exe'
+    $sc.Arguments        = '//nologo "' + $launcherVbs + '"'
+  } else {
+    $sc.TargetPath       = "$env:ComSpec"
+    $sc.Arguments        = '/d /c call "' + $launcher + '"'
+  }
   $sc.WorkingDirectory = (Split-Path $launcher)
-  $sc.Description      = 'WorkDaddy – WorkBuddy 增强工具（双击启动）'
+  $sc.Description      = 'WorkDaddy – WorkBuddy 增强工具（请以管理员身份运行）'
   if (Test-Path $logoIco) { $sc.IconLocation = $logoIco + ',0' }   # 用官方 logo，而非 cmd 默认图标
   $sc.Save()
   Write-Host ('  桌面快捷方式 : ' + $lnkPath)

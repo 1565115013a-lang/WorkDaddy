@@ -18,7 +18,7 @@ set "FAIL=0"
 rem ---- 1) 关键文件齐全 ----
 echo.
 echo [1/6] 检查关键文件...
-for %%F in (daemon.js lib.js watchdog.js win-launcher.js inject.js theme-patches.js launcher.cmd install-win.cmd install-win.ps1 win\setup.sed) do (
+for %%F in (daemon.js lib.js watchdog.js win-launcher.js win-inject-helper.js inject.js theme-patches.js launcher.cmd launcher-hidden.vbs install-win.cmd install-win.ps1 win\setup.sed) do (
   if not exist "%SCRIPT_DIR%%%F" (
     echo   缺失: %%~F
     set /a FAIL+=1

@@ -6,9 +6,10 @@ rem        已在安装后日常只需双击桌面「WorkDaddy」图标。
 rem  设计：绝对路径定位 scripts\launcher.cmd，无相对路径歧义。
 rem ============================================================
 setlocal
-chcp 65001 >nul
+chcp 65001 >nul 2>&1
+echo WorkDaddy launcher starting...
 if not exist "%~dp0scripts\launcher.cmd" (
-  echo 错误：找不到 %~dp0scripts\launcher.cmd，请确认在解压后的 zip 根目录运行。
+  echo ERROR: %~dp0scripts\launcher.cmd was not found.
   pause
   exit /b 1
 )

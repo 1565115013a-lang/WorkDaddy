@@ -12,7 +12,7 @@ rem        这样无论从哪个目录双击、即便目录里残留 scripts\scr
 rem        也只认"与本文件同级的 scripts\install-win.ps1"，杜绝路径歧义。
 rem ============================================================
 setlocal
-chcp 65001 >nul
+chcp 65001 >nul 2>&1
 
 rem ---------- 0) 找到真正的包根（向上穿透 scripts 嵌套残留） ----------
 set "PKGROOT=%~dp0"
@@ -26,7 +26,7 @@ if exist "%PKGROOT%..\scripts\install-win.ps1" (
 goto root_missing
 
 :root_ok
-echo 已定位包根：%PKGROOT%
+echo Package root: %PKGROOT%
 
 rem ---------- 1) 存在性校验（绝对路径，不依赖 cd） ----------
 if not exist "%PKGROOT%scripts\install-win.cmd"  goto root_missing
@@ -39,10 +39,10 @@ goto :eof
 
 :root_missing
 echo.
-echo 错误：找不到完整的安装文件（scripts\install-win.ps1 / daemon.js）。
-echo 请确认是从 zip 解压目录的顶层双击本文件；若目录里有 scripts\scripts
-echo 之类的嵌套残留，请删除整个解压文件夹后用原 zip 重新解压。
+echo ERROR: required installation files were not found.
+echo Run this file from the top level of the extracted WorkDaddy zip.
+echo The top level must contain Install-WorkDaddy.cmd and the scripts folder.
 echo.
-echo 顶层入口应为：Install-WorkDaddy.cmd 与 scripts\ 同级。
+echo Expected: Install-WorkDaddy.cmd beside scripts\.
 pause
 exit /b 1

@@ -25,7 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
 let wsLib = null;
@@ -41,6 +41,8 @@ try { wsLib = require('ws'); } catch (_) {
     try { wsLib = require(c); break; } catch (_) {}
   }
 }
+// Node 22 提供全局 WebSocket，但 macOS 用户常见的 Node 18/20 没有；app 内置 ws 作为统一兜底。
+const WebSocketCtor = globalThis.WebSocket || (wsLib && (wsLib.WebSocket || wsLib));
 const {
   AUTH_FILE,
   defaultDataDir,
@@ -51,6 +53,8 @@ const {
   listAccounts,
   switchTo,
   deleteAccount,
+  backupPath,
+  updateMeta,
 } = require('./lib.js');
 
 const DATA_DIR = defaultDataDir();
@@ -63,7 +67,18 @@ const DATA_DIR = defaultDataDir();
 // 1.0.2：代码块容器 /.cb-markdown-pre-container 毛玻璃 + chat widget 容器毛玻璃 + 表头半透明（theme-patches patch-77/78）
 // 1.0.3：欢迎页隐藏暂存提示词按钮（inject isWelcomePage）；chat widget 预览 iframe 背景透明（patch-80 + inject 同源注入兜底）；
 //       默认主题改为「WorkBuddy 默认主题」（首次初始化/面板回退不再指向 nebula）
-const DAEMON_VERSION = '1.0.4';
+// 1.0.4：macOS dmg 打包修复（launcher 可执行位）
+// 1.0.5：修复自动更新「缺少解包后的新应用」——下载阶段只落 .dmg 从未解包，
+//       applyUpdate 现改为在安装前调用 extractAppFromDmg 解出 WorkDaddy.app（幂等），
+//       解包函数亦增强（清理残留挂载点、只读挂载、校验 dmg 内存在 WorkDaddy.app）
+// 1.0.6：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照
+// 1.0.7：兼容无全局 WebSocket 的 Node 18/20，使用内置 ws 建立 CDP
+// 1.0.8：去除 launchd 重定向造成的重复日志，并记录 launcher 选择的 Node 运行时
+// 1.0.9：诊断快照中的常见 token 字段脱敏
+// 1.0.10：daemon.log 按 10 MB 滚动保留最近 3 份，避免长期运行无限增长
+// 发布版本保持 1.0.5；build id 用于同版本修复包强制替换旧 daemon。
+const DAEMON_VERSION = '1.0.5';
+const DAEMON_BUILD_ID = 'accounts-migration-fix-20260820';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -268,20 +283,28 @@ function extractAppFromDmg(dmgPath) {
   const appDest = path.join(UPDATE_DIR, 'WorkDaddy.app');
   return new Promise((resolve, reject) => {
     const exec = require('child_process').execFile;
-    exec('hdiutil', ['attach', '-nobrowse', '-mountpoint', mountPoint, dmgPath], (err) => {
-      if (err) return reject(new Error('挂载 dmg 失败: ' + err.message));
-      const src = path.join(mountPoint, 'WorkDaddy.app');
-      fs.rmSync(appDest, { recursive: true, force: true });
-      const cp = require('child_process').spawn('cp', ['-R', src, appDest], { stdio: 'ignore' });
-      cp.on('close', (code) => {
-        exec('hdiutil', ['detach', mountPoint], () => {
-          if (code !== 0 || !fs.existsSync(path.join(appDest, 'Contents', 'Info.plist'))) {
-            return reject(new Error('解包应用失败'));
-          }
-          resolve(appDest);
+    // 先清理可能残留的挂载点（上次更新失败/中断会遗留，direct attach -mountpoint 会报 Resource busy），
+    // 再用只读 + 免校验挂载（只取包内容，不做写操作）
+    exec('hdiutil', ['detach', mountPoint, '-force'], () => {
+      exec('hdiutil', ['attach', '-nobrowse', '-readonly', '-noverify', '-mountpoint', mountPoint, dmgPath], (err) => {
+        if (err) return reject(new Error('挂载 dmg 失败: ' + err.message));
+        const src = path.join(mountPoint, 'WorkDaddy.app');
+        if (!fs.existsSync(src)) {
+          exec('hdiutil', ['detach', mountPoint, '-force'], () => reject(new Error('dmg 中未找到 WorkDaddy.app')));
+          return;
+        }
+        fs.rmSync(appDest, { recursive: true, force: true });
+        const cp = require('child_process').spawn('cp', ['-R', src, appDest], { stdio: 'ignore' });
+        cp.on('close', (code) => {
+          exec('hdiutil', ['detach', mountPoint, '-force'], () => {
+            if (code !== 0 || !fs.existsSync(path.join(appDest, 'Contents', 'Info.plist'))) {
+              return reject(new Error('解包应用失败'));
+            }
+            resolve(appDest);
+          });
         });
+        cp.on('error', (e) => { exec('hdiutil', ['detach', mountPoint, '-force'], () => reject(e)); });
       });
-      cp.on('error', (e) => { exec('hdiutil', ['detach', mountPoint], () => reject(e)); });
     });
   });
 }
@@ -313,26 +336,91 @@ function applyUpdate() {
   const appPath = '/Applications/WorkDaddy.app';
   const srcApp = path.join(UPDATE_DIR, 'WorkDaddy.app');
   if (!fs.existsSync(scriptPath)) return Promise.reject(new Error('缺少 apply-update.sh'));
-  if (!fs.existsSync(srcApp)) return Promise.reject(new Error('缺少解包后的新应用'));
-  // 停掉自身 launchd 服务（KeepAlive 会在新版本启动后接管）
-  execFile('launchctl', ['bootout', 'gui/' + process.getuid(), 'com.workbuddy.workdaddy'], () => {
-    execFile('launchctl', ['remove', 'com.workbuddy.workdaddy'], () => {});
+  // 解出新应用：下载阶段只落了 .dmg，这里才把 WorkDaddy.app 从 dmg 解到 UPDATE_DIR（幂等：已解出则复用）
+  const dmgPath = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.dmg');
+  const preUnpack = fs.existsSync(srcApp)
+    ? Promise.resolve(srcApp)
+    : (fs.existsSync(dmgPath)
+        ? (updateState.message = '正在解包新应用…', extractAppFromDmg(dmgPath))
+        : Promise.reject(new Error('缺少安装包（未找到已下载的 dmg）')));
+  return preUnpack.then((p) => {
+    if (!fs.existsSync(p)) return Promise.reject(new Error('缺少解包后的新应用'));
+    // 停掉自身 launchd 服务（KeepAlive 会在新版本启动后接管）
+    execFile('launchctl', ['bootout', 'gui/' + process.getuid(), 'com.workbuddy.workdaddy'], () => {
+      execFile('launchctl', ['remove', 'com.workbuddy.workdaddy'], () => {});
+    });
+    log('[update] 执行 apply-update.sh，daemon 即将退出');
+    const child = require('child_process').spawn('bash', [scriptPath, p, appPath, String(ACTUAL_PORT)], { detached: true, stdio: 'ignore' });
+    child.unref();
+    return { ok: true, message: '更新已启动，WorkDaddy 即将重启' };
   });
-  log('[update] 执行 apply-update.sh，daemon 即将退出');
-  const child = require('child_process').spawn('bash', [scriptPath, srcApp, appPath, String(ACTUAL_PORT)], { detached: true, stdio: 'ignore' });
-  child.unref();
-  return Promise.resolve({ ok: true, message: '更新已启动，WorkDaddy 即将重启' });
 }
 
 
+let logWriteCount = 0;
+function rotateLogsIfNeeded() {
+  if (++logWriteCount % 100 !== 0) return;
+  const file = logFile(DATA_DIR);
+  try {
+    if (fs.statSync(file).size < 10 * 1024 * 1024) return;
+    for (let i = 2; i >= 1; i--) {
+      const older = file + '.' + i;
+      const newer = file + '.' + (i + 1);
+      try { fs.unlinkSync(newer); } catch (_) {}
+      try { fs.renameSync(older, newer); } catch (_) {}
+    }
+    fs.renameSync(file, file + '.1');
+  } catch (_) {}
+}
+
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
-  process.stdout.write(line);
+  // launchd/nohup 已把 stdout 重定向到同一个文件；只写一次，避免每条日志重复。
   try {
+    rotateLogsIfNeeded();
     fs.appendFileSync(logFile(DATA_DIR), line);
   } catch (_) {
     /* 忽略日志错误 */
   }
+}
+
+// launchd 应只启动一个 daemon；启动器的 nohup 兜底和 launchd 异步拉起可能短暂重叠，
+// 用原子创建锁文件把这类竞态变成可观测的单实例退出，而不是两个进程同时清理/注入页面。
+function acquireDaemonLock() {
+  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      daemonLockFd = fs.openSync(DAEMON_LOCK_FILE, 'wx', 0o600);
+      fs.writeFileSync(daemonLockFd, payload, 'utf8');
+      log(`[lock] daemon 单实例锁已获取 (pid=${process.pid})`);
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let owner = null;
+      try { owner = JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8')); } catch (_) {}
+      const ownerPid = Number(owner && owner.pid);
+      let alive = false;
+      if (ownerPid > 0 && ownerPid !== process.pid) {
+        try { process.kill(ownerPid, 0); alive = true; } catch (_) {}
+      }
+      if (alive) {
+        process.stdout.write(`[${new Date().toISOString()}] [lock] 已有 daemon 运行 (pid=${ownerPid})，当前进程退出\n`);
+        return false;
+      }
+      try { fs.unlinkSync(DAEMON_LOCK_FILE); } catch (_) { return false; }
+    }
+  }
+  return false;
+}
+
+function releaseDaemonLock() {
+  if (daemonLockFd === null) return;
+  try { fs.closeSync(daemonLockFd); } catch (_) {}
+  daemonLockFd = null;
+  try {
+    const owner = JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8'));
+    if (Number(owner.pid) === process.pid) fs.unlinkSync(DAEMON_LOCK_FILE);
+  } catch (_) {}
 }
 
 /* ================= 自动备份（双层触发：CDP 事件 + 文件监听兜底） ================= */
@@ -369,22 +457,32 @@ const cdp = {
   pending: new Map(),
   manualClose: false,
 };
+
+const DIAGNOSTICS_FILE = path.join(DATA_DIR, 'diagnostics-latest.json');
+const DAEMON_LOCK_FILE = path.join(DATA_DIR, '.daemon.lock');
+let daemonLockFd = null;
 // 注入节流：仅避免 connect 与 loadEventFired 在同一瞬间（<1.5s）重复注入导致闪烁；
 // 但每次页面刷新（含 Command+R）都应重新注入最新代码，因此不用“一次加载只注入一次”的布尔去重，
 // 否则 Electron 重载未触发 loadEventFired 时会遗留旧版本组件。
 let lastInjectTs = 0;
+let injectRetryTimer = null; // 被节流跳过的自动注入的兜底补种定时器
 
 async function findCdpEndpoint() {
   const ports = CDP_PORT_HINT ? [CDP_PORT_HINT] : [9222, 9223, 9333];
   for (const p of ports) {
     try {
-      const r = await fetch(`http://127.0.0.1:${p}/json/version`, {
-        signal: AbortSignal.timeout(1500),
-      });
-      const v = await r.json();
-      if (/Chrome|Chromium|Electron|Edge|Headless/i.test(v.Browser || '')) {
-        return p;
-      }
+      const [versionRes, listRes] = await Promise.all([
+        fetch(`http://127.0.0.1:${p}/json/version`, { signal: AbortSignal.timeout(1500) }),
+        fetch(`http://127.0.0.1:${p}/json/list`, { signal: AbortSignal.timeout(1500) }),
+      ]);
+      const version = await versionRes.json();
+      const list = await listRes.json();
+      const targets = Array.isArray(list) ? list : [];
+      const belongsToWorkBuddy = /workbuddy|codebuddy/i.test([version.Browser, version['User-Agent']].filter(Boolean).join(' '));
+      if (belongsToWorkBuddy && targets.some(isWorkBuddyCdpTarget)) return p;
+      // 旧逻辑会把任意 Chromium（常见为 Antigravity）当成 WorkBuddy。
+      // 扫描到历史误注入标记时仅做清理，不对该应用执行任何新注入。
+      await cleanupForeignInjectedTargets(targets);
     } catch (_) {
       /* 端口未开放，跳过 */
     }
@@ -392,16 +490,73 @@ async function findCdpEndpoint() {
   return null;
 }
 
+function isWorkBuddyCdpTarget(target) {
+  if (!target || target.type !== 'page') return false;
+  const url = String(target.url || '');
+  const title = String(target.title || '');
+  return /(?:^|\/)WorkBuddy\.app(?:\/|$)/i.test(url) ||
+    /https?:\/\/(?:[^/]+\.)?(?:workbuddy|codebuddy)\.cn(?:\/|$)/i.test(url) ||
+    /^WorkBuddy(?:\s|$)/i.test(title);
+}
+
 async function getPageTarget(port) {
-  const r = await fetch(`http://127.0.0.1:${port}/json/list`, {
-    signal: AbortSignal.timeout(1500),
-  });
+  const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
   const list = await r.json();
-  const pages = (list || []).filter((t) => t.type === 'page');
-  if (!pages.length) return null;
-  return (
-    pages.find((t) => /workbuddy|codebuddy/i.test(t.url || '')) || pages[0]
-  );
+  return (Array.isArray(list) ? list : []).find(isWorkBuddyCdpTarget) || null;
+}
+
+async function cleanupForeignInjectedTargets(targets) {
+  if (!WebSocketCtor) return;
+  for (const target of targets) {
+    if (!target || target.type !== 'page' || !target.webSocketDebuggerUrl) continue;
+    try { await cleanupForeignInjectedTarget(target); } catch (_) {}
+  }
+}
+
+async function cleanupForeignInjectedTarget(target) {
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch (_) {}
+      resolve();
+    };
+    const ws = new WebSocketCtor(target.webSocketDebuggerUrl);
+    const timer = setTimeout(finish, 1800);
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        id: 1,
+        method: 'Runtime.evaluate',
+        params: {
+          returnByValue: true,
+          expression: `(function(){
+            var marked = !!(document.querySelector('.wbs-root,#wbs-style,#wbs-theme-style') || window.__wbsWidget);
+            if (!marked) return { removed: false };
+            try { if (window.__wbsWidget && typeof window.__wbsWidget.destroy === 'function') window.__wbsWidget.destroy(); } catch (_) {}
+            try { delete window.__wbsWidget; } catch (_) { window.__wbsWidget = null; }
+            document.querySelectorAll('.wbs-root,.wbs-stash-inline,.wbs-stash-btn,#wbs-style,#wbs-theme-style,#wbs-diag-badge,#wbs-debug-panel').forEach(function (n) { n.remove(); });
+            return { removed: true };
+          })()`,
+        },
+      }));
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.id === 1) {
+          clearTimeout(timer);
+          if (msg.error) log(`[cdp] 清理宿主页旧注入失败: ${msg.error.message || msg.error}`);
+          else if (msg.result && msg.result.result && msg.result.result.value && msg.result.result.value.removed) {
+            log(`[cdp] 已清理非 WorkBuddy 目标的旧注入: ${target.url || target.title || 'unknown'}`);
+          }
+          finish();
+        }
+      } catch (_) {}
+    };
+    ws.onerror = finish;
+    ws.onclose = finish;
+  });
 }
 
 function cdpSend(method, params = {}, _retry = 0) {
@@ -436,6 +591,7 @@ function cdpActivatePage() {
 }
 
 async function connectCdp() {
+  if (!WebSocketCtor) throw new Error('当前 Node 运行时没有 WebSocket，且未找到内置 ws 模块');
   cdp.port = await findCdpEndpoint();
   if (!cdp.port) {
     cdp.connected = false;
@@ -445,11 +601,11 @@ async function connectCdp() {
   const target = await getPageTarget(cdp.port).catch(() => null);
   if (!target) {
     cdp.connected = false;
-    cdp.error = `端口 ${cdp.port} 上没有 page 目标`;
+    cdp.error = `端口 ${cdp.port} 上没有 WorkBuddy 页面目标`;
     return false;
   }
   return new Promise((resolve) => {
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    const ws = new WebSocketCtor(target.webSocketDebuggerUrl);
     ws.onopen = () => {
       cdp.ws = ws;
       cdp.connected = true;
@@ -605,33 +761,94 @@ function resolveWorkBuddyBinary() {
   return null;
 }
 
-/** 退出 WorkBuddy：macOS 按应用路径精确匹配；Windows 按进程名 taskkill（先优雅 WM_CLOSE，超时强杀） */
-function quitWorkBuddy() {
+function runCommand(command, args, options = {}) {
   return new Promise((resolve) => {
-    if (IS_WIN) {
-      let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
-      const run = (args) => {
-        const p = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
-        p.on('error', finish);
-        p.on('exit', () => setTimeout(finish, 700));
-      };
-      run(['/IM', 'WorkBuddy.exe']);
-      setTimeout(() => { if (!done) run(['/F', '/T', '/IM', 'WorkBuddy.exe']); }, 2500);
-      setTimeout(finish, 8000); // 极端兜底，绝不悬挂
-      return;
+    const timeoutMs = Number(options.timeoutMs) || 0;
+    const spawnOptions = { ...options };
+    delete spawnOptions.timeoutMs;
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+    let child;
+    try {
+      child = spawn(command, args, { stdio: 'ignore', windowsHide: true, ...spawnOptions });
+    } catch (e) {
+      return finish({ code: null, error: e });
     }
-    // 先尝试正常退出（给 Electron 一次处理机会），再强制 kill
-    const p1 = spawn('osascript', ['-e', 'tell application "WorkBuddy" to quit'], { stdio: 'ignore' });
-    p1.on('error', () => {});
-    p1.on('exit', () => {
-      setTimeout(() => {
-        const p2 = spawn('pkill', ['-f', WORKBUDDY_APP], { stdio: 'ignore' });
-        p2.on('error', () => {});
-        p2.on('exit', () => resolve());
-      }, 800);
-    });
+    child.on('error', (error) => finish({ code: null, error }));
+    child.on('exit', (code, signal) => finish({ code, signal, error: null }));
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        try { child.kill(); } catch (_) {}
+        finish({ code: null, error: new Error(command + ' 超时') });
+      }, timeoutMs);
+    }
   });
+}
+
+function workBuddyRunning() {
+  try {
+    if (IS_WIN) {
+      const r = spawnSync(
+        'tasklist',
+        ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
+        { encoding: 'utf8', timeout: 5000, windowsHide: true }
+      );
+      return r.status === 0 && /"WorkBuddy\.exe"/i.test(r.stdout || '');
+    }
+    const r = spawnSync('pgrep', ['-f', WORKBUDDY_APP], { stdio: 'ignore', timeout: 5000 });
+    return r.status === 0;
+  } catch (_) {
+    // 探测失败时按仍在运行处理，避免误删身份文件后拉起旧实例。
+    return true;
+  }
+}
+
+async function waitForWorkBuddyExit(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!workBuddyRunning()) return true;
+    await sleep(200);
+  }
+  return !workBuddyRunning();
+}
+
+async function elevatedWindowsKill() {
+  const command =
+    "$p = Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/IM','WorkBuddy.exe' -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+  return runCommand('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { timeoutMs: 30000 });
+}
+
+/** 退出 WorkBuddy，并确认进程已经消失；失败时拒绝继续登录切换。 */
+async function quitWorkBuddy() {
+  if (!workBuddyRunning()) return true;
+
+  if (IS_WIN) {
+    await runCommand('taskkill', ['/IM', 'WorkBuddy.exe']);
+    if (await waitForWorkBuddyExit(1800)) return true;
+
+    await runCommand('taskkill', ['/F', '/T', '/IM', 'WorkBuddy.exe']);
+    if (await waitForWorkBuddyExit(2500)) return true;
+
+    // WorkBuddy 可能由管理员权限启动；普通 daemon 无法结束它时请求一次 UAC。
+    await elevatedWindowsKill();
+    if (await waitForWorkBuddyExit(5000)) return true;
+    throw new Error('无法确认 WorkBuddy 已退出（可能未通过管理员授权）');
+  }
+
+  // 先尝试正常退出（给 Electron 一次处理机会），再强制 kill 并验证。
+  await runCommand('osascript', ['-e', 'tell application "WorkBuddy" to quit']);
+  if (await waitForWorkBuddyExit(2500)) return true;
+  await runCommand('pkill', ['-f', WORKBUDDY_APP]);
+  if (await waitForWorkBuddyExit(2500)) return true;
+  await runCommand('pkill', ['-9', '-f', WORKBUDDY_APP]);
+  if (await waitForWorkBuddyExit(3000)) return true;
+  throw new Error('无法确认 WorkBuddy 已退出');
 }
 
 /** 探测 WorkDaddy.app 位置（macOS 专用：退出登录后打开它，由其 launcher 以 CDP 模式重启 WorkBuddy 并注入组件） */
@@ -817,7 +1034,14 @@ const CHECKIN_ENDPOINTS = [
   'https://www.codebuddy.cn/v2/billing/meter/daily-checkin',
 ];
 const CHECKIN_CACHE_FILE = path.join(DATA_DIR, 'checkin-cache.json');
+const CHECKIN_REQUEST_TIMEOUT_MS = 12000;
+const CHECKIN_QUEUE_DELAY_MS = 250;
 let claimInFlight = false;
+let checkinState = { running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0 };
+
+function checkinSnapshot() {
+  return Object.assign({}, checkinState, { running: !!claimInFlight });
+}
 
 function todayStr(d) {
   d = d || new Date();
@@ -847,6 +1071,8 @@ function saveCheckinCache(cache) {
 async function dailyCheckin(accessToken) {
   let lastErr = null;
   for (const url of CHECKIN_ENDPOINTS) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CHECKIN_REQUEST_TIMEOUT_MS);
     try {
       const r = await fetch(url, {
         method: 'POST',
@@ -860,6 +1086,7 @@ async function dailyCheckin(accessToken) {
           'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
         },
         body: '{}',
+        signal: controller.signal,
       });
       const text = await r.text();
       let o = {};
@@ -869,9 +1096,14 @@ async function dailyCheckin(accessToken) {
       const ok = already || (r.ok && (code === 0 || code === undefined || code === null));
       // 401 = token 过期/未授权：直接给友好文案，避免面板显示裸 "HTTP 401"
       const failMsg = r.status === 401 ? '登录身份过期' : 'HTTP ' + r.status;
-      return { ok, already, code, message: o.msg || o.message || (r.ok ? 'ok' : failMsg), url };
+      const result = { ok, already, code, message: o.msg || o.message || (r.ok ? 'ok' : failMsg), url };
+      // 网络异常或服务端错误才切换兜底域名；认证/参数错误直接返回，避免无意义地重复请求。
+      if (ok || r.status === 401 || (r.status >= 400 && r.status < 500 && r.status !== 404)) return result;
+      lastErr = result.message;
     } catch (e) {
-      lastErr = e.message;
+      lastErr = e.name === 'AbortError' ? '请求超时（' + (CHECKIN_REQUEST_TIMEOUT_MS / 1000) + ' 秒）' : e.message;
+    } finally {
+      clearTimeout(timeout);
     }
   }
   return { ok: false, already: false, code: -1, message: lastErr || '未知错误', url: CHECKIN_ENDPOINTS[0] };
@@ -904,21 +1136,30 @@ async function claimDailyForUid(uid) {
 
 /** 对所有账号执行每日签到（自动跳过今日已成功过的，带并发保护） */
 async function claimDailyForAll() {
-  if (claimInFlight) return { skipped: true, reason: 'in-flight' };
+  if (claimInFlight) return { skipped: true, reason: 'in-flight', checkin: checkinSnapshot() };
   claimInFlight = true;
   try {
     const list = listAccounts(DATA_DIR).map((a) => a.uid);
+    checkinState = { running: true, total: list.length, done: 0, startedAt: Date.now(), finishedAt: 0 };
     const results = [];
-    for (const uid of list) {
+    for (let i = 0; i < list.length; i++) {
+      const uid = list[i];
+      let result;
       try {
-        results.push(await claimDailyForUid(uid));
+        result = await claimDailyForUid(uid);
       } catch (e) {
-        results.push({ uid, ok: false, reason: e.message });
+        result = { uid, ok: false, reason: e.message };
       }
+      results.push(result);
+      checkinState.done = i + 1;
+      // 账号之间留一点间隔，避免多个账号同时触发服务端限流/连接排队。
+      if (i < list.length - 1 && !result.skipped) await sleep(CHECKIN_QUEUE_DELAY_MS);
     }
     log('[checkin] 本轮回检 ' + results.length + ' 个账号');
     return { total: results.length, results };
   } finally {
+    checkinState.running = false;
+    checkinState.finishedAt = Date.now();
     claimInFlight = false;
   }
 }
@@ -928,13 +1169,23 @@ function injectWidget(reason) {
   if (!cdp.connected) {
     return Promise.reject(new Error('CDP 未连接，无法注入组件'));
   }
-  // 节流：connect 与 loadEventFired 可能几乎同时触发，1.5s 内只注入一次，避免闪烁；
-  // 但每次刷新（含 Command+R）间隔都远大于 1.5s，因此必定会重新注入最新代码。
+  // 节流：仅抑制 connect 与 page-load 在 <1s 内连发的重复注入（避免闪烁）。
+  // 关键：manual（launcher/用户显式 /api/inject）恒不等候、必须无条件注入——
+  // 否则 WorkBuddy 重启后仅有的注入机会会被节流吞掉（多台机器 FAB 缺失的根因：
+  // launcher 检测到 CDP 就调用 manual，但被 1.5s 节流跳过，页面又不会再触发补种）。
   var now = Date.now();
-  if (now - lastInjectTs < 1500) {
+  if (reason !== 'manual' && now - lastInjectTs < 1000) {
     log(`[cdp] 注入节流跳过 (${reason})`);
+    // 兜底：被跳过的自动注入可能是页面刚就绪的唯一一次机会，1.5s 后补种一次（脚本幂等，安全）
+    if (!injectRetryTimer) {
+      injectRetryTimer = setTimeout(function () {
+        injectRetryTimer = null;
+        if (cdp.connected) injectWidget('retry').catch(function () {});
+      }, 1500);
+    }
     return Promise.resolve();
   }
+  injectRetryTimer = null;
   lastInjectTs = now;
   let script;
   try {
@@ -962,7 +1213,104 @@ function injectWidget(reason) {
         returnByValue: false,
       })
     )
+    // 注入脚本若在页面抛错，CDP 协议不报错（无 protocol error），会被误判为"已注入"；
+    // 显式检查 exceptionDetails 让失败可见、留痕，便于定位 WorkBuddy 版本差异导致的挂载失败。
+    .then((r) => {
+      if (r && r.exceptionDetails) {
+        const ex = r.exceptionDetails.exception;
+        const desc = (ex && (ex.description || ex.value)) || r.exceptionDetails.text || '注入脚本页面抛错';
+        log(`[cdp] 注入脚本页面抛错(${reason}): ${String(desc).slice(0, 500)}`);
+        return writeDiagnosticsSnapshot('inject-exception').then(() => r);
+      }
+      return r;
+    })
+    .then(async (r) => {
+      // Runtime.evaluate 本身成功不代表脚本完成挂载；回读 DOM/全局守卫，区分“协议成功”与“用户可见”。
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      let state = null;
+      try {
+        const check = await cdpSend('Runtime.evaluate', {
+          expression: '({ url: location.href, readyState: document.readyState, body: !!document.body, root: !!document.querySelector(".wbs-root"), widget: !!window.__wbsWidget })',
+          returnByValue: true,
+        });
+        state = check && check.result && check.result.value;
+      } catch (e) {
+        log(`[cdp] 注入结果校验失败(${reason}): ${e.message}`);
+      }
+      if (!state || !state.root || !state.widget) {
+        log(`[cdp] 注入后未检测到组件(${reason}): ${JSON.stringify(state || {})}`);
+        writeDiagnosticsSnapshot('inject-not-mounted').catch(() => {});
+        // 页面首屏尚未完成时偶发 body 已存在但应用仍在替换根节点，延迟补试一次。
+        if (!String(reason).endsWith('-retry')) {
+          setTimeout(() => { if (cdp.connected) injectWidget(String(reason) + '-retry').catch(() => {}); }, 700);
+        }
+      } else {
+        log(`[cdp] 注入结果确认(${reason}): root=true widget=true url=${state.url}`);
+      }
+      return r;
+    })
     .catch((e) => log(`[cdp] 注入失败: ${e.message}`));
+}
+
+async function readCdpTargets() {
+  if (!cdp.port) return [];
+  try {
+    const r = await fetch(`http://127.0.0.1:${cdp.port}/json/list`, { signal: AbortSignal.timeout(1500) });
+    const list = await r.json();
+    return (Array.isArray(list) ? list : []).map((t) => ({ id: t.id, type: t.type, title: t.title, url: t.url }));
+  } catch (e) {
+    return [{ error: e.message }];
+  }
+}
+
+function readLogTail(maxLines = 120) {
+  try {
+    const text = fs.readFileSync(logFile(DATA_DIR), 'utf8');
+    return text.split(/\r?\n/).filter(Boolean).slice(-maxLines).map((line) => line
+      .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/ig, '$1<redacted>')
+      .replace(/(["']?(?:accessToken|refreshToken|token)["']?\s*[:=]\s*["']?)[^"'\s,}]+/ig, '$1<redacted>'));
+  } catch (_) {
+    return [];
+  }
+}
+
+async function collectDiagnostics(reason) {
+  const result = {
+    schema: 1,
+    generatedAt: new Date().toISOString(),
+    reason: reason || 'manual',
+    daemon: { version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID, pid: process.pid, platform: process.platform, arch: process.arch, node: process.version },
+    paths: { dataDir: DATA_DIR, logFile: logFile(DATA_DIR), diagnosticsFile: DIAGNOSTICS_FILE, authFile: AUTH_FILE },
+    cdp: { connected: cdp.connected, port: cdp.port, targetUrl: cdp.targetUrl, error: cdp.error, targets: await readCdpTargets() },
+    injection: null,
+    logTail: readLogTail(),
+  };
+  if (cdp.connected) {
+    try {
+      const r = await cdpSend('Runtime.evaluate', {
+        expression: '({ url: location.href, title: document.title, readyState: document.readyState, body: !!document.body, root: !!document.querySelector(".wbs-root"), widget: !!window.__wbsWidget, diag: !!window.__wbsDiag })',
+        returnByValue: true,
+      });
+      result.injection = r && r.result && r.result.value;
+    } catch (e) {
+      result.injection = { error: e.message };
+    }
+  }
+  return result;
+}
+
+async function writeDiagnosticsSnapshot(reason) {
+  try {
+    const snapshot = await collectDiagnostics(reason);
+    const tmp = DIAGNOSTICS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, DIAGNOSTICS_FILE);
+    log(`[diag] 已写入本地诊断快照 (${reason || 'manual'}): ${DIAGNOSTICS_FILE}`);
+    return snapshot;
+  } catch (e) {
+    log(`[diag] 写入诊断快照失败: ${e.message}`);
+    return null;
+  }
 }
 
 /* ================= 本地 Web 服务 ================= */
@@ -974,12 +1322,22 @@ const SESSIONS_DB = path.join(os.homedir(), '.workbuddy', 'workbuddy.db');
 let NodeSqlite = null;
 if (IS_WIN) { try { NodeSqlite = require('node:sqlite'); } catch (_) { NodeSqlite = null; } }
 // 输出统一为 "header|header2\nval|val2" 格式，sqliteQuery 的解析两种后端通用
+function sqliteIsWrite(sql) {
+  // 复制/迁移/删除/恢复会执行写 SQL；其余当前调用均为查询。
+  return /^\s*(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|VACUUM|REINDEX|ANALYZE|BEGIN|COMMIT|ROLLBACK|ATTACH|DETACH)\b/i.test(String(sql || ''));
+}
 function sqliteRun(sql) {
   if (IS_WIN && NodeSqlite) {
     return new Promise((resolve, reject) => {
       let db = null;
       try {
-        db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: true });
+        const write = sqliteIsWrite(sql);
+        db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: !write });
+        if (write) {
+          db.exec(sql);
+          db.close(); db = null;
+          return resolve('');
+        }
         const rows = db.prepare(sql).all();
         db.close(); db = null;
         if (!rows.length) return resolve('');
@@ -2166,6 +2524,7 @@ async function fetchResource(accessToken, body) {
       'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000),
   });
   const text = await r.text();
   let o;
@@ -2204,8 +2563,35 @@ async function fetchResource(accessToken, body) {
  *  - meter：计量包（原查询的 PackageCodes，如 26.27）
  *  - package：体验/赠送包（用户提供的第二套 PackageCodes，如 CodeBuddy 个人体验版 500）
  * 两者 CapacityRemainPrecise 累加即为该账号总剩余积分。
- * 任一组查询失败不影响另一组的结果。
+ * 任一组查询失败不影响另一组的结果（但单组失败会先重试，避免余额被偏低计入）。
  */
+const retryDelay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 单组查询带有限重试：接口/http 偶发失败或返回空 Accounts 时，若直接按 0 计入会让总余额
+// 偏低（如数百积分的体验/赠送包被漏掉）。重试耗尽仍失败才抛出，由上层作为该组 0 处理。
+async function robustFetchResource(accessToken, body, label) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetchResource(accessToken, body);
+      // 偶发返回空 Accounts（count=0）也会把该组余额算成 0，同样再多试一次（bound 在 3 次内）
+      if (r.count === 0 && attempt < 3) {
+        log(`[credits] ${label} 返回空结果，第 ${attempt} 次重试`);
+        await retryDelay(300 * attempt);
+        continue;
+      }
+      return r;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 3) {
+        log(`[credits] ${label} 失败(第 ${attempt} 次): ${e.message}，重试`);
+        await retryDelay(300 * attempt);
+      }
+    }
+  }
+  throw lastErr || new Error(label + ' 查询返回空结果');
+}
+
 async function fetchCredits(accessToken) {
   // 1) 计量包（meter）
   const meterBody = {
@@ -2235,8 +2621,8 @@ async function fetchCredits(accessToken) {
     ],
   };
   const [m, p] = await Promise.allSettled([
-    fetchResource(accessToken, meterBody),
-    fetchResource(accessToken, pkgBody),
+    robustFetchResource(accessToken, meterBody, 'meter'),
+    robustFetchResource(accessToken, pkgBody, 'package'),
   ]);
   const meter = m.status === 'fulfilled' ? m.value : { credits: 0, count: 0, totalDosage: 0 };
   const pkg = p.status === 'fulfilled' ? p.value : { credits: 0, count: 0, totalDosage: 0 };
@@ -2253,6 +2639,37 @@ async function fetchCredits(accessToken) {
     meterError: m.status === 'rejected' ? String((m.reason && m.reason.message) || m.reason) : null,
     packageError: p.status === 'rejected' ? String((p.reason && p.reason.message) || m.reason) : null,
   };
+}
+
+/* ================= 账号导出 / 导入（加密密钥 = workdaddy） =================
+ * 目的：跨电脑同步账号备份，避免重新登录导致身份过期。
+ * 说明：用户口吻的「RSA 加密」在本场景用对称加密实现（密钥固定为 workdaddy，任何机器均可解开）：
+ *   AES-256-GCM + scryptSync(workdaddy) 派生 32 字节密钥。导出文件的 envelope 仅含元信息，
+ *   账号内容（含令牌）整体密文，未解密前无法读取。kdf 参数固定，跨机器可还原。
+ */
+const EXPORT_PASSPHRASE = 'workdaddy';
+const EXPORT_KDF_SALT = 'WorkDaddy-account-export-v1';
+
+function exportSecretKey() {
+  return crypto.scryptSync(EXPORT_PASSPHRASE, EXPORT_KDF_SALT, 32);
+}
+// 密文布局：iv(12) + authTag(16) + ciphertext
+function encryptExport(plain) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', exportSecretKey(), iv);
+  const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, enc]).toString('base64');
+}
+function decryptExport(b64) {
+  const buf = Buffer.from(String(b64 || ''), 'base64');
+  if (buf.length <= 28) throw new Error('导出数据不完整或已损坏');
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', exportSecretKey(), iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
 }
 
 function handleApi(req, res) {
@@ -2323,31 +2740,31 @@ function handleApi(req, res) {
     });
   }
 
-  // 「假退出登录」：删除当前登录文件（备份的 accounts/<uid>.info 仍保留，token 未过期），
-  // 然后退出 WorkBuddy 并重新打开，让应用回到登录页，方便登录新账号；之后可用「恢复登录」或面板切回备份账号。
+  // 「假退出登录」：先退出 WorkBuddy，再删除当前登录文件（备份的 accounts/<uid>.info
+  // 仍保留，token 未过期），最后重新打开，让应用回到登录页，方便登录新账号。
   if (req.method === 'POST' && p === '/api/logout') {
     return (async () => {
+      let quit = false;
+      let relaunched = false;
       try {
+        // 必须先停宿主：优雅退出可能把内存中的旧身份重新写回登录文件。
+        await quitWorkBuddy();
+        quit = true;
         if (fs.existsSync(AUTH_FILE)) {
-          fs.unlinkSync(AUTH_FILE); // 删除登录文件，token 仍保留在备份里
-          log('[logout] 已删除登录文件（假退出，token 未过期，备份保留）');
+          fs.unlinkSync(AUTH_FILE); // token 仍保留在 accounts/ 备份里
+          log('[logout] WorkBuddy 已退出，已删除登录文件（假退出，token 未过期，备份保留）');
         } else {
-          log('[logout] 当前无登录文件');
+          log('[logout] WorkBuddy 已退出，当前无登录文件');
         }
-        let quit = false;
-        let relaunched = false;
-        try {
-          await quitWorkBuddy();
-          quit = true;
-          await sleep(1200); // 等进程完全退出
-          await relaunchWorkBuddy();
-          relaunched = true;
-        } catch (e) {
-          log(`[logout] 退出/重启 WorkBuddy 失败: ${e.message}`);
+        if (fs.existsSync(AUTH_FILE)) {
+          throw new Error('删除登录文件后仍然存在');
         }
+        await relaunchWorkBuddy();
+        relaunched = true;
         return json(res, 200, { ok: true, quit, relaunched });
       } catch (e) {
-        return json(res, 500, { ok: false, error: e.message });
+        log(`[logout] 退出/删除/重启 WorkBuddy 失败: ${e.message}`);
+        return json(res, 502, { ok: false, quit, relaunched, error: e.message });
       }
     })();
   }
@@ -2358,6 +2775,7 @@ function handleApi(req, res) {
     return json(res, 200, {
       ok: true,
       version: DAEMON_VERSION,
+      buildId: DAEMON_BUILD_ID,
       cdp: {
         connected: cdp.connected,
         port: cdp.port,
@@ -2377,9 +2795,20 @@ function handleApi(req, res) {
     });
   }
 
+  // 诊断：保存一份不含 token 的本地快照，便于用户在异常机器上直接提供文件排查。
+  if (req.method === 'GET' && p === '/api/diagnostics') {
+    return writeDiagnosticsSnapshot('api-get').then((snapshot) => json(res, 200, { ok: true, file: DIAGNOSTICS_FILE, diagnostics: snapshot }));
+  }
+  if (req.method === 'POST' && p === '/api/diagnostics') {
+    return writeDiagnosticsSnapshot('api-post').then((snapshot) => json(res, 200, { ok: true, file: DIAGNOSTICS_FILE, diagnostics: snapshot }));
+  }
+
   if (req.method === 'GET' && p === '/api/accounts') {
     // 面板打开即自动对全部账号签到（带每日缓存，幂等，不阻塞响应）
-    claimDailyForAll().catch((e) => log('[checkin] 自动签到失败: ' + e.message));
+    // checkinStatus=1 仅回读缓存和队列状态，不重复触发一轮签到，供面板轮询使用。
+    if (url.searchParams.get('checkinStatus') !== '1') {
+      claimDailyForAll().catch((e) => log('[checkin] 自动签到失败: ' + e.message));
+    }
     const accounts = listAccounts(DATA_DIR);
     const cache = loadCheckinCache();
     const today = todayStr();
@@ -2389,7 +2818,7 @@ function handleApi(req, res) {
         checkin: c && c.date === today ? { ok: c.ok, already: c.already, code: c.code, message: c.message } : null,
       });
     });
-    return json(res, 200, { ok: true, current: currentAccount(), accounts: enriched });
+    return json(res, 200, { ok: true, current: currentAccount(), accounts: enriched, checkin: checkinSnapshot() });
   }
 
   // 查询指定账号的剩余积分（累加 Account 数组的 CapacityRemainPrecise）
@@ -2418,6 +2847,85 @@ function handleApi(req, res) {
       } catch (e) {
         log(`[credits] 查询 ${uid} 积分失败: ${e.message}`);
         return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+
+  // 导出账号：加密打包全部备份，返回可直接下载的文件内容（密钥 workdaddy）
+  if (req.method === 'POST' && p === '/api/accounts/export') {
+    try {
+      const accounts = listAccounts(DATA_DIR);
+      const items = [];
+      for (const a of accounts) {
+        const file = backupPath(DATA_DIR, a.uid);
+        if (!fs.existsSync(file)) continue;
+        try {
+          const raw = fs.readFileSync(file, 'utf8');
+          JSON.parse(raw); // 跳过损坏备份
+          items.push({ uid: a.uid, info: raw });
+        } catch (_) { /* 跳过 */ }
+      }
+      if (!items.length) return json(res, 200, { ok: false, error: '没有可导出的账号备份' });
+      const payload = { exportType: 'WorkDaddy-accounts', version: 1, accounts: items };
+      const envelope = JSON.stringify({
+        wbsExport: 'WorkDaddy',
+        version: 1,
+        createdAt: new Date().toISOString(),
+        kdf: 'aes-256-gcm+scrypt',
+        data: encryptExport(JSON.stringify(payload)),
+      });
+      const filename = 'WorkDaddy-账号导出-' + new Date().toISOString().slice(0, 10) + '.json';
+      log(`[export] 导出 ${items.length} 个账号 -> ${filename}`);
+      return json(res, 200, { ok: true, filename, content: envelope, count: items.length });
+    } catch (e) {
+      log(`[export] 导出失败: ${e.message}`);
+      return json(res, 500, { ok: false, error: e.message });
+    }
+  }
+
+  // 导入账号：从加密文件解密并恢复备份（密钥 workdaddy），按 uid 覆盖写入
+  if (req.method === 'POST' && p === '/api/accounts/import') {
+    return readBody(req).then((body) => {
+      try {
+        let text = '';
+        if (typeof body === 'string') text = body;
+        else if (body && typeof body.content === 'string') text = body.content;
+        else if (body && typeof body.data === 'string') text = body.data;
+        if (!text) throw new Error('未读取到有效内容，请选择导出文件');
+        let envelope;
+        try { envelope = JSON.parse(text); } catch (_) { throw new Error('文件不是有效的导出 JSON'); }
+        if (!envelope || envelope.wbsExport !== 'WorkDaddy') throw new Error('不是 WorkDaddy 的账号导出文件');
+        const payload = JSON.parse(decryptExport(envelope.data));
+        const list = Array.isArray(payload && payload.accounts) ? payload.accounts : [];
+        if (!list.length) throw new Error('导入文件中没有账号数据');
+        ensureDirs(DATA_DIR);
+        const imported = [];
+        for (const item of list) {
+          const uid = String(item && item.uid || '').trim();
+          const info = item && item.info;
+          if (!uid || typeof info !== 'string') continue;
+          let j;
+          try { j = JSON.parse(info); } catch (_) { continue; }
+          const acct = j.account || (Array.isArray(j.accounts) && j.accounts[0]);
+          if (!acct || !acct.uid || String(acct.uid) !== uid) continue; // 安全校验：uid 必须匹配
+          const dest = backupPath(DATA_DIR, uid);
+          const tmp = dest + '.tmp';
+          fs.writeFileSync(tmp, info, { mode: 0o600 });
+          fs.renameSync(tmp, dest);
+          try { fs.chmodSync(dest, 0o600); } catch (_) {}
+          updateMeta(DATA_DIR, {
+            uid,
+            nickname: acct.nickname || '',
+            uin: acct.uin || '',
+            phone: acct.phoneNumber || '',
+          });
+          imported.push(uid);
+        }
+        log(`[import] 成功导入 ${imported.length}/${list.length} 个账号`);
+        return json(res, 200, { ok: true, imported, count: imported.length });
+      } catch (e) {
+        log(`[import] 导入失败: ${e.message}`);
+        return json(res, 200, { ok: false, error: e.message });
       }
     });
   }
@@ -2661,17 +3169,18 @@ function handleApi(req, res) {
   if (req.method === 'GET' && p === '/api/devtools-url') {
     return new Promise((resolve) => {
       const httpMod = require('http');
-      httpMod.get('http://127.0.0.1:9222/json/list', (r) => {
+      const devtoolsPort = cdp.port || CDP_PORT_HINT || 9222;
+      httpMod.get('http://127.0.0.1:' + devtoolsPort + '/json/list', (r) => {
         let d = '';
         r.on('data', (c) => (d += c));
         r.on('end', () => {
           try {
             const list = JSON.parse(d);
-            const page = list.find((t) => t.type === 'page' && /workbuddy|codebuddy/i.test(t.url));
-            const id = page ? page.id : (list.find((t) => t.type === 'page') || {}).id;
+            const page = list.find(isWorkBuddyCdpTarget);
+            const id = page && page.id;
             if (!id) return resolve(json(res, 500, { ok: false, error: '未找到 WorkBuddy 页面 target' }));
             if (!wsLib) return resolve(json(res, 500, { ok: false, error: 'ws 代理库未加载，无法打开 DevTools' }));
-            const url = 'http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:' + ACTUAL_PORT + '/devtools-proxy/' + id;
+            const url = 'http://127.0.0.1:' + devtoolsPort + '/devtools/inspector.html?ws=127.0.0.1:' + ACTUAL_PORT + '/devtools-proxy/' + id;
             resolve(json(res, 200, { ok: true, url }));
           } catch (e) {
             resolve(json(res, 500, { ok: false, error: e.message }));
@@ -3075,7 +3584,7 @@ function handleApi(req, res) {
             log('[switch] 已通过 CDP 刷新 WorkBuddy 窗口');
             // 切换后通过接口自动签到（带每日缓存，幂等）
             claimDailyForUid(uid)
-              .then((r) => log('[checkin] 切换后自动签到 ' + uid + ': ' + (r.ok ? (r.already ? '今日已签' : '成功') : '失败 ' + (r.reason || r.message))))
+              .then((r) => log('[checkin] 切换后自动签到 ' + uid + ': ' + (r.ok ? '已领取' : '失败 ' + (r.reason || r.message))))
               .catch((e) => log('[checkin] 切换后签到异常: ' + e.message));
           } catch (e) {
             log(`[switch] CDP 刷新失败: ${e.message}`);
@@ -3267,7 +3776,8 @@ function startServer() {
       const m = /^\/devtools-proxy\/([A-Za-z0-9]+)$/.exec(pathname);
       if (!m) { socket.destroy(); return; }
       wss.handleUpgrade(req, socket, head, (front) => {
-        const back = new WebSocket('ws://127.0.0.1:9222/devtools/page/' + m[1]);
+        if (!WebSocketCtor) { try { front.close(); } catch (_) {} return; }
+        const back = new WebSocketCtor('ws://127.0.0.1:9222/devtools/page/' + m[1]);
         let backReady = false;
         let keepAlive = null;
         const queue = [];
@@ -3350,7 +3860,8 @@ function startServer() {
 
 /* ================= 启动 ================= */
 
-ensureDirs(DATA_DIR);
+ensureDirs(DATA_DIR, log);
+if (!acquireDaemonLock()) process.exit(0);
 // 首次启动初始化（新电脑 / 数据目录为空时）：内置壁纸 + WorkDaddy 主题 + 默认蒙版 10%
 initBuiltinAssets();
 // 启动时刷新决策弹窗规则到最新版本（已启用时替换旧规则段）
@@ -3371,9 +3882,15 @@ updateTimer.unref && updateTimer.unref();
 
 process.on('SIGTERM', () => {
   log('收到 SIGTERM，退出');
+  releaseDaemonLock();
   try { stopCaffeinate(); } catch (_) {}
   try {
     fs.unwatchFile(AUTH_FILE);
   } catch (_) {}
   process.exit(0);
 });
+process.on('SIGINT', () => {
+  releaseDaemonLock();
+  process.exit(0);
+});
+process.on('exit', releaseDaemonLock);

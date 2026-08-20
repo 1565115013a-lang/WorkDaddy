@@ -85,10 +85,15 @@ if ($rc -ge 8) {
 # 5) 清理备份 + 拉起（launcher 幂等：检测 daemon 后启动 watchdog）
 Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue
 $launcher = Join-Path $AppDir 'launcher.cmd'
+$launcherVbs = Join-Path $AppDir 'launcher-hidden.vbs'
 if (Test-Path $launcher) {
-  # 直接启动 launcher.cmd（Start-Process 传单个参数字符串在 PS5.1 不会自动补外层引号，
-  # 含空格路径会被拆散——直接指定 FilePath+WorkingDirectory 最稳）
-  Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
+  if (Test-Path $launcherVbs) {
+    # wscript.exe 不创建控制台，自动更新重启时也不再弹出空白 Windows Terminal。
+    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $launcherVbs + '"') -WorkingDirectory (Split-Path $launcher)
+  } else {
+    # 兼容旧版本目录：直接启动 launcher.cmd。
+    Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
+  }
 }
 Write-Host "[apply] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') done"
 Stop-Transcript

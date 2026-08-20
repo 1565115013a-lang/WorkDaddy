@@ -18,6 +18,24 @@ const path = require('path');
 
 const IS_WIN = process.platform === 'win32';
 
+const PLATFORM_DATA_DIR = IS_WIN
+  ? path.join(
+      process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+      'WorkDaddy'
+    )
+  : path.join(os.homedir(), 'Library', 'Application Support', 'WorkDaddy');
+const LEGACY_DATA_DIR = IS_WIN
+  ? null
+  : path.join(os.homedir(), 'Library', 'Application Support', 'HelloBuddy');
+
+function samePath(a, b) {
+  return !!a && !!b && path.resolve(a) === path.resolve(b);
+}
+
+function isLegacyDataDir(dataDir) {
+  return !IS_WIN && samePath(dataDir, LEGACY_DATA_DIR);
+}
+
 // macOS: ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
 // Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info（真机已确认）
 const AUTH_FILE =
@@ -37,14 +55,10 @@ const AUTH_FILE =
       ));
 
 function defaultDataDir() {
-  // macOS: ~/Library/Application Support/WorkDaddy
-  // Windows: %APPDATA%\WorkDaddy
-  return (
-    process.env.WBSWITCH_DATA_DIR ||
-    (IS_WIN
-      ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy')
-      : path.join(os.homedir(), 'Library', 'Application Support', 'WorkDaddy'))
-  );
+  // 旧版 launchd 可能把 WBSWITCH_DATA_DIR 设成 HelloBuddy；新版本始终落到 WorkDaddy，
+  // 避免旧服务被新 daemon 拉起后继续写入旧目录。
+  const configured = process.env.WBSWITCH_DATA_DIR;
+  return configured && !isLegacyDataDir(configured) ? configured : PLATFORM_DATA_DIR;
 }
 
 function accountsDir(dataDir) {
@@ -60,7 +74,57 @@ function backupPath(dataDir, uid) {
   return path.join(accountsDir(dataDir), `${uid}.info`);
 }
 
-function ensureDirs(dataDir) {
+/**
+ * 兼容旧版账号备份：把 HelloBuddy/accounts 中尚未存在于 WorkDaddy 的账号复制过来。
+ * 只对平台默认 WorkDaddy 目录执行，显式自定义数据目录不做隐式迁移。
+ * 源目录和文件均保留，重复调用幂等。
+ */
+function migrateLegacyDataDir(dataDir, log = () => {}) {
+  if (IS_WIN || !samePath(dataDir, PLATFORM_DATA_DIR)) {
+    return { migrated: 0, skipped: 0, source: null, target: dataDir };
+  }
+
+  const sourceAccounts = accountsDir(LEGACY_DATA_DIR);
+  if (!fs.existsSync(sourceAccounts)) {
+    return { migrated: 0, skipped: 0, source: LEGACY_DATA_DIR, target: dataDir };
+  }
+
+  let names;
+  try {
+    names = fs
+      .readdirSync(sourceAccounts)
+      .filter((name) => name.endsWith('.info') && !name.endsWith('.tmp'));
+  } catch (_) {
+    return { migrated: 0, skipped: 0, source: LEGACY_DATA_DIR, target: dataDir };
+  }
+
+  const targetAccounts = accountsDir(dataDir);
+  fs.mkdirSync(targetAccounts, { recursive: true, mode: 0o700 });
+  let migrated = 0;
+  let skipped = 0;
+  for (const name of names) {
+    const source = path.join(sourceAccounts, name);
+    const target = path.join(targetAccounts, name);
+    if (fs.existsSync(target)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      fs.copyFileSync(source, target);
+      fs.chmodSync(target, 0o600);
+      migrated += 1;
+    } catch (e) {
+      log(`[migration] 迁移账号 ${name} 失败: ${e.message}`);
+    }
+  }
+  if (migrated) {
+    log(`[migration] 已从 ${LEGACY_DATA_DIR}/accounts 迁移 ${migrated} 个账号到 ${dataDir}/accounts`);
+  }
+  return { migrated, skipped, source: LEGACY_DATA_DIR, target: dataDir };
+}
+
+function ensureDirs(dataDir, log = () => {}) {
+  migrateLegacyDataDir(dataDir, log);
   fs.mkdirSync(accountsDir(dataDir), { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(dataDir, 0o700);
@@ -116,7 +180,7 @@ function updateMeta(dataDir, info) {
 
 /** 把当前登录信息备份到 accounts/<uid>.info（原子写入，0600） */
 function backupCurrent(dataDir, log = () => {}) {
-  ensureDirs(dataDir);
+  ensureDirs(dataDir, log);
   const info = readAuthFile();
   const dest = backupPath(dataDir, info.uid);
   const tmp = dest + '.tmp';
@@ -132,6 +196,7 @@ function backupCurrent(dataDir, log = () => {}) {
 
 /** 列出所有已备份账号（直接读备份文件提取展示字段，按最近刷新时间倒序） */
 function listAccounts(dataDir) {
+  migrateLegacyDataDir(dataDir);
   const dir = accountsDir(dataDir);
   let names = [];
   try {
@@ -178,6 +243,7 @@ function listAccounts(dataDir) {
 
 /** 永久删除某个账号的备份文件（不影响当前登录） */
 function deleteAccount(dataDir, uid) {
+  migrateLegacyDataDir(dataDir);
   const file = backupPath(dataDir, uid);
   let deletedFile = false;
   if (fs.existsSync(file)) {
@@ -199,6 +265,7 @@ function deleteAccount(dataDir, uid) {
 
 /** 切换登录账号：把备份文件复制回登录信息文件（先校验 uid 匹配） */
 function switchTo(dataDir, uid, log = () => {}) {
+  migrateLegacyDataDir(dataDir, log);
   const src = backupPath(dataDir, uid);
   if (!fs.existsSync(src)) {
     throw new Error(`未找到账号 ${uid} 的备份文件`);
@@ -248,6 +315,7 @@ function switchTo(dataDir, uid, log = () => {}) {
 module.exports = {
   AUTH_FILE,
   defaultDataDir,
+  migrateLegacyDataDir,
   accountsDir,
   metaFile,
   logFile,
