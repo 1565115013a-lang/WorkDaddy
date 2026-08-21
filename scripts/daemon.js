@@ -80,8 +80,10 @@ const DATA_DIR = defaultDataDir();
 // 1.0.8：去除 launchd 重定向造成的重复日志，并记录 launcher 选择的 Node 运行时
 // 1.0.9：诊断快照中的常见 token 字段脱敏
 // 1.0.10：daemon.log 按 10 MB 滚动保留最近 3 份，避免长期运行无限增长
-const DAEMON_VERSION = '1.0.7';
-const DAEMON_BUILD_ID = 'cdp-port-fallback-fix-20260821';
+// 1.0.11：「登录新账号」新增「无感登录」（OAuth state 轮询采集，流程同 workbuddy-switch），
+//         不退出 WorkBuddy 即可把新账号入库；/api/open-url 供系统浏览器打开授权页
+const DAEMON_VERSION = '1.0.11';
+const DAEMON_BUILD_ID = 'seamless-login-20260821';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -350,6 +352,202 @@ function downloadUpdate() {
 // 计算文件 SHA-256
 function sha256File(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+// ---------------------------------------------------------------------------
+// 无感登录（OAuth state 轮询采集，流程与 workbuddy-switch 一致）：
+//   1. POST /v2/plugin/auth/state?platform=workbuddy 申请 state + 授权链接
+//   2. 用户在系统浏览器完成扫码授权（WorkBuddy 全程不退出）
+//   3. 轮询 GET /v2/plugin/auth/token?state=... 拿 accessToken
+//   4. GET /v2/plugin/login/account?state=... 拉账号信息，拼成官方认证文件结构入库
+// ---------------------------------------------------------------------------
+
+const WB_API_ENDPOINT = 'https://www.codebuddy.cn';
+const WB_API_PREFIX = '/v2/plugin';
+const OAUTH_TIMEOUT_SECONDS = 600;
+const OAUTH_RESULT_RETENTION_SECONDS = 300;
+const oauthStates = new Map(); // loginId -> { state, expiresAt, done, result, error }
+
+// 时间戳归一化：秒/毫秒/字符串 → 毫秒；无效返回 null
+function normTs(v) {
+  let ts = typeof v === 'number' ? v : typeof v === 'string' ? parseFloat(v) : NaN;
+  if (!isFinite(ts) || ts <= 0) return null;
+  if (ts < 1e10) ts *= 1000; // 秒 → 毫秒
+  return Math.round(ts);
+}
+
+// 带超时的 JSON 请求（返回解析后的 JSON；解析失败回退 {code,message}）
+function httpJson(url, method, body, headers) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https:') ? require('https') : require('http');
+    const data = body != null ? Buffer.from(JSON.stringify(body)) : null;
+    const u = new URL(url);
+    const req = mod.request(
+      {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: method || 'GET',
+        headers: Object.assign(
+          { 'User-Agent': 'WorkDaddy/' + DAEMON_VERSION, Accept: 'application/json' },
+          data ? { 'Content-Type': 'application/json', 'Content-Length': data.length } : {},
+          headers || {}
+        ),
+        timeout: 30000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          try {
+            resolve(text ? JSON.parse(text) : {});
+          } catch (_) {
+            resolve({ code: res.statusCode, message: text.slice(0, 500) });
+          }
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('请求超时')));
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+// 把 OAuth token + 账号信息拼成官方 workbuddy-desktop.info 结构
+// （{account, auth, accounts, allAccounts}，与 lib.js switchTo 写回的格式一致）
+function buildSeamlessAuthFile(tokenData, accData) {
+  const now = Date.now();
+  const rawToken = tokenData && typeof tokenData === 'object' ? tokenData : {};
+  const domain = String(rawToken.domain || '');
+  let expiresAt = normTs(rawToken.expiresAt != null ? rawToken.expiresAt : rawToken.expires_at);
+  if (expiresAt == null) {
+    const expiresIn = Number(rawToken.expiresIn != null ? rawToken.expiresIn : rawToken.expires_in);
+    if (Number.isFinite(expiresIn) && expiresIn > 0) expiresAt = now + expiresIn * 1000;
+  }
+  let refreshExpiresAt = normTs(
+    rawToken.refreshExpiresAt != null ? rawToken.refreshExpiresAt : rawToken.refresh_expires_at
+  );
+  if (refreshExpiresAt == null) {
+    const refreshExpiresIn = Number(
+      rawToken.refreshExpiresIn != null ? rawToken.refreshExpiresIn : rawToken.refresh_expires_in
+    );
+    if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) {
+      refreshExpiresAt = now + refreshExpiresIn * 1000;
+    }
+  }
+
+  const accountObj = Object.assign({}, accData && typeof accData === 'object' ? accData : {}, {
+    uid: String(accData.uid || ''),
+    nickname: String(accData.nickname || ''),
+    uin: accData.uin || '',
+    phoneNumber: accData.phoneNumber || '',
+    type: accData.type || 'personal',
+    lastLogin: true,
+    pluginEnabled: true,
+  });
+
+  // 保留官方响应中的额外字段（例如 idToken/sessionState），只覆盖标准字段。
+  // WorkBuddy 后续可能依赖这些字段，不能把 OAuth 响应压缩成固定白名单。
+  const authObj = Object.assign({}, rawToken, {
+    accessToken: String(rawToken.accessToken || rawToken.access_token || ''),
+    refreshToken: String(rawToken.refreshToken || rawToken.refresh_token || ''),
+    tokenType: String(rawToken.tokenType || rawToken.token_type || 'Bearer'),
+    domain,
+    lastRefreshTime: now,
+    scope: rawToken.scope || 'openid profile offline_access email',
+    notBeforePolicy: rawToken.notBeforePolicy != null ? rawToken.notBeforePolicy : 0,
+    sessionState: rawToken.sessionState || '',
+  });
+  if (expiresAt != null) {
+    authObj.expiresAt = expiresAt;
+    authObj.expiresIn = Math.max(0, Math.round((expiresAt - now) / 1000));
+    authObj.refreshExpiresAt = refreshExpiresAt != null ? refreshExpiresAt : expiresAt;
+    authObj.refreshExpiresIn = Math.max(0, Math.round((authObj.refreshExpiresAt - now) / 1000));
+  } else {
+    authObj.expiresIn = 0;
+    authObj.refreshExpiresIn = 0;
+  }
+
+  // 合并现有登录文件里的 allAccounts（按 uid 去重），保持与官方文件结构一致
+  let all = [];
+  try {
+    const cur = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    const arr = cur.allAccounts || cur.accounts;
+    if (Array.isArray(arr)) all = arr;
+  } catch (_) {}
+  all = all.filter((a) => a && a.uid !== accountObj.uid);
+  all.push(accountObj);
+
+  return { account: accountObj, auth: authObj, accounts: all, allAccounts: all };
+}
+
+function scheduleOAuthStateCleanup(loginId) {
+  const timer = setTimeout(() => oauthStates.delete(loginId), OAUTH_RESULT_RETENTION_SECONDS * 1000);
+  if (timer.unref) timer.unref();
+}
+
+// 把无感登录采集到的账号写入 accounts/<uid>.info 备份（不触碰当前登录文件）
+function saveSeamlessAccount(tokenData, accData) {
+  const uid = String(accData.uid || '');
+  if (!uid) throw new Error('官方接口未返回 uid，无法保存账号');
+  ensureDirs(DATA_DIR);
+  const session = buildSeamlessAuthFile(tokenData, accData);
+  const dest = backupPath(DATA_DIR, uid);
+  const tmp = dest + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(session, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, dest);
+  fs.chmodSync(dest, 0o600);
+  updateMeta(DATA_DIR, {
+    uid,
+    nickname: accData.nickname || '',
+    uin: accData.uin || '',
+    phone: accData.phoneNumber || '',
+  });
+  log(`[oauth] 无感登录已入库账号 ${accData.nickname || uid} (${uid}) -> ${dest}`);
+  return { uid, nickname: accData.nickname || '', email: accData.email || '' };
+}
+
+// 轮询一次授权结果：未完成返回 {done:false}；完成则入库并返回账号信息
+async function oauthPollOnce(loginId) {
+  const info = oauthStates.get(loginId);
+  if (!info) return { done: true, error: '登录请求不存在或已过期' };
+  if (info.done) return { done: true, result: info.result, error: info.error };
+  if (Date.now() > info.expiresAt) {
+    info.done = true;
+    info.error = '登录超时，请重新发起';
+    scheduleOAuthStateCleanup(loginId);
+    return { done: true, error: info.error };
+  }
+  const tokenResp = await httpJson(
+    `${WB_API_ENDPOINT}${WB_API_PREFIX}/auth/token?state=${encodeURIComponent(info.state)}`,
+    'GET'
+  );
+  const code = tokenResp && typeof tokenResp.code === 'number' ? tokenResp.code : -1;
+  if (code !== 0 && code !== 200) return { done: false };
+  const data = tokenResp.data || {};
+  const accessToken = data.accessToken || data.access_token || '';
+  if (!accessToken) return { done: false };
+
+  // 已授权：拉取账号信息并入库
+  const accHeaders = { Authorization: `Bearer ${accessToken}` };
+  if (data.domain) accHeaders['X-Domain'] = data.domain;
+  const accResp = await httpJson(
+    `${WB_API_ENDPOINT}${WB_API_PREFIX}/login/account?state=${encodeURIComponent(info.state)}`,
+    'GET',
+    null,
+    accHeaders
+  );
+  const accData = (accResp && accResp.data) || {};
+  info.done = true;
+  try {
+    info.result = saveSeamlessAccount(data, accData);
+  } catch (e) {
+    info.error = e.message;
+  }
+  scheduleOAuthStateCleanup(loginId);
+  return { done: true, result: info.result, error: info.error };
 }
 
 // 从 dmg 中解出 WorkDaddy.app 到 UPDATE_DIR（挂载→拷贝→卸载），返回 app 目录
@@ -2876,6 +3074,68 @@ function handleApi(req, res) {
   }
 
   // /api/batch-claim 已移除：领取改为打开面板时自动调接口（见 /api/accounts）
+
+  // 「无感登录」第一步：申请 state + 授权链接（不退出、不打断当前 WorkBuddy）
+  if (req.method === 'POST' && p === '/api/oauth/start') {
+    return (async () => {
+      try {
+        const resp = await httpJson(
+          `${WB_API_ENDPOINT}${WB_API_PREFIX}/auth/state?platform=workbuddy`,
+          'POST',
+          {}
+        );
+        const d = (resp && resp.data) || {};
+        if (!d.state) throw new Error('auth/state 响应缺少 state');
+        const authUrl =
+          d.authUrl || d.auth_url || d.url || `${WB_API_ENDPOINT}/login?state=${d.state}`;
+        const loginId = 'wd_' + crypto.randomUUID().replace(/-/g, '');
+        oauthStates.set(loginId, {
+          state: d.state,
+          expiresAt: Date.now() + OAUTH_TIMEOUT_SECONDS * 1000,
+          done: false,
+          result: null,
+          error: null,
+        });
+        const cleanupTimer = setTimeout(
+          () => oauthStates.delete(loginId),
+          (OAUTH_TIMEOUT_SECONDS + OAUTH_RESULT_RETENTION_SECONDS) * 1000
+        );
+        if (cleanupTimer.unref) cleanupTimer.unref();
+        log(`[oauth] 发起无感登录 loginId=${loginId}`);
+        return json(res, 200, { ok: true, loginId, verificationUri: authUrl, expiresIn: OAUTH_TIMEOUT_SECONDS });
+      } catch (e) {
+        log(`[oauth] 发起失败: ${e.message}`);
+        return json(res, 502, { ok: false, error: e.message });
+      }
+    })();
+  }
+
+  // 「无感登录」第二步：轮询授权结果，完成即自动入库
+  if (req.method === 'GET' && p === '/api/oauth/poll') {
+    const loginId = url.searchParams.get('loginId') || '';
+    return oauthPollOnce(loginId).then(
+      (r) => json(res, 200, Object.assign({ ok: true }, r)),
+      (e) => json(res, 502, { ok: false, error: e.message })
+    );
+  }
+
+  // 在系统浏览器打开链接（无感登录授权页等）
+  if (req.method === 'POST' && p === '/api/open-url') {
+    return readBody(req).then((body) => {
+      const u = String((body && body.url) || '');
+      if (!/^https?:\/\//i.test(u)) return json(res, 400, { ok: false, error: '仅支持 http(s) 链接' });
+      try {
+        if (IS_WIN) {
+          spawn('rundll32', ['url.dll,FileProtocolHandler', u], { detached: true, stdio: 'ignore' }).unref();
+        } else {
+          spawn('open', [u], { detached: true, stdio: 'ignore' }).unref();
+        }
+        return json(res, 200, { ok: true });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
 
   if (req.method === 'GET' && p === '/api/status') {
     return json(res, 200, {

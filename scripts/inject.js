@@ -2453,35 +2453,139 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     root.querySelector('[data-act="close"]').addEventListener('click', function () { setOpen(false); });
 
 
-    // 退出登录（假退出）：两击确认 + 说明
-    var logoutArmed = false;
+    // 登录新账号：弹窗二选一 —— 方法一 假退出当前账号 / 方法二 无感登录
     logoutBtn.addEventListener('click', function () {
       if (this.disabled) return;
-      if (!logoutArmed) {
-        logoutArmed = true;
-        this.classList.add('armed');
-        this.textContent = '确认？将退回登录页';
-        toast('这是「假退出」：仅把当前会话退回登录页，token 不会过期', false, root);
-        setBuildTimeout(function () {
-          logoutArmed = false;
-          logoutBtn.classList.remove('armed');
-          logoutBtn.innerHTML = LOGOUT_SVG + '<span>登录新账号</span>';
-        }, 4000);
-        return;
-      }
-      this.disabled = true;
-      api('/api/logout', { method: 'POST' })
-        .then(function () {
-          toast('WorkBuddy 即将退出并重新打开到登录页', false, root);
-          logoutArmed = false;
-          logoutBtn.classList.remove('armed');
-          logoutBtn.innerHTML = LOGOUT_SVG + '<span>登录新账号</span>';
+      openLoginChoice();
+    });
+
+    function closeLoginModal(mask) {
+      if (mask && mask.parentNode) mask.parentNode.removeChild(mask);
+    }
+
+    function openLoginChoice() {
+      closeLoginModal(root.querySelector('#wbs-login-modal'));
+      var mask = document.createElement('div');
+      mask.className = 'wbs-modal-mask';
+      mask.id = 'wbs-login-modal';
+      mask.innerHTML =
+        '<div class="wbs-modal">' +
+        '<div class="wbs-modal-title">添加新账号</div>' +
+        '<div class="wbs-login-body" id="wbs-login-body">' +
+        '<button class="wbs-login-opt danger" type="button" data-way="logout">' +
+        '<span class="wbs-login-opt-title">方法一：假退出当前账号</span>' +
+        '<span class="wbs-login-opt-desc">退出 WorkBuddy 回到登录页扫码，当前账号已备份，随时可切回</span>' +
+        '</button>' +
+        '<button class="wbs-login-opt" type="button" data-way="seamless">' +
+        '<span class="wbs-login-opt-title">方法二：无感登录</span>' +
+        '<span class="wbs-login-opt-desc">不退出 WorkBuddy，在浏览器完成授权后新账号自动加入列表</span>' +
+        '</button>' +
+        '</div>' +
+        '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-login-cancel">取消</button></div>' +
+        '</div>';
+      root.appendChild(mask);
+      var body = mask.querySelector('#wbs-login-body');
+      mask.querySelector('#wbs-login-cancel').addEventListener('click', function () { closeLoginModal(mask); });
+      mask.addEventListener('click', function (ev) { if (ev.target === mask) closeLoginModal(mask); });
+
+      // 方法一：假退出（保留两击确认，防误触）
+      var logoutOpt = mask.querySelector('[data-way="logout"]');
+      var logoutArmed = false;
+      var logoutArmedTimer = null;
+      var resetLogoutArm = function () {
+        logoutArmed = false;
+        logoutOpt.classList.remove('armed');
+        logoutOpt.querySelector('.wbs-login-opt-title').textContent = '方法一：假退出当前账号';
+        logoutOpt.querySelector('.wbs-login-opt-desc').textContent = '退出 WorkBuddy 回到登录页扫码，当前账号已备份，随时可切回';
+      };
+      logoutOpt.addEventListener('click', function () {
+        if (logoutOpt.disabled) return;
+        if (!logoutArmed) {
+          logoutArmed = true;
+          logoutOpt.classList.add('armed');
+          logoutOpt.querySelector('.wbs-login-opt-title').textContent = '再点一次，确认假退出';
+          logoutOpt.querySelector('.wbs-login-opt-desc').textContent = 'WorkBuddy 将退出并重新打开到登录页';
+          logoutArmedTimer = setBuildTimeout(resetLogoutArm, 4000);
+          return;
+        }
+        if (logoutArmedTimer) clearTimeout(logoutArmedTimer);
+        logoutOpt.disabled = true;
+        api('/api/logout', { method: 'POST' })
+          .then(function () {
+            closeLoginModal(mask);
+            toast('WorkBuddy 即将退出并重新打开到登录页', false, root);
+          })
+          .catch(function (e) {
+            toast('退出失败: ' + (e.message || e), true, root);
+            resetLogoutArm();
+            logoutOpt.disabled = false;
+          });
+      });
+
+      // 方法二：无感登录（OAuth 扫码采集，WorkBuddy 不退出）
+      mask.querySelector('[data-way="seamless"]').addEventListener('click', function () {
+        startSeamlessLogin(mask, body);
+      });
+    }
+
+    function startSeamlessLogin(mask, body) {
+      var pollTimer = null;
+      var cancelled = false;
+      body.innerHTML =
+        '<div class="wbs-login-status" id="wbs-login-status">正在发起授权…</div>';
+      mask.querySelector('.wbs-modal-actions').innerHTML =
+        '<button class="wbs-modal-btn" type="button" id="wbs-login-cancel2">取消</button>';
+      mask.querySelector('#wbs-login-cancel2').addEventListener('click', function () {
+        cancelled = true;
+        if (pollTimer) clearTimeout(pollTimer);
+        closeLoginModal(mask);
+      });
+
+      var statusEl = function () { return mask.querySelector('#wbs-login-status'); };
+      api('/api/oauth/start', { method: 'POST' })
+        .then(function (r) {
+          if (cancelled) return;
+          // 自动在系统浏览器打开授权页；失败不阻断，面板里留了手动链接
+          api('/api/open-url', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: r.verificationUri }),
+          }).catch(function () {});
+          var el = statusEl();
+          if (el) {
+            el.innerHTML = '已在系统浏览器打开授权页，扫码确认后新账号会自动加入列表。<br>' +
+              '没弹出来？<a class="wbs-login-link" href="' + r.verificationUri + '" target="_blank">点此打开授权页</a>';
+          }
+          var poll = function () {
+            if (cancelled) return;
+            api('/api/oauth/poll?loginId=' + encodeURIComponent(r.loginId))
+              .then(function (p) {
+                if (cancelled) return;
+                if (!p.done) { pollTimer = setTimeout(poll, 1500); return; }
+                if (p.result) {
+                  closeLoginModal(mask);
+                  toast('新账号「' + (p.result.nickname || p.result.uid) + '」已加入列表', false, root);
+                  refresh();
+                } else {
+                  var errEl = statusEl();
+                  if (errEl) errEl.textContent = p.error || '登录失败，请关闭后重试';
+                }
+              })
+              .catch(function (e) {
+                if (cancelled) return;
+                var errEl = statusEl();
+                if (errEl) errEl.textContent = '网络暂时失败，正在重试…';
+                pollTimer = setTimeout(poll, 1500);
+              });
+          };
+          pollTimer = setTimeout(poll, 1500);
         })
         .catch(function (e) {
-          toast('退出失败: ' + (e.message || e), true, root);
-        })
-        .finally(function () { logoutBtn.disabled = false; });
-    });
+          if (cancelled) return;
+          var el = statusEl();
+          if (el) el.textContent = '发起授权失败: ' + (e.message || e);
+        });
+    }
 
     // ===== 主题系统（WorkDaddy 换肤）：segmented 切换 =====
     // 主题 = CSS 变量覆盖（--wb-* / --dc-*），daemon 通过 CDP 注入 <style>。
@@ -4126,6 +4230,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-logout-btn:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);border-color:var(--wb-border-default,#d5d5d5)}',
     '.wbs-logout-btn.armed{background:#f53f3f;color:#fff;border-color:#f53f3f}',
     '.wbs-logout-btn svg{width:15px;height:15px}',
+    /* 登录新账号二选一弹窗（方法一 假退出 / 方法二 无感登录） */
+    '.wbs-login-body{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}',
+    '.wbs-login-opt{display:flex;flex-direction:column;align-items:flex-start;gap:4px;width:100%;padding:12px 14px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:12px;background:var(--wb-bg-popover,#fff);cursor:pointer;text-align:left;transition:all .15s;font-family:inherit}',
+    '.wbs-login-opt:hover{background:var(--wb-bg-hover,#f5f5f5);border-color:var(--wb-border-strong,#bbb);transform:translateY(-1px)}',
+    '.wbs-login-opt:disabled{opacity:.6;cursor:not-allowed;transform:none}',
+    '.wbs-login-opt-title{font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);line-height:1.4}',
+    '.wbs-login-opt-desc{font-size:11px;color:var(--wb-icon-tertiary,#999);line-height:1.55;font-weight:400}',
+    '.wbs-login-opt.danger .wbs-login-opt-title{color:#f53f3f}',
+    '.wbs-login-opt.danger:hover{border-color:color-mix(in srgb,#f53f3f 45%,transparent);background:color-mix(in srgb,#f53f3f 6%,transparent)}',
+    '.wbs-login-opt.danger.armed{background:#f53f3f;border-color:#f53f3f}',
+    '.wbs-login-opt.danger.armed .wbs-login-opt-title,.wbs-login-opt.danger.armed .wbs-login-opt-desc{color:#fff}',
+    '.wbs-login-status{font-size:12px;color:var(--wb-icon-secondary,#666);line-height:1.7;word-break:break-all;padding:2px 0 10px}',
+    '.wbs-login-link{color:var(--wb-accent-blue,#4f86ff);text-decoration:none;font-weight:600}',
+    '.wbs-login-link:hover{text-decoration:underline}',
     '.wbs-empty{text-align:center;color:var(--wb-icon-tertiary,#999);padding:28px 10px;font-size:12px}',
     /* body 高度：无底部功能区后最大化 */
     '.wbs-body{max-height:calc(min(78vh,660px) - 118px)}',
