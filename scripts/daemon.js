@@ -82,8 +82,10 @@ const DATA_DIR = defaultDataDir();
 // 1.0.10：daemon.log 按 10 MB 滚动保留最近 3 份，避免长期运行无限增长
 // 1.0.11：「登录新账号」新增「无感登录」（OAuth state 轮询采集，流程同 workbuddy-switch），
 //         不退出 WorkBuddy 即可把新账号入库；/api/open-url 供系统浏览器打开授权页
-const DAEMON_VERSION = '1.0.11';
-const DAEMON_BUILD_ID = 'seamless-login-20260821';
+// 1.0.12：修复旧 daemon 与新版使用同一 build 标识导致启动器复用旧内存代码；
+//         账号切换始终使用 JSON 替换 + CDP 刷新，不退出 WorkBuddy
+const DAEMON_VERSION = '1.0.12';
+const DAEMON_BUILD_ID = 'seamless-login-20260821-r2';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -365,6 +367,7 @@ function sha256File(file) {
 const WB_API_ENDPOINT = 'https://www.codebuddy.cn';
 const WB_API_PREFIX = '/v2/plugin';
 const OAUTH_TIMEOUT_SECONDS = 600;
+const OAUTH_RESULT_RETENTION_SECONDS = 300;
 const oauthStates = new Map(); // loginId -> { state, expiresAt, done, result, error }
 
 // 时间戳归一化：秒/毫秒/字符串 → 毫秒；无效返回 null
@@ -418,12 +421,23 @@ function httpJson(url, method, body, headers) {
 // （{account, auth, accounts, allAccounts}，与 lib.js switchTo 写回的格式一致）
 function buildSeamlessAuthFile(tokenData, accData) {
   const now = Date.now();
-  const domain = String(tokenData.domain || '');
-  let expiresAt = normTs(tokenData.expiresAt);
-  if (expiresAt == null && tokenData.expiresIn) expiresAt = now + Number(tokenData.expiresIn) * 1000;
-  let refreshExpiresAt = normTs(tokenData.refreshExpiresAt);
-  if (refreshExpiresAt == null && tokenData.refreshExpiresIn) {
-    refreshExpiresAt = now + Number(tokenData.refreshExpiresIn) * 1000;
+  const rawToken = tokenData && typeof tokenData === 'object' ? tokenData : {};
+  const domain = String(rawToken.domain || '');
+  let expiresAt = normTs(rawToken.expiresAt != null ? rawToken.expiresAt : rawToken.expires_at);
+  if (expiresAt == null) {
+    const expiresIn = Number(rawToken.expiresIn != null ? rawToken.expiresIn : rawToken.expires_in);
+    if (Number.isFinite(expiresIn) && expiresIn > 0) expiresAt = now + expiresIn * 1000;
+  }
+  let refreshExpiresAt = normTs(
+    rawToken.refreshExpiresAt != null ? rawToken.refreshExpiresAt : rawToken.refresh_expires_at
+  );
+  if (refreshExpiresAt == null) {
+    const refreshExpiresIn = Number(
+      rawToken.refreshExpiresIn != null ? rawToken.refreshExpiresIn : rawToken.refresh_expires_in
+    );
+    if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) {
+      refreshExpiresAt = now + refreshExpiresIn * 1000;
+    }
   }
 
   const accountObj = Object.assign({}, accData && typeof accData === 'object' ? accData : {}, {
@@ -436,16 +450,18 @@ function buildSeamlessAuthFile(tokenData, accData) {
     pluginEnabled: true,
   });
 
-  const authObj = {
-    accessToken: String(tokenData.accessToken || ''),
-    refreshToken: String(tokenData.refreshToken || ''),
-    tokenType: String(tokenData.tokenType || 'Bearer'),
+  // 保留官方响应中的额外字段（例如 idToken/sessionState），只覆盖标准字段。
+  // WorkBuddy 后续可能依赖这些字段，不能把 OAuth 响应压缩成固定白名单。
+  const authObj = Object.assign({}, rawToken, {
+    accessToken: String(rawToken.accessToken || rawToken.access_token || ''),
+    refreshToken: String(rawToken.refreshToken || rawToken.refresh_token || ''),
+    tokenType: String(rawToken.tokenType || rawToken.token_type || 'Bearer'),
     domain,
     lastRefreshTime: now,
-    scope: tokenData.scope || 'openid profile offline_access email',
-    notBeforePolicy: 0,
-    sessionState: '',
-  };
+    scope: rawToken.scope || 'openid profile offline_access email',
+    notBeforePolicy: rawToken.notBeforePolicy != null ? rawToken.notBeforePolicy : 0,
+    sessionState: rawToken.sessionState || '',
+  });
   if (expiresAt != null) {
     authObj.expiresAt = expiresAt;
     authObj.expiresIn = Math.max(0, Math.round((expiresAt - now) / 1000));
@@ -467,6 +483,11 @@ function buildSeamlessAuthFile(tokenData, accData) {
   all.push(accountObj);
 
   return { account: accountObj, auth: authObj, accounts: all, allAccounts: all };
+}
+
+function scheduleOAuthStateCleanup(loginId) {
+  const timer = setTimeout(() => oauthStates.delete(loginId), OAUTH_RESULT_RETENTION_SECONDS * 1000);
+  if (timer.unref) timer.unref();
 }
 
 // 把无感登录采集到的账号写入 accounts/<uid>.info 备份（不触碰当前登录文件）
@@ -498,6 +519,7 @@ async function oauthPollOnce(loginId) {
   if (Date.now() > info.expiresAt) {
     info.done = true;
     info.error = '登录超时，请重新发起';
+    scheduleOAuthStateCleanup(loginId);
     return { done: true, error: info.error };
   }
   const tokenResp = await httpJson(
@@ -526,6 +548,7 @@ async function oauthPollOnce(loginId) {
   } catch (e) {
     info.error = e.message;
   }
+  scheduleOAuthStateCleanup(loginId);
   return { done: true, result: info.result, error: info.error };
 }
 
@@ -3075,6 +3098,11 @@ function handleApi(req, res) {
           result: null,
           error: null,
         });
+        const cleanupTimer = setTimeout(
+          () => oauthStates.delete(loginId),
+          (OAUTH_TIMEOUT_SECONDS + OAUTH_RESULT_RETENTION_SECONDS) * 1000
+        );
+        if (cleanupTimer.unref) cleanupTimer.unref();
         log(`[oauth] 发起无感登录 loginId=${loginId}`);
         return json(res, 200, { ok: true, loginId, verificationUri: authUrl, expiresIn: OAUTH_TIMEOUT_SECONDS });
       } catch (e) {
@@ -3914,29 +3942,22 @@ function handleApi(req, res) {
     return readBody(req).then(async (body) => {
       const uid = (body.uid || '').trim();
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
-      let acct = null;
-      let hostStopped = false;
-      let reloaded = false;
       try {
-        // WorkBuddy 在宿主进程内缓存认证状态；仅刷新 renderer 会回到登录页。
-        // 先退出宿主，避免它在退出阶段把旧账号写回 auth 文件，再写入目标备份并重启。
-        if (body.reload) {
-          await quitWorkBuddy();
-          hostStopped = true;
-          log('[switch] WorkBuddy 已退出，准备写入目标账号登录文件');
-        }
-        acct = switchTo(DATA_DIR, uid, log);
+        const acct = switchTo(DATA_DIR, uid, log);
         const hint = '登录文件已切换，请重启 WorkBuddy 使新账号生效';
+        let reloaded = false;
         if (body.reload) {
           try {
-            await relaunchWorkBuddy();
+            await reloadWorkBuddyPage();
             reloaded = true;
-            log('[switch] 已重启 WorkBuddy，目标账号应在宿主启动时加载');
+            log('[switch] 已通过 CDP 刷新 WorkBuddy 窗口');
             // 切换后通过接口自动签到（带每日缓存，幂等）
             claimDailyForUid(uid)
               .then((r) => log('[checkin] 切换后自动签到 ' + uid + ': ' + (r.ok ? '已领取' : '失败 ' + (r.reason || r.message))))
               .catch((e) => log('[checkin] 切换后签到异常: ' + e.message));
-          } catch (e) { throw new Error('WorkBuddy 重启失败: ' + e.message); }
+          } catch (e) {
+            log(`[switch] CDP 刷新失败: ${e.message}`);
+          }
         }
         return json(res, 200, {
           ok: true,
@@ -3946,15 +3967,6 @@ function handleApi(req, res) {
           hint: reloaded ? '已切换并触发窗口刷新' : hint,
         });
       } catch (e) {
-        // 切换写入或重启失败时，尽量恢复宿主，避免面板操作把 WorkBuddy 留在退出状态。
-        if (hostStopped && !reloaded) {
-          try {
-            await relaunchWorkBuddy();
-            log('[switch] 切换失败，已尝试恢复启动 WorkBuddy');
-          } catch (recoverError) {
-            log(`[switch] 切换失败且恢复启动失败: ${recoverError.message}`);
-          }
-        }
         return json(res, 500, { ok: false, error: e.message });
       }
     });

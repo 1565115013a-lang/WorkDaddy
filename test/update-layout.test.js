@@ -32,19 +32,17 @@ test('macOS updater stops the daemon before waiting for the API port', () => {
   assert.ok(stop < wait, 'daemon shutdown must precede the port wait');
 });
 
-test('account switching restarts WorkBuddy after replacing auth', () => {
+test('account switching refreshes WorkBuddy after replacing auth without restarting it', () => {
   const script = read('daemon.js');
   const lib = read('lib.js');
   const routeStart = script.indexOf("if (req.method === 'POST' && p === '/api/switch')");
   assert.notEqual(routeStart, -1);
   const route = script.slice(routeStart, routeStart + 2600);
-  const quit = route.indexOf('await quitWorkBuddy()');
   const copy = route.indexOf('switchTo(DATA_DIR, uid, log)');
-  assert.notEqual(quit, -1);
   assert.notEqual(copy, -1);
-  assert.ok(quit < copy, 'WorkBuddy must exit before the target auth file is copied');
-  assert.match(route, /await relaunchWorkBuddy\(\)/);
-  assert.doesNotMatch(route, /await reloadWorkBuddyPage\(\)/);
+  assert.match(route, /await reloadWorkBuddyPage\(\)/);
+  assert.doesNotMatch(route, /await quitWorkBuddy\(\)/);
+  assert.doesNotMatch(route, /await relaunchWorkBuddy\(\)/);
   assert.match(lib, /function retireLogoutMarker/);
   assert.match(lib, /retireLogoutMarker\(log\);/);
 });
@@ -66,6 +64,19 @@ test('account switching retires WorkBuddy logout marker', () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('seamless login refreshes the running WorkBuddy session', () => {
+  const script = read('inject.js');
+  const start = script.indexOf('function startSeamlessLogin');
+  const end = script.indexOf('\n    // ===== 主题系统', start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const seamless = script.slice(start, end);
+  assert.match(seamless, /扫码确认后会自动切换到新账号\.\.\./);
+  assert.match(seamless, /api\('\/api\/switch'/);
+  assert.match(seamless, /reload: true/);
+  assert.doesNotMatch(seamless, /没弹出来\?|点此打开授权页/);
 });
 
 test('CDP startup supports a persisted fallback port instead of hardcoding 9222', () => {
