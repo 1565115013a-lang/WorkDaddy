@@ -365,6 +365,7 @@ function sha256File(file) {
 const WB_API_ENDPOINT = 'https://www.codebuddy.cn';
 const WB_API_PREFIX = '/v2/plugin';
 const OAUTH_TIMEOUT_SECONDS = 600;
+const OAUTH_RESULT_RETENTION_SECONDS = 300;
 const oauthStates = new Map(); // loginId -> { state, expiresAt, done, result, error }
 
 // 时间戳归一化：秒/毫秒/字符串 → 毫秒；无效返回 null
@@ -418,12 +419,23 @@ function httpJson(url, method, body, headers) {
 // （{account, auth, accounts, allAccounts}，与 lib.js switchTo 写回的格式一致）
 function buildSeamlessAuthFile(tokenData, accData) {
   const now = Date.now();
-  const domain = String(tokenData.domain || '');
-  let expiresAt = normTs(tokenData.expiresAt);
-  if (expiresAt == null && tokenData.expiresIn) expiresAt = now + Number(tokenData.expiresIn) * 1000;
-  let refreshExpiresAt = normTs(tokenData.refreshExpiresAt);
-  if (refreshExpiresAt == null && tokenData.refreshExpiresIn) {
-    refreshExpiresAt = now + Number(tokenData.refreshExpiresIn) * 1000;
+  const rawToken = tokenData && typeof tokenData === 'object' ? tokenData : {};
+  const domain = String(rawToken.domain || '');
+  let expiresAt = normTs(rawToken.expiresAt != null ? rawToken.expiresAt : rawToken.expires_at);
+  if (expiresAt == null) {
+    const expiresIn = Number(rawToken.expiresIn != null ? rawToken.expiresIn : rawToken.expires_in);
+    if (Number.isFinite(expiresIn) && expiresIn > 0) expiresAt = now + expiresIn * 1000;
+  }
+  let refreshExpiresAt = normTs(
+    rawToken.refreshExpiresAt != null ? rawToken.refreshExpiresAt : rawToken.refresh_expires_at
+  );
+  if (refreshExpiresAt == null) {
+    const refreshExpiresIn = Number(
+      rawToken.refreshExpiresIn != null ? rawToken.refreshExpiresIn : rawToken.refresh_expires_in
+    );
+    if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) {
+      refreshExpiresAt = now + refreshExpiresIn * 1000;
+    }
   }
 
   const accountObj = Object.assign({}, accData && typeof accData === 'object' ? accData : {}, {
@@ -436,16 +448,18 @@ function buildSeamlessAuthFile(tokenData, accData) {
     pluginEnabled: true,
   });
 
-  const authObj = {
-    accessToken: String(tokenData.accessToken || ''),
-    refreshToken: String(tokenData.refreshToken || ''),
-    tokenType: String(tokenData.tokenType || 'Bearer'),
+  // 保留官方响应中的额外字段（例如 idToken/sessionState），只覆盖标准字段。
+  // WorkBuddy 后续可能依赖这些字段，不能把 OAuth 响应压缩成固定白名单。
+  const authObj = Object.assign({}, rawToken, {
+    accessToken: String(rawToken.accessToken || rawToken.access_token || ''),
+    refreshToken: String(rawToken.refreshToken || rawToken.refresh_token || ''),
+    tokenType: String(rawToken.tokenType || rawToken.token_type || 'Bearer'),
     domain,
     lastRefreshTime: now,
-    scope: tokenData.scope || 'openid profile offline_access email',
-    notBeforePolicy: 0,
-    sessionState: '',
-  };
+    scope: rawToken.scope || 'openid profile offline_access email',
+    notBeforePolicy: rawToken.notBeforePolicy != null ? rawToken.notBeforePolicy : 0,
+    sessionState: rawToken.sessionState || '',
+  });
   if (expiresAt != null) {
     authObj.expiresAt = expiresAt;
     authObj.expiresIn = Math.max(0, Math.round((expiresAt - now) / 1000));
@@ -467,6 +481,11 @@ function buildSeamlessAuthFile(tokenData, accData) {
   all.push(accountObj);
 
   return { account: accountObj, auth: authObj, accounts: all, allAccounts: all };
+}
+
+function scheduleOAuthStateCleanup(loginId) {
+  const timer = setTimeout(() => oauthStates.delete(loginId), OAUTH_RESULT_RETENTION_SECONDS * 1000);
+  if (timer.unref) timer.unref();
 }
 
 // 把无感登录采集到的账号写入 accounts/<uid>.info 备份（不触碰当前登录文件）
@@ -498,6 +517,7 @@ async function oauthPollOnce(loginId) {
   if (Date.now() > info.expiresAt) {
     info.done = true;
     info.error = '登录超时，请重新发起';
+    scheduleOAuthStateCleanup(loginId);
     return { done: true, error: info.error };
   }
   const tokenResp = await httpJson(
@@ -526,6 +546,7 @@ async function oauthPollOnce(loginId) {
   } catch (e) {
     info.error = e.message;
   }
+  scheduleOAuthStateCleanup(loginId);
   return { done: true, result: info.result, error: info.error };
 }
 
@@ -3075,6 +3096,11 @@ function handleApi(req, res) {
           result: null,
           error: null,
         });
+        const cleanupTimer = setTimeout(
+          () => oauthStates.delete(loginId),
+          (OAUTH_TIMEOUT_SECONDS + OAUTH_RESULT_RETENTION_SECONDS) * 1000
+        );
+        if (cleanupTimer.unref) cleanupTimer.unref();
         log(`[oauth] 发起无感登录 loginId=${loginId}`);
         return json(res, 200, { ok: true, loginId, verificationUri: authUrl, expiresIn: OAUTH_TIMEOUT_SECONDS });
       } catch (e) {

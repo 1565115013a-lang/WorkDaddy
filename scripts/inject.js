@@ -2491,6 +2491,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 方法一：假退出（保留两击确认，防误触）
       var logoutOpt = mask.querySelector('[data-way="logout"]');
       var logoutArmed = false;
+      var logoutArmedTimer = null;
+      var resetLogoutArm = function () {
+        logoutArmed = false;
+        logoutOpt.classList.remove('armed');
+        logoutOpt.querySelector('.wbs-login-opt-title').textContent = '方法一：假退出当前账号';
+        logoutOpt.querySelector('.wbs-login-opt-desc').textContent = '退出 WorkBuddy 回到登录页扫码，当前账号已备份，随时可切回';
+      };
       logoutOpt.addEventListener('click', function () {
         if (logoutOpt.disabled) return;
         if (!logoutArmed) {
@@ -2498,8 +2505,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           logoutOpt.classList.add('armed');
           logoutOpt.querySelector('.wbs-login-opt-title').textContent = '再点一次，确认假退出';
           logoutOpt.querySelector('.wbs-login-opt-desc').textContent = 'WorkBuddy 将退出并重新打开到登录页';
+          logoutArmedTimer = setBuildTimeout(resetLogoutArm, 4000);
           return;
         }
+        if (logoutArmedTimer) clearTimeout(logoutArmedTimer);
         logoutOpt.disabled = true;
         api('/api/logout', { method: 'POST' })
           .then(function () {
@@ -2508,11 +2517,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           })
           .catch(function (e) {
             toast('退出失败: ' + (e.message || e), true, root);
-            logoutArmed = false;
+            resetLogoutArm();
             logoutOpt.disabled = false;
-            logoutOpt.classList.remove('armed');
-            logoutOpt.querySelector('.wbs-login-opt-title').textContent = '方法一：假退出当前账号';
-            logoutOpt.querySelector('.wbs-login-opt-desc').textContent = '退出 WorkBuddy 回到登录页扫码，当前账号已备份，随时可切回';
           });
       });
 
@@ -2568,7 +2574,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
               .catch(function (e) {
                 if (cancelled) return;
                 var errEl = statusEl();
-                if (errEl) errEl.textContent = '登录失败: ' + (e.message || e);
+                if (errEl) errEl.textContent = '网络暂时失败，正在重试…';
+                pollTimer = setTimeout(poll, 1500);
               });
           };
           pollTimer = setTimeout(poll, 1500);
