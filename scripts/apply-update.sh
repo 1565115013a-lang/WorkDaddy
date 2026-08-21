@@ -17,11 +17,15 @@ exec >>"$LOG" 2>&1
 
 echo "[apply] $(date '+%F %T') start src=$SRC_APP dst=$APP_PATH"
 
-# 1) 等待旧 daemon 完全退出（端口释放）——运行中的 app 无法被替换
+# 1) 先终止旧 daemon，再等待端口释放——运行中的 app 无法被替换。
+# launchd bootout 是异步的；先杀进程可以避免正常更新路径白等 30 秒。
+pkill -f "$APP_PATH/Contents/Resources/scripts/daemon.js" 2>/dev/null || true
+pkill -f "scripts/daemon.js" 2>/dev/null || true
 for i in $(seq 1 30); do
   if ! lsof -ti tcp:"$UI_PORT" >/dev/null 2>&1; then break; fi
   sleep 1
 done
+# KeepAlive 可能在第一次 pkill 后短暂拉起旧 daemon；替换前再清一次。
 pkill -f "$APP_PATH/Contents/Resources/scripts/daemon.js" 2>/dev/null || true
 pkill -f "scripts/daemon.js" 2>/dev/null || true
 sleep 1

@@ -9,6 +9,27 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $targetScripts = Join-Path $AppDir 'scripts'
+$sentryReporter = Join-Path $SrcDir 'sentry-report.js'
+$nodeBin = $null
+
+# WorkBuddy 通常自带 Node；安装失败上报不依赖 npm 或 Electron。
+try {
+  $managedNodeRoot = Join-Path $env:USERPROFILE '.workbuddy\binaries\node\versions'
+  $nodeBin = Get-ChildItem -Path $managedNodeRoot -Filter 'node.exe' -File -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+} catch {}
+if (-not $nodeBin) {
+  try { $nodeBin = (Get-Command node -ErrorAction SilentlyContinue).Source } catch {}
+}
+
+function Send-Sentry {
+  param([string]$Stage, [string]$Message, [int]$ExitCode = 0)
+  if (-not $nodeBin -or -not (Test-Path $sentryReporter)) { return }
+  try {
+    $extra = @{ exitCode = $ExitCode } | ConvertTo-Json -Compress
+    & $nodeBin $sentryReporter --stage $Stage --message $Message --extra-json $extra *> $null
+  } catch {}
+}
 
 Write-Host '=============================================================='
 Write-Host ' WorkDaddy Windows 安装'
@@ -19,6 +40,7 @@ Write-Host ("  安装目录 : " + $AppDir)
 # 1) 复制（排除开发/临时文件；node_modules/ws 随包带入）
 if (-not (Test-Path (Join-Path $SrcDir 'daemon.js'))) {
   Write-Host '错误：源目录中找不到 daemon.js，请从仓库 scripts/ 目录运行本脚本。'
+  Send-Sentry 'windows-install-missing-files' '安装源目录中找不到 daemon.js' 1
   exit 1
 }
 New-Item -ItemType Directory -Force -Path $targetScripts | Out-Null
@@ -33,6 +55,7 @@ if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
   $rc = $LASTEXITCODE
   if ($rc -ge 8) {
     Write-Host "复制失败（robocopy=$rc）"
+    Send-Sentry 'windows-install-copy' "robocopy 复制失败 (code=$rc)" $rc
     exit 2
   }
 }
@@ -56,6 +79,7 @@ try {
   Write-Host '  自启注册：HKCU\...\Run\WorkDaddy = ' $launcher
 } catch {
   Write-Host ('  自启注册失败（可忽略，之后手动双击 launcher.cmd 即可）: ' + $_.Exception.Message)
+  Send-Sentry 'windows-install-autostart' ('注册登录自启失败: ' + $_.Exception.Message) 0
 }
 
 # 4) 启动（daemon + 以 CDP 模式重启 WorkBuddy + 注入）
@@ -97,6 +121,7 @@ try {
   if (Test-Path $logoIco) { Write-Host ('  图标         : ' + $logoIco) }
 } catch {
   Write-Host ('  桌面快捷方式创建失败（可忽略，之后可手动创建）: ' + $_.Exception.Message)
+  Send-Sentry 'windows-install-shortcut' ('创建桌面快捷方式失败: ' + $_.Exception.Message) 0
 }
 
 Write-Host '=============================================================='

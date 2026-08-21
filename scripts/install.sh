@@ -32,6 +32,23 @@ if [ -z "$NODE" ]; then
   echo "错误: 未找到 node，请先安装 Node.js"; exit 1
 fi
 
+REPORTER="$DIR/scripts/sentry-report.js"
+report_install_failure() {
+  local code="$1"
+  if [ -f "$REPORTER" ]; then
+    "$NODE" "$REPORTER" \
+      --stage macos-install \
+      --message "install.sh 失败 (exit=${code})" \
+      --extra-json "{\"exitCode\":${code}}" >/dev/null 2>&1 || true
+  fi
+}
+on_install_exit() {
+  local code="$?"
+  if [ "$code" -ne 0 ]; then report_install_failure "$code"; fi
+  return "$code"
+}
+trap on_install_exit EXIT
+
 echo "==> 创建备份目录: $DATA_DIR"
 mkdir -p "$DATA_DIR/accounts"
 chmod 700 "$DATA_DIR"
@@ -43,7 +60,10 @@ rm -f "$LEGACY_PLIST"
 pkill -f "$DIR/scripts/daemon.js" 2>/dev/null || true
 
 echo "==> 首次同步当前登录账号"
-"$NODE" "$DIR/scripts/sync.js" || echo "   (首次同步失败，守护进程启动后会自动重试)"
+if ! "$NODE" "$DIR/scripts/sync.js"; then
+  "$NODE" "$REPORTER" --stage macos-sync --message "首次同步当前账号失败" >/dev/null 2>&1 || true
+  echo "   (首次同步失败，守护进程启动后会自动重试)"
+fi
 
 echo "==> 注册 launchd 守护进程: $LABEL"
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -108,7 +128,7 @@ echo "=============================================="
 echo "✅ 安装完成！"
 echo "   Web 界面 : http://127.0.0.1:${UI_PORT}"
 echo "   备份目录 : ${DATA_DIR}"
-echo "   CDP 端口 : ${CDP_PORT:-自动探测 (9222/9223/9333)}"
+echo "   CDP 端口 : ${CDP_PORT:-自动选择 (9222-9232/9333，端口占用会自动切换)}"
 if [ "$LAUNCHD_OK" = "1" ]; then
   echo "   开机自启 : launchd 已注册 ✅"
 else
@@ -117,7 +137,7 @@ fi
 echo ""
 echo "下一步：让 CDP 生效（可选但推荐）"
 echo "   bash \"$DIR/scripts/relaunch-with-cdp.sh\""
-echo "   即以 --remote-debugging-port=9222 重启 WorkBuddy，"
+echo "   将以自动选择的 --remote-debugging-port 重启 WorkBuddy，"
 echo "   之后登录/切换账号会实时自动备份，切换后可直接刷新窗口。"
 echo "=============================================="
 

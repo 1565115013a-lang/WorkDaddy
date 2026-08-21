@@ -10,10 +10,10 @@
 #   2) 恢复登录：从本地备份选择一个账号写入登录文件，再启动 WorkBuddy
 #   3) 退出
 #
-# 用法: bash scripts/relaunch-with-cdp.sh [CDP端口，默认 9222]
+# 用法: bash scripts/relaunch-with-cdp.sh [CDP端口，默认自动选择 9222-9232/9333]
 set -uo pipefail
 
-PORT="${WBSWITCH_CDP_PORT:-${1:-9222}}"
+PORT="${WBSWITCH_CDP_PORT:-${1:-}}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.workbuddy.workdaddy"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
@@ -28,9 +28,49 @@ else
 fi
 AUTH_FILE="${WBSWITCH_AUTH_FILE:-$HOME/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info}"
 APP_BIN="/Applications/WorkBuddy.app/Contents/MacOS/Electron"
+CDP_PORT_FILE="$DATA_DIR/cdp-port.json"
 
 # 统一使用的 node 路径（优先系统 PATH，兜底用 managed runtime）
 NODE_BIN="$(command -v node || echo /Users/h/.workbuddy/binaries/node/versions/22.22.2/bin/node)"
+REPORTER="$DIR/scripts/sentry-report.js"
+report_relaunch_failure() {
+  local code="$1"
+  if [ -f "$REPORTER" ] && [ -x "$NODE_BIN" ]; then
+    "$NODE_BIN" "$REPORTER" --stage macos-relaunch --message "relaunch-with-cdp.sh 失败 (exit=${code})" --extra-json "{\"exitCode\":${code}}" >/dev/null 2>&1 || true
+  fi
+}
+on_relaunch_exit() {
+  local code="$?"
+  if [ "$code" -ne 0 ]; then report_relaunch_failure "$code"; fi
+  return "$code"
+}
+trap on_relaunch_exit EXIT
+
+valid_port() { [ "${1:-0}" -ge 1024 ] 2>/dev/null && [ "${1:-0}" -le 65535 ] 2>/dev/null; }
+port_in_use() {
+  if command -v nc >/dev/null 2>&1; then nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; else curl -s --max-time 1 "http://127.0.0.1:$1/" >/dev/null 2>&1; fi
+}
+is_workbuddy_cdp() { curl -fsS --max-time 1 "http://127.0.0.1:$1/json/version" 2>/dev/null | grep -qiE 'WorkBuddy|CodeBuddy'; }
+resolve_cdp_port() {
+  local saved="" p
+  if [ -f "$CDP_PORT_FILE" ]; then saved="$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CDP_PORT_FILE" | head -1)"; fi
+  local candidates=""
+  valid_port "$PORT" && candidates="$candidates $PORT"
+  valid_port "$saved" && candidates="$candidates $saved"
+  for p in $(seq 9222 9232); do candidates="$candidates $p"; done
+  candidates="$candidates 9333"
+  for p in $candidates; do
+    if is_workbuddy_cdp "$p"; then PORT="$p"; break; fi
+  done
+  if ! is_workbuddy_cdp "$PORT"; then
+    for p in $candidates; do if ! port_in_use "$p"; then PORT="$p"; break; fi; done
+  fi
+  if ! valid_port "$PORT"; then echo "错误：9222-9232、9333 均被占用，无法启动 CDP"; exit 1; fi
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+  printf '{"port":%s,"updatedAt":"%s"}\n' "$PORT" "$(date -u +%FT%TZ)" > "${CDP_PORT_FILE}.tmp.$$" 2>/dev/null || true
+  mv -f "${CDP_PORT_FILE}.tmp.$$" "$CDP_PORT_FILE" 2>/dev/null || true
+}
+resolve_cdp_port
 
 # 清理旧版常驻服务，但保留 HelloBuddy 数据目录；新 daemon 会在启动时迁移旧账号。
 launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST" 2>/dev/null || true
@@ -178,6 +218,7 @@ launch_plugin() {
     echo "警告：等待 15 秒仍未检测到 WorkBuddy CDP 端口 ${PORT}。"
     echo "   WorkBuddy 可能忽略了该参数，或启动较慢。可再等几秒后执行："
     echo "   curl http://127.0.0.1:${PORT}/json/version"
+    "$NODE_BIN" "$REPORTER" --stage macos-cdp-timeout --message "等待 15 秒未检测到 WorkBuddy CDP 端口" --extra-json "{\"cdpPort\":${PORT}}" >/dev/null 2>&1 || true
   fi
 }
 

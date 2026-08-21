@@ -54,6 +54,8 @@ const AUTH_FILE =
         'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
       ));
 
+const LOGOUT_MARKER = `${AUTH_FILE}.logged-out`;
+
 function defaultDataDir() {
   // 旧版 launchd 可能把 WBSWITCH_DATA_DIR 设成 HelloBuddy；新版本始终落到 WorkDaddy，
   // 避免旧服务被新 daemon 拉起后继续写入旧目录。
@@ -72,6 +74,40 @@ function logFile(dataDir) {
 }
 function backupPath(dataDir, uid) {
   return path.join(accountsDir(dataDir), `${uid}.info`);
+}
+
+/** WorkBuddy ignores auth files while this marker exists; retire it after a switch. */
+function retireLogoutMarker(log = () => {}) {
+  if (!fs.existsSync(LOGOUT_MARKER)) return false;
+  try {
+    const retired = `${LOGOUT_MARKER}.retired.${process.pid}.${Date.now()}`;
+    fs.renameSync(LOGOUT_MARKER, retired);
+    try {
+      fs.unlinkSync(retired);
+    } catch (_) {
+      // A leftover retired marker is harmless and keeps the operation recoverable.
+    }
+    log('[switch] 已清理 WorkBuddy 登录退出标记');
+    return true;
+  } catch (e) {
+    if (IS_WIN) {
+      throw new Error(`清理登录退出标记失败(${e.code || ''}): ${(e.message || e).toString().slice(0, 200)}`);
+    }
+    // WorkBuddy may launch the daemon in a sandbox that cannot unlink auth files.
+    try {
+      const { execFileSync } = require('child_process');
+      const markerQ = LOGOUT_MARKER.replace(/"/g, '\\"');
+      execFileSync('osascript', ['-e', `do shell script "rm -f \\\"${markerQ}\\\""`], {
+        timeout: 15000,
+        stdio: 'pipe',
+      });
+      if (fs.existsSync(LOGOUT_MARKER)) throw new Error('标记仍然存在');
+      log('[switch] 已通过系统授权清理 WorkBuddy 登录退出标记');
+      return true;
+    } catch (e2) {
+      throw new Error(`清理登录退出标记失败: ${(e2.message || e2).toString().slice(0, 200)}`);
+    }
+  }
 }
 
 /**
@@ -308,6 +344,7 @@ function switchTo(dataDir, uid, log = () => {}) {
       throw new Error(`写入登录文件失败: ${(e2.message || e2).toString().slice(0, 200)}`);
     }
   }
+  retireLogoutMarker(log);
   log(`[switch] 已切换登录账号为 ${acct.nickname || uid} (${uid})`);
   return { uid: acct.uid, nickname: acct.nickname || '', uin: acct.uin || '' };
 }
@@ -320,6 +357,7 @@ module.exports = {
   metaFile,
   logFile,
   backupPath,
+  retireLogoutMarker,
   ensureDirs,
   readAuthFile,
   updateMeta,

@@ -14,7 +14,7 @@
  *   WBSWITCH_AUTH_FILE   登录信息文件路径（默认 CodeBuddyExtension 下 auth/workbuddy-desktop.info）
  *   WBSWITCH_DATA_DIR    备份数据目录（默认 ~/Library/Application Support/WorkDaddy）
  *   WBSWITCH_PORT        Web 界面端口（默认 47832，被占用则 +1 尝试）
- *   WBSWITCH_CDP_PORT    WorkBuddy CDP 端口（默认自动探测 9222/9223/9333）
+ *   WBSWITCH_CDP_PORT    WorkBuddy CDP 首选端口（被占用时自动切换到 9222-9232/9333）
  *
  * 用法: node scripts/daemon.js
  */
@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
@@ -56,6 +57,8 @@ const {
   backupPath,
   updateMeta,
 } = require('./lib.js');
+const { extractCreditSegments, sortCreditSegments } = require('./credit-segments.js');
+const { captureException } = require('./sentry-report.js');
 
 const DATA_DIR = defaultDataDir();
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -71,14 +74,14 @@ const DATA_DIR = defaultDataDir();
 // 1.0.5：修复自动更新「缺少解包后的新应用」——下载阶段只落 .dmg 从未解包，
 //       applyUpdate 现改为在安装前调用 extractAppFromDmg 解出 WorkDaddy.app（幂等），
 //       解包函数亦增强（清理残留挂载点、只读挂载、校验 dmg 内存在 WorkDaddy.app）
-// 1.0.6：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照
+// 1.0.6：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照；
+//       修复跨平台自动更新并展示按到期时间拆分的积分明细
 // 1.0.7：兼容无全局 WebSocket 的 Node 18/20，使用内置 ws 建立 CDP
 // 1.0.8：去除 launchd 重定向造成的重复日志，并记录 launcher 选择的 Node 运行时
 // 1.0.9：诊断快照中的常见 token 字段脱敏
 // 1.0.10：daemon.log 按 10 MB 滚动保留最近 3 份，避免长期运行无限增长
-// 发布版本保持 1.0.5；build id 用于同版本修复包强制替换旧 daemon。
-const DAEMON_VERSION = '1.0.5';
-const DAEMON_BUILD_ID = 'accounts-migration-fix-20260820';
+const DAEMON_VERSION = '1.0.7';
+const DAEMON_BUILD_ID = 'cdp-port-fallback-fix-20260821';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -89,9 +92,81 @@ let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（被占用时 +1）
 const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
   ? parseInt(process.env.WBSWITCH_CDP_PORT, 10)
   : null;
+const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const WATCH_INTERVAL = 3000; // 文件监听兜底
 const BACKUP_DEBOUNCE = 1500; // CDP 事件触发的备份防抖
 const CDP_RECONNECT_MS = 5000;
+
+function validCdpPort(port) {
+  return Number.isInteger(port) && port >= 1024 && port <= 65535;
+}
+
+function readCdpPortFile() {
+  try {
+    const value = JSON.parse(fs.readFileSync(CDP_PORT_FILE, 'utf8')).port;
+    return validCdpPort(value) ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeCdpPortFile(port, logFn = log) {
+  if (!validCdpPort(port)) return false;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = `${CDP_PORT_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ port, updatedAt: new Date().toISOString() }) + '\n', { mode: 0o600 });
+    fs.renameSync(tmp, CDP_PORT_FILE);
+    return true;
+  } catch (e) {
+    try { fs.unlinkSync(`${CDP_PORT_FILE}.tmp.${process.pid}`); } catch (_) {}
+    logFn(`[cdp] 保存端口配置失败: ${e.message}`);
+    return false;
+  }
+}
+
+function cdpPortCandidates() {
+  const ports = [];
+  const add = (port) => { if (validCdpPort(port) && !ports.includes(port)) ports.push(port); };
+  add(CDP_PORT_HINT);
+  add(readCdpPortFile());
+  for (let port = 9222; port <= 9232; port++) add(port);
+  add(9333);
+  return ports;
+}
+
+function isLocalPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    let settled = false;
+    const finish = (available) => {
+      if (settled) return;
+      settled = true;
+      if (available) {
+        try { server.close(() => resolve(true)); } catch (_) { resolve(true); }
+      } else {
+        try { server.close(); } catch (_) {}
+        resolve(false);
+      }
+    };
+    server.once('error', () => finish(false));
+    server.listen({ host: HOST, port }, () => finish(true));
+  });
+}
+
+async function findAvailableCdpPort() {
+  for (const port of cdpPortCandidates()) {
+    if (await isLocalPortAvailable(port)) return port;
+  }
+  throw new Error('9222-9232、9333 均被占用，无法为 WorkBuddy 分配 CDP 端口');
+}
+
+async function selectCdpPort(logFn = log) {
+  const port = await findAvailableCdpPort();
+  writeCdpPortFile(port, logFn);
+  logFn(`[cdp] 为 WorkBuddy 选择端口 ${port}`);
+  return port;
+}
 
 /* ================= 自动更新（GitHub Releases 检查 + 下载 + 辅助脚本替换） =================
  * 业界标准（Sparkle 同款链路）：daemon 定时请求 GitHub Releases API 取最新 tag/资产，
@@ -468,7 +543,7 @@ let lastInjectTs = 0;
 let injectRetryTimer = null; // 被节流跳过的自动注入的兜底补种定时器
 
 async function findCdpEndpoint() {
-  const ports = CDP_PORT_HINT ? [CDP_PORT_HINT] : [9222, 9223, 9333];
+  const ports = cdpPortCandidates();
   for (const p of ports) {
     try {
       const [versionRes, listRes] = await Promise.all([
@@ -479,7 +554,10 @@ async function findCdpEndpoint() {
       const list = await listRes.json();
       const targets = Array.isArray(list) ? list : [];
       const belongsToWorkBuddy = /workbuddy|codebuddy/i.test([version.Browser, version['User-Agent']].filter(Boolean).join(' '));
-      if (belongsToWorkBuddy && targets.some(isWorkBuddyCdpTarget)) return p;
+      if (belongsToWorkBuddy && targets.some(isWorkBuddyCdpTarget)) {
+        if (readCdpPortFile() !== p) writeCdpPortFile(p);
+        return p;
+      }
       // 旧逻辑会把任意 Chromium（常见为 Antigravity）当成 WorkBuddy。
       // 扫描到历史误注入标记时仅做清理，不对该应用执行任何新注入。
       await cleanupForeignInjectedTargets(targets);
@@ -871,36 +949,45 @@ function findWorkDaddyApp() {
 
 /** 重新启动 WorkBuddy：macOS 优先走 WorkDaddy.app launcher；Windows 直接带 CDP 参数重启 exe */
 function relaunchWorkBuddy() {
-  return new Promise((resolve, reject) => {
+  return (async () => {
+    const port = await selectCdpPort(log);
     if (IS_WIN) {
       const bin = resolveWorkBuddyBinary();
-      if (!bin) return reject(new Error('未找到 WorkBuddy.exe（可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定）'));
-      log(`[logout] 以 --remote-debugging-port=9222 重启 WorkBuddy: ${bin}`);
-      const child = spawn(bin, ['--remote-debugging-port=9222'], { detached: true, stdio: 'ignore', windowsHide: true });
-      child.on('error', (e) => reject(e));
+      if (!bin) throw new Error('未找到 WorkBuddy.exe（可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定）');
+      log(`[logout] 以 --remote-debugging-port=${port} 重启 WorkBuddy: ${bin}`);
+      const child = spawn(bin, [`--remote-debugging-port=${port}`], { detached: true, stdio: 'ignore', windowsHide: true });
+      await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('spawn', resolve);
+      });
       child.unref();
-      return resolve();
+      return;
     }
     const workDaddy = findWorkDaddyApp();
     if (workDaddy) {
       log(`[logout] 正在打开 WorkDaddy (${workDaddy})，由其 launcher 重启 WorkBuddy`);
       const child = spawn('open', [workDaddy], { detached: true, stdio: 'ignore' });
-      child.on('error', (e) => reject(e));
+      await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('spawn', resolve);
+      });
       child.unref();
-      return resolve();
+      return;
     }
     if (!fs.existsSync(WORKBUDDY_BINARY)) {
-      return reject(new Error(`未找到 WorkBuddy 可执行文件: ${WORKBUDDY_BINARY}`));
+      throw new Error(`未找到 WorkBuddy 可执行文件: ${WORKBUDDY_BINARY}`);
     }
-    log('[logout] 未找到 WorkDaddy.app，直接重新启动 WorkBuddy（带 CDP 端口 9222）');
-    const child = spawn(WORKBUDDY_BINARY, ['--remote-debugging-port=9222'], {
+    log(`[logout] 未找到 WorkDaddy.app，直接重新启动 WorkBuddy（带 CDP 端口 ${port}）`);
+    const child = spawn(WORKBUDDY_BINARY, [`--remote-debugging-port=${port}`], {
       detached: true,
       stdio: 'ignore',
     });
-    child.on('error', (e) => reject(e));
+    await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('spawn', resolve);
+    });
     child.unref();
-    resolve();
-  });
+  })();
 }
 
 /**
@@ -2511,7 +2598,7 @@ function formatLocalDateTime(d) {
  * 查询剩余积分余额（单套 PackageCodes）。
  * 接口返回 Account 数组，累加每个 Account 的 CapacityRemainPrecise。
  */
-async function fetchResource(accessToken, body) {
+async function fetchResource(accessToken, body, source) {
   const r = await fetch('https://www.workbuddy.cn/billing/meter/get-user-resource', {
     method: 'POST',
     headers: {
@@ -2554,6 +2641,7 @@ async function fetchResource(accessToken, body) {
     credits: parseFloat(credits.toFixed(2)),
     count: accounts.length,
     totalDosage: data && data.TotalDosage,
+    segments: extractCreditSegments(accounts, source),
   };
 }
 
@@ -2573,7 +2661,7 @@ async function robustFetchResource(accessToken, body, label) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const r = await fetchResource(accessToken, body);
+      const r = await fetchResource(accessToken, body, label);
       // 偶发返回空 Accounts（count=0）也会把该组余额算成 0，同样再多试一次（bound 在 3 次内）
       if (r.count === 0 && attempt < 3) {
         log(`[credits] ${label} 返回空结果，第 ${attempt} 次重试`);
@@ -2618,26 +2706,44 @@ async function fetchCredits(accessToken) {
       'TCACA_code_023_4xbGhMrE6q',
       'TCACA_code_026_BaESVICNoi',
       'TCACA_code_027_0FCGVA6vSa',
+      // Current CodeBuddy activity/bonus packages. Older WorkBuddy accounts use the
+      // codes above; querying both keeps daily grants visible across editions.
+      'TCACA_code_035_ArVxJcGDsm',
+      'TCACA_code_036_lupO5WgNdG',
+      'TCACA_code_037_WxOD3MpI2o',
+      'TCACA_code_039_KRcQj7wUat',
+      'TCACA_code_040_mi9rCYg46x',
     ],
   };
   const [m, p] = await Promise.allSettled([
     robustFetchResource(accessToken, meterBody, 'meter'),
     robustFetchResource(accessToken, pkgBody, 'package'),
   ]);
-  const meter = m.status === 'fulfilled' ? m.value : { credits: 0, count: 0, totalDosage: 0 };
-  const pkg = p.status === 'fulfilled' ? p.value : { credits: 0, count: 0, totalDosage: 0 };
+  const meter = m.status === 'fulfilled' ? m.value : { credits: 0, count: 0, totalDosage: 0, segments: [] };
+  const pkg = p.status === 'fulfilled' ? p.value : { credits: 0, count: 0, totalDosage: 0, segments: [] };
   if (m.status === 'rejected' && p.status === 'rejected') {
     throw m.reason; // 两组都失败才真正报错
   }
   const totalDosage = (Number(meter.totalDosage) || 0) + (Number(pkg.totalDosage) || 0);
+  const credits = parseFloat((meter.credits + pkg.credits).toFixed(2));
+  let segments = sortCreditSegments([...(meter.segments || []), ...(pkg.segments || [])]);
+  const visibleSegmentCredits = segments.reduce((sum, segment) => sum + segment.remaining, 0);
+  // Keep the total and the bar consistent even when a new API field is not recognized yet.
+  if (credits > visibleSegmentCredits + 0.01) {
+    segments = sortCreditSegments([
+      ...segments,
+      { remaining: credits - visibleSegmentCredits, total: credits - visibleSegmentCredits, expiresAt: null, source: '其他积分' },
+    ]);
+  }
   return {
-    credits: parseFloat((meter.credits + pkg.credits).toFixed(2)),
+    credits,
     count: meter.count + pkg.count,
     totalDosage,
     meterCredits: meter.credits,
     packageCredits: pkg.credits,
     meterError: m.status === 'rejected' ? String((m.reason && m.reason.message) || m.reason) : null,
     packageError: p.status === 'rejected' ? String((p.reason && p.reason.message) || m.reason) : null,
+    segments,
   };
 }
 
@@ -2843,6 +2949,7 @@ function handleApi(req, res) {
           packageCredits: r.packageCredits,
           meterError: r.meterError,
           packageError: r.packageError,
+          segments: r.segments,
         });
       } catch (e) {
         log(`[credits] 查询 ${uid} 积分失败: ${e.message}`);
@@ -3169,7 +3276,7 @@ function handleApi(req, res) {
   if (req.method === 'GET' && p === '/api/devtools-url') {
     return new Promise((resolve) => {
       const httpMod = require('http');
-      const devtoolsPort = cdp.port || CDP_PORT_HINT || 9222;
+      const devtoolsPort = cdp.port || readCdpPortFile() || CDP_PORT_HINT || 9222;
       httpMod.get('http://127.0.0.1:' + devtoolsPort + '/json/list', (r) => {
         let d = '';
         r.on('data', (c) => (d += c));
@@ -3573,22 +3680,29 @@ function handleApi(req, res) {
     return readBody(req).then(async (body) => {
       const uid = (body.uid || '').trim();
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
+      let acct = null;
+      let hostStopped = false;
+      let reloaded = false;
       try {
-        const acct = switchTo(DATA_DIR, uid, log);
+        // WorkBuddy 在宿主进程内缓存认证状态；仅刷新 renderer 会回到登录页。
+        // 先退出宿主，避免它在退出阶段把旧账号写回 auth 文件，再写入目标备份并重启。
+        if (body.reload) {
+          await quitWorkBuddy();
+          hostStopped = true;
+          log('[switch] WorkBuddy 已退出，准备写入目标账号登录文件');
+        }
+        acct = switchTo(DATA_DIR, uid, log);
         const hint = '登录文件已切换，请重启 WorkBuddy 使新账号生效';
-        let reloaded = false;
         if (body.reload) {
           try {
-            await reloadWorkBuddyPage();
+            await relaunchWorkBuddy();
             reloaded = true;
-            log('[switch] 已通过 CDP 刷新 WorkBuddy 窗口');
+            log('[switch] 已重启 WorkBuddy，目标账号应在宿主启动时加载');
             // 切换后通过接口自动签到（带每日缓存，幂等）
             claimDailyForUid(uid)
               .then((r) => log('[checkin] 切换后自动签到 ' + uid + ': ' + (r.ok ? '已领取' : '失败 ' + (r.reason || r.message))))
               .catch((e) => log('[checkin] 切换后签到异常: ' + e.message));
-          } catch (e) {
-            log(`[switch] CDP 刷新失败: ${e.message}`);
-          }
+          } catch (e) { throw new Error('WorkBuddy 重启失败: ' + e.message); }
         }
         return json(res, 200, {
           ok: true,
@@ -3598,6 +3712,15 @@ function handleApi(req, res) {
           hint: reloaded ? '已切换并触发窗口刷新' : hint,
         });
       } catch (e) {
+        // 切换写入或重启失败时，尽量恢复宿主，避免面板操作把 WorkBuddy 留在退出状态。
+        if (hostStopped && !reloaded) {
+          try {
+            await relaunchWorkBuddy();
+            log('[switch] 切换失败，已尝试恢复启动 WorkBuddy');
+          } catch (recoverError) {
+            log(`[switch] 切换失败且恢复启动失败: ${recoverError.message}`);
+          }
+        }
         return json(res, 500, { ok: false, error: e.message });
       }
     });
@@ -3766,7 +3889,7 @@ function startServer() {
   });
 
   // DevTools WebSocket 代理：/devtools-proxy/<targetId> —— 浏览器前端连 daemon（不校验 Origin），
-  // daemon 用无 Origin 的 WebSocket 连 9222 转发（Electron CDP 拒绝带 Origin 的连接）
+  // daemon 用无 Origin 的 WebSocket 连当前 CDP 端口转发（Electron CDP 拒绝带 Origin 的连接）
   if (wsLib) {
     const { WebSocketServer } = wsLib;
     const wss = new WebSocketServer({ noServer: true });
@@ -3777,7 +3900,9 @@ function startServer() {
       if (!m) { socket.destroy(); return; }
       wss.handleUpgrade(req, socket, head, (front) => {
         if (!WebSocketCtor) { try { front.close(); } catch (_) {} return; }
-        const back = new WebSocketCtor('ws://127.0.0.1:9222/devtools/page/' + m[1]);
+        const upstreamPort = cdp.port;
+        if (!upstreamPort) { try { front.close(); } catch (_) {} return; }
+        const back = new WebSocketCtor('ws://127.0.0.1:' + upstreamPort + '/devtools/page/' + m[1]);
         let backReady = false;
         let keepAlive = null;
         const queue = [];
@@ -3859,6 +3984,16 @@ function startServer() {
 }
 
 /* ================= 启动 ================= */
+
+process.on('uncaughtException', (error) => {
+  log('[fatal] 未捕获异常: ' + (error && error.stack || error));
+  captureException(error, { stage: 'daemon-uncaught' }).catch(() => {});
+  setTimeout(() => process.exit(1), 5500);
+});
+process.on('unhandledRejection', (reason) => {
+  log('[fatal] 未处理 Promise 异常: ' + (reason && reason.stack || reason));
+  captureException(reason, { stage: 'daemon-unhandled-rejection' }).catch(() => {});
+});
 
 ensureDirs(DATA_DIR, log);
 if (!acquireDaemonLock()) process.exit(0);

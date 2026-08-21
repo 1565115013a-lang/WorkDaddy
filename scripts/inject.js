@@ -150,16 +150,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '<circle cx="5.5" cy="5.5" r="1.5" fill="currentColor"/>' +
     '</svg>';
 
-  // 今日签到状态展示
+  // 今日签到状态展示：账号卡片底部与积分余额并列显示
+  function isIdentityExpired(a) {
+    if (!a) return false;
+    var checkin = a.checkin || {};
+    var code = String(checkin.code == null ? '' : checkin.code);
+    var message = String(checkin.message || '');
+    if (code === '401' || /401|Unauthorized|未授权|登录身份过期/.test(message)) return true;
+    if (a.tokenExpiresAt !== undefined && a.tokenExpiresAt !== null && a.tokenExpiresAt !== '') {
+      var expiry = Number(a.tokenExpiresAt);
+      if (!isFinite(expiry)) expiry = Date.parse(String(a.tokenExpiresAt));
+      if (isFinite(expiry) && expiry <= Date.now()) return true;
+    }
+    return false;
+  }
+
   function checkinHtml(a) {
     var c = a && a.checkin;
-    if (!c) return '<span class="wbs-ck pending">正在领取中</span>';
+    if (!c) return '<span class="wbs-ck wbs-checkin-tag pending">签到中</span>';
     // “本轮刚领取”和“今天已领取过”都是成功态，统一展示避免同一页面出现两套文案。
-    if (c.ok) return '<span class="wbs-ck ok">已领取 ✓</span>';
+    if (c.ok) return '<span class="wbs-ck wbs-checkin-tag ok">今日已签到✓</span>';
     // 认证类错误（401/未授权）统一显示友好文案（daemon 已产出，缓存残留旧文案时兜底）
     var msg = c.message || '失败';
     if (/401|Unauthorized|未授权|登录身份过期/.test(msg)) msg = '登录身份过期';
-    return '<span class="wbs-ck fail">' + msg + '</span>';
+    return '<span class="wbs-ck wbs-checkin-tag fail">' + msg + '</span>';
   }
 
   function el(tag, cls, html) {
@@ -521,6 +535,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<div class="click">',
       '<span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>',
       '<button class="button up" type="button" aria-label="Codex 助手">',
+      '<span class="wbs-fab-antenna" aria-hidden="true"><span class="wbs-fab-antenna-dot"></span></span>',
+      '<span class="wbs-fab-ear wbs-fab-ear-left" aria-hidden="true"></span>',
+      '<span class="wbs-fab-ear wbs-fab-ear-right" aria-hidden="true"></span>',
       '<div class="speak dblink"><div class="wrap"><div class="eye double-blink"></div><div class="eye double-blink"></div></div></div>',
       '<div class="speak doblink"><div class="wrap"><div class="eye down"></div><div class="eye down"></div></div></div>',
       '<div class="speak rblink"><div class="wrap"><div class="eye right-blink"></div><div class="eye right-blink"></div></div></div>',
@@ -776,6 +793,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var fab = root.querySelector('.wbs-fab');
       if (!fab) return;
       if (fab.classList.contains('hidden')) return; // 面板打开时保持隐藏
+      // WorkBuddy 首页 composer 的右上插槽存在时，按钮放回 WorkBuddy 窗口右下角，
+      // 避免被首页输入区的内部定位挤到中间位置。
+      var homeComposerCorner = document.querySelector('.wb-home-page [class*="_topRightSlotStandalone_"] > div:nth-child(1) > div:nth-child(3)');
+      if (homeComposerCorner) {
+        var cornerRect = homeComposerCorner.getBoundingClientRect();
+        if (cornerRect.width > 0 && cornerRect.height > 0) {
+          fab.classList.remove('fab--solid');
+          fab.style.position = 'fixed';
+          fab.style.left = 'auto';
+          fab.style.top = 'auto';
+          fab.style.right = '22px';
+          fab.style.bottom = '22px';
+          return;
+        }
+      }
       var target = null;
       var solid = false; // 贴消息队列上方时纯色背景（不毛玻璃）
       // 1) 消息队列展开时优先贴它
@@ -1297,6 +1329,64 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var enhancePane = root.querySelector('[data-pane="enhance"]');
     var aboutPane = root.querySelector('[data-pane="about"]');
     var logoutBtn = root.querySelector('[data-act="logout"]');
+    var creditTooltip = null;
+    var creditTooltipSegment = null;
+
+    function findCreditSegment(target) {
+      var node = target;
+      while (node && node !== accountsPane) {
+        if (node.nodeType === 1 && node.classList && node.classList.contains('wbs-credit-segment')) return node;
+        node = node.parentNode;
+      }
+      return null;
+    }
+
+    function hideCreditTooltip() {
+      creditTooltipSegment = null;
+      if (creditTooltip) creditTooltip.style.display = 'none';
+    }
+
+    function showCreditTooltip(segment) {
+      if (!segment || !segment.getAttribute('data-tip')) return;
+      if (!creditTooltip) {
+        creditTooltip = document.createElement('div');
+        creditTooltip.className = 'wbs-credit-tooltip';
+        creditTooltip.setAttribute('role', 'tooltip');
+        document.body.appendChild(creditTooltip);
+      }
+      creditTooltip.textContent = segment.getAttribute('data-tip');
+      creditTooltip.style.display = 'block';
+      var rect = segment.getBoundingClientRect();
+      var tipRect = creditTooltip.getBoundingClientRect();
+      var gap = 8;
+      var top = rect.top - tipRect.height - gap;
+      if (top < 8) top = rect.bottom + gap;
+      var left = rect.left + (rect.width / 2) - (tipRect.width / 2);
+      left = Math.max(8, Math.min(left, window.innerWidth - tipRect.width - 8));
+      creditTooltip.style.left = Math.round(left) + 'px';
+      creditTooltip.style.top = Math.round(top) + 'px';
+    }
+
+    if (accountsPane) {
+      listen(accountsPane, 'mouseover', function (event) {
+        var segment = findCreditSegment(event.target);
+        if (!segment || segment === creditTooltipSegment) return;
+        creditTooltipSegment = segment;
+        showCreditTooltip(segment);
+      });
+      listen(accountsPane, 'mouseout', function (event) {
+        var from = findCreditSegment(event.target);
+        var to = findCreditSegment(event.relatedTarget);
+        if (from && from !== to) hideCreditTooltip();
+      });
+      listen(accountsPane, 'scroll', hideCreditTooltip, true);
+      listen(window, 'resize', hideCreditTooltip);
+      registerDisposer(function () {
+        hideCreditTooltip();
+        if (creditTooltip) { creditTooltip.remove(); creditTooltip = null; }
+      });
+    }
+
     // 账号 pane 初始化：顶部 导出/导入 工具栏 + 列表容器 + 底部退出登录按钮（原 foot 的 logout 迁移到账号 tab）
     if (accountsPane) {
       accountsPane.innerHTML =
@@ -1912,7 +2002,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       wireEnhancePane();
     }
 
-    // 关于 pane：项目信息卡（名字/标语/原理徽章/介绍）+ 版本 + GitHub 图标按钮，无 logo
+    // 关于 pane：项目信息卡（名字/标语/原理徽章/介绍）+ 支持项目入口 + 版本
     function buildAboutPane() {
       if (!aboutPane) return;
       aboutPane.dataset.built = '1';
@@ -1933,14 +2023,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<div class="wbs-about-tag" id="wbs-about-tag">WorkBuddy 的多账号 · 主题 · 增强工具集</div>' +
           '<span class="wbs-about-badge" id="wbs-about-badge">本机回环 CDP 注入 · 不改官方安装包</span>' +
           '<div class="wbs-about-desc">一个基于 <b>Chrome DevTools Protocol (CDP)</b> 的 WorkBuddy 桌面端增强工具。零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。</div>' +
+          '<div class="wbs-about-support">' +
+            '<span class="wbs-about-support-text">如果 WorkDaddy 对你有帮助，欢迎在 GitHub 点个 Star。你的支持会让这个小项目持续更新。</span>' +
+            '<a class="wbs-about-ghbtn" id="wbs-about-repo" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" aria-label="在 GitHub 上给 WorkDaddy 点 Star" title="在 GitHub 上给 WorkDaddy 点 Star">' +
+              '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>' +
+            '</a>' +
+          '</div>' +
           '<div class="wbs-about-foot">' +
             '<span class="wbs-about-ver" id="wbs-about-ver">' + esc('') + '</span>' +
             '<a class="wbs-about-feedback" id="wbs-about-issues" href="https://github.com/babygoton/WorkDaddy/issues" target="_blank" rel="noopener" title="去 GitHub Issues 反馈问题">' +
               '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
               '<span>问题反馈</span>' +
-            '</a>' +
-            '<a class="wbs-about-ghbtn" id="wbs-about-repo" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" title="GitHub 仓库">' +
-              '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>' +
             '</a>' +
           '</div>' +
         '</div>';
@@ -3101,11 +3194,110 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
 
+    function fmtCreditExpiry(ts) {
+      if (!ts) return '有效期未知';
+      var diff = Number(ts) - Date.now();
+      if (diff <= 0) return '已过期';
+      var minute = 60 * 1000;
+      var hour = 60 * minute;
+      var day = 24 * hour;
+      if (diff < hour) return '剩余 ' + Math.max(1, Math.ceil(diff / minute)) + ' 分钟';
+      if (diff < day) return '剩余 ' + Math.ceil(diff / hour) + ' 小时';
+      if (diff < 30 * day) return '剩余 ' + Math.ceil(diff / day) + ' 天';
+      return '剩余 ' + Math.ceil(diff / day) + ' 天';
+    }
+
+    function creditTone(ts) {
+      var day = 24 * 3600 * 1000;
+      if (!ts || Number(ts) - Date.now() > 30 * day) return 'safe';
+      var diff = Number(ts) - Date.now();
+      if (diff <= day) return 'within1';
+      if (diff <= 3 * day) return 'within3';
+      if (diff <= 7 * day) return 'within7';
+      if (diff <= 15 * day) return 'within15';
+      return 'within30';
+    }
+
+    function creditTip(segment) {
+      var amount = fmtCredits(segment.remaining) + ' 积分';
+      var source = segment.source === 'meter' ? '基础用量'
+        : segment.source === 'package' ? '赠送与加量包'
+        : segment.source;
+      var expiry = fmtCreditExpiry(segment.expiresAt);
+      var expiryLine = segment.expiresAt
+        ? '到期时间 ' + fmtDateTime(segment.expiresAt) + '（' + expiry + '）'
+        : '到期时间（' + expiry + '）';
+      return (source || '积分') + '\n' + amount + '\n' + expiryLine;
+    }
+
+    function creditBarHtml(credits, segments) {
+      var list = Array.isArray(segments) ? segments.filter(function (s) { return s && Number(s.remaining) > 0; }) : [];
+      if (!list.length && Number(credits) > 0) {
+        list = [{ remaining: Number(credits), total: Number(credits), expiresAt: null, source: '积分' }];
+      }
+      if (!list.length) return Number(credits) === 0 ? '' : '<div class="wbs-credit-empty">暂无可用积分</div>';
+      var total = list.reduce(function (sum, s) { return sum + Math.max(0, Number(s.remaining) || 0); }, 0) || 1;
+      var cells = list.map(function (segment) {
+        var amount = Math.max(0, Number(segment.remaining) || 0);
+        var weight = Math.max(0.008, amount / total);
+        var tip = creditTip(segment);
+        var attrTip = esc(tip).replace(/"/g, '&quot;');
+        return '<span class="wbs-credit-segment ' + creditTone(segment.expiresAt) + '" style="flex:' + weight.toFixed(4) + ' 1 0" data-tip="' + attrTip + '" aria-label="' + attrTip + '"></span>';
+      }).join('');
+      return '<div class="wbs-credit-bar" role="img" aria-label="积分到期分布">' + cells + '</div>';
+    }
+
+    function creditBlockHtml(credits, segments, account) {
+      if (isIdentityExpired(account)) return '';
+      var checkin = checkinHtml(account);
+      if (credits === undefined) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-loading">读取中…</span></div></div>';
+      if (credits === null) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-na">-</span></div></div>';
+      return '<div class="wbs-credit-block">' +
+        '<div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-total">' + CREDIT_ICON + '<b>' + fmtCredits(credits) + '</b></span></div>' +
+        creditBarHtml(credits, segments) +
+        '</div>';
+    }
+
+    function nearestCreditExpiry(account) {
+      var segments = account && Array.isArray(account.creditSegments) ? account.creditSegments : [];
+      var nearest = Infinity;
+      segments.forEach(function (segment) {
+        if (!segment || Number(segment.remaining) <= 0) return;
+        if (segment.expiresAt === null || segment.expiresAt === undefined || segment.expiresAt === '') return;
+        var expiresAt = Number(segment.expiresAt);
+        if (isFinite(expiresAt) && expiresAt < nearest) nearest = expiresAt;
+      });
+      return nearest;
+    }
+
+    function sortAccountsByCreditExpiry() {
+      state.accounts = state.accounts.map(function (account, index) {
+        return { account: account, index: index, expiresAt: nearestCreditExpiry(account) };
+      }).sort(function (a, b) {
+        if (a.expiresAt !== b.expiresAt) return a.expiresAt - b.expiresAt;
+        return a.index - b.index;
+      }).map(function (item) { return item.account; });
+    }
+
+    function reorderAccountCards() {
+      var list = accountsPane.querySelector('.wbs-acct-list');
+      if (!list) return;
+      var cards = {};
+      list.querySelectorAll('.wbs-card').forEach(function (card) {
+        cards[card.getAttribute('data-uid')] = card;
+      });
+      state.accounts.forEach(function (account) {
+        var card = cards[account.uid];
+        if (card) list.appendChild(card);
+      });
+    }
+
     // token 过期状态：< 7 天 / 已过期 -> 红字高亮
-    function tokenState(expiresAt) {
+    function tokenState(expiresAt, account) {
+      if (isIdentityExpired(account)) return { warn: true, expired: true, label: expiresAt ? fmtDateTime(expiresAt) : '-' };
       if (!expiresAt) return { warn: false, label: '-' };
       var diff = expiresAt - Date.now();
-      if (diff < 0) return { warn: true, label: '已过期 ' + fmtDateTime(expiresAt) };
+      if (diff < 0) return { warn: true, expired: true, label: fmtDateTime(expiresAt) };
       if (diff < 24 * 3600 * 1000) return { warn: true, label: '即将过期 ' + fmtDateTime(expiresAt) };
       if (diff < 7 * 24 * 3600 * 1000) return { warn: true, label: fmtDateTime(expiresAt) };
       return { warn: false, label: fmtDateTime(expiresAt) };
@@ -3125,32 +3317,28 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       state.accounts.forEach(function (a) {
         var isCur = state.current && a.uid === state.current.uid;
-        var ts = tokenState(a.tokenExpiresAt);
+        var ts = tokenState(a.tokenExpiresAt, a);
         var credits = a.credits;
-        var creditsHtml = credits === undefined
-          ? '<span class="wbs-credit-loading">查询中…</span>'
-          : CREDIT_ICON + '<span class="wbs-credit-val">' + fmtCredits(credits) + '</span>';
         var card = el('div', 'wbs-card' + (isCur ? ' cur' : ''));
         card.setAttribute('data-uid', a.uid);
         var badge = isCur ? '<span class="wbs-badge">当前</span>' : '';
-        // 当前登录账号：隐藏「切换」「删除」图标按钮
+        // 当前登录账号隐藏操作；认证已过期的账号保留删除，但隐藏切换，避免进入登录页。
+        var expired = isIdentityExpired(a);
         var ops = isCur
           ? ''
           : '<div class="wbs-ops">' +
-            '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>' +
+            (expired ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
             '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + TRASH_SVG + '</button>' +
             '</div>';
         card.innerHTML =
           '<div class="wbs-info">' +
-          '<div class="wbs-row1"><span class="wbs-name">' + (a.nickname || '(未命名)') + '</span>' + badge + '</div>' +
-          '<div class="wbs-meta">' +
-          '<div class="wbs-mi"><span class="wbs-lbl">手机</span><span class="wbs-val">' + (a.phone || '-') + '</span></div>' +
-          '<div class="wbs-mi"><span class="wbs-lbl">积分余额</span><span class="wbs-credit">' + creditsHtml + '</span></div>' +
-          '<div class="wbs-mi wbs-checkin-cell"><span class="wbs-lbl">今日签到</span>' + checkinHtml(a) + '</div>' +
-          '<div class="wbs-mi"><span class="wbs-lbl">Token 过期</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + ts.label + '</span></div>' +
+          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + (a.nickname || '(未命名)') + '</span>' + badge + '</div>' + ops + '</div>' +
+          '<div class="wbs-meta wbs-secondary-row">' +
+          '<div class="wbs-mi wbs-phone-cell"><span class="wbs-lbl">手机</span><span class="wbs-val">' + (a.phone || '-') + '</span></div>' +
+          '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">登录过期于</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + ts.label + '</span></div>' +
           '</div>' +
-          '</div>' +
-          ops;
+          '<div class="wbs-credit-cell' + (isIdentityExpired(a) ? ' wbs-credit-hidden' : '') + '">' + creditBlockHtml(credits, a.creditSegments, a) + '</div>' +
+          '</div>';
         list.appendChild(card);
       });
       // 切换按钮：两击确认（第一次点击进入确认态，3s 内再点才真正切换，防止误触）
@@ -3279,19 +3467,26 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var cards = accountsPane.querySelectorAll('.wbs-card');
       var byUid = {};
       (accounts || []).forEach(function (a) { if (a && a.uid) byUid[a.uid] = a; });
-      for (var i = 0; i < cards.length; i++) {
-        var uid = cards[i].getAttribute('data-uid');
-        var account = byUid[uid];
-        if (!account) continue;
-        var cell = cards[i].querySelector('.wbs-checkin-cell');
-        var status = cell && cell.querySelector('.wbs-ck');
-        if (status) status.outerHTML = checkinHtml(account);
-      }
       (accounts || []).forEach(function (a) {
         for (var j = 0; j < state.accounts.length; j++) {
           if (state.accounts[j].uid === a.uid) { state.accounts[j].checkin = a.checkin; break; }
         }
       });
+      for (var i = 0; i < cards.length; i++) {
+        var uid = cards[i].getAttribute('data-uid');
+        var account = byUid[uid];
+        if (!account) continue;
+        var cell = cards[i].querySelector('.wbs-credit-cell');
+        var status = cell && cell.querySelector('.wbs-checkin-tag');
+        if (status) status.outerHTML = checkinHtml(account);
+        if (cell) {
+          var hidden = isIdentityExpired(account);
+          cell.classList.toggle('wbs-credit-hidden', hidden);
+          if (hidden) cell.innerHTML = '';
+          var switchBtn = cards[i].querySelector('.wbs-acc-switch');
+          if (switchBtn) switchBtn.style.display = hidden ? 'none' : '';
+        }
+      }
     }
 
     function stopCheckinPolling() {
@@ -3330,6 +3525,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       state.creditRemaining = accounts.length;
       function settleBatch() {
         if (runId !== state.creditRunId || state.creditRemaining !== 0) return;
+        sortAccountsByCreditExpiry();
+        reorderAccountCards();
         var sum = 0;
         state.accounts.forEach(function (account) {
           if (typeof account.credits === 'number' && isFinite(account.credits)) sum += account.credits;
@@ -3369,15 +3566,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           .then(function (r) {
             if (runId !== state.creditRunId) return;
             var credits = r && typeof r.credits === 'number' && isFinite(r.credits) ? r.credits : null;
+            var segments = r && Array.isArray(r.segments) ? r.segments : [];
             for (var i = 0; i < state.accounts.length; i++) {
-              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = credits; break; }
+              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = credits; state.accounts[i].creditSegments = segments; break; }
             }
-            updateCreditCell(a.uid, credits);
+            updateCreditCell(a.uid, credits, segments);
           })
           .catch(function () {
             if (runId !== state.creditRunId) return;
             for (var i = 0; i < state.accounts.length; i++) {
-              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = null; break; }
+              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = null; state.accounts[i].creditSegments = []; break; }
             }
             updateCreditCell(a.uid, null);
             // 静默失败，不弹 toast；避免面板抖动
@@ -3393,20 +3591,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
-    function updateCreditCell(uid, credits) {
+    function updateCreditCell(uid, credits, segments) {
       var cards = accountsPane.querySelectorAll('.wbs-card');
       var card = null;
       for (var i = 0; i < cards.length; i++) {
         if (cards[i].getAttribute('data-uid') === uid) { card = cards[i]; break; }
       }
       if (!card) return;
-      var elCredit = card.querySelector('.wbs-credit');
+      var elCredit = card.querySelector('.wbs-credit-cell');
       if (!elCredit) return;
-      if (credits === null) {
-        elCredit.innerHTML = '<span class="wbs-credit-na">-</span>';
-      } else {
-        elCredit.innerHTML = CREDIT_ICON + '<span class="wbs-credit-val">' + fmtCredits(credits) + '</span>';
+      var account = null;
+      for (var j = 0; j < state.accounts.length; j++) {
+        if (state.accounts[j].uid === uid) { account = state.accounts[j]; break; }
       }
+      var hidden = isIdentityExpired(account);
+      elCredit.classList.toggle('wbs-credit-hidden', hidden);
+      elCredit.innerHTML = hidden ? '' : creditBlockHtml(credits, segments || [], account);
     }
 
     // ===== 调试：暴露内部状态到 window.__wbsDiag（控制台可调） =====
@@ -3553,15 +3753,23 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '@keyframes wbs-sleep-pulse-amber{0%,100%{box-shadow:0 0 5px 1px rgba(255,176,58,.6)}50%{box-shadow:0 0 13px 4px rgba(255,176,58,.95)}}',
     '.wbs-fab.hidden{display:none}',
     '.wbs-fab .click{position:relative}',
-    '.wbs-fab .click span{display:none}',
+    '.wbs-fab .click > span:not(.wbs-fab-antenna):not(.wbs-fab-ear){display:none}',
     '.wbs-fab .button.shadow{display:none}',
     '.wbs-fab .button{position:relative;left:0;top:0;transform:none;cursor:pointer;border:solid 4px rgba(255,255,255,0);background-color:#141416;font-size:20px;color:#fff;border-color:rgba(255,255,255,0);box-shadow:0 4px 14px rgba(0,0,0,.45);border-radius:50px;display:flex;align-items:center;justify-content:center;width:100px;height:48px;box-sizing:content-box;padding:0;margin:0;outline:none;transition:background-color .2s,color .2s}',
     /* 贴消息队列时（queue 上方）保持纯色背景（与默认黑色一致，逻辑保留） */
     '.wbs-fab.fab--solid .button{background:#141416;box-shadow:0 4px 14px rgba(0,0,0,.45)}',
     '.wbs-fab .button:before,.wbs-fab .button:after{display:none}',
     '.wbs-fab .button.up{z-index:2}',
-    '.wbs-fab .click .button .speak:nth-child(n+2){display:none}',
-    '.wbs-fab .speak{font-size:15px}',
+    '.wbs-fab-antenna{position:absolute;left:50%;top:-20px;width:4px;height:18px;transform:translateX(-50%);background:#141416;border-radius:3px;z-index:1;pointer-events:none}',
+    '.wbs-fab-antenna-dot{position:absolute;left:50%;top:-7px;width:14px;height:14px;transform:translateX(-50%);border-radius:50%;background:#141416}',
+    '.wbs-fab-ear{position:absolute;top:50%;width:20px;height:30px;transform:translateY(-50%);border-radius:58% 38% 38% 58% / 50%;background:#141416;overflow:hidden;z-index:1;pointer-events:none}',
+    '.wbs-fab-ear::before{content:"";position:absolute;top:4px;left:4px;width:12px;height:22px;border-radius:58% 38% 38% 58% / 50%;background:#141416}',
+    '.wbs-fab-ear::after{content:"";position:absolute;top:10px;left:8px;width:4px;height:10px;border-radius:50%;background:#141416}',
+    '.wbs-fab-ear-left{left:-11px;transform:translateY(-50%) rotate(-8deg)}',
+    '.wbs-fab-ear-right{right:-11px;transform:translateY(-50%) rotate(8deg);border-radius:38% 58% 58% 38% / 50%}',
+    '.wbs-fab-ear-right::before{left:4px;border-radius:38% 58% 58% 38% / 50%}',
+    '.wbs-fab .click .button .speak~.speak{display:none}',
+    '.wbs-fab .speak{position:relative;z-index:2;font-size:15px}',
     '.wbs-fab .wrap{position:relative;width:100px;height:40px;margin:0 2rem;color:#fff;line-height:40px;font-size:2rem;text-align:center;font-weight:400;margin-bottom:0;display:flex;gap:5px}',
     '.wbs-fab .eye{position:relative;margin:auto;top:0;bottom:0;background:#fff;width:40px;height:40px;border-radius:50%;display:inline-block;animation:wbs-cc-double-blink 4s cubic-bezier(0.785,0.135,0.15,0.86) infinite;overflow:hidden}',
     '@keyframes wbs-cc-double-blink{0%,8%{height:40px}10%,12%{height:10px}13%{height:40px}14%,16%{height:0}18%,100%{height:40px}}',
@@ -3587,25 +3795,64 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-btn-close:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;max-height:calc(min(78vh,660px) - 170px)}',
     /* 账号卡片：头像 + 信息 + 右侧操作 */
-    '.wbs-card{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;margin-bottom:4px;transition:background .12s}',
+    '.wbs-card{display:block;padding:10px 12px;border-radius:12px;margin-bottom:4px;transition:background .12s}',
     '.wbs-card:hover{background:var(--wb-bg-hover,#f7f8fa)}',
     '.wbs-card.cur{background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-ava{width:34px;height:34px;border-radius:50%;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-secondary,#555);display:flex;align-items:center;justify-content:center;font-weight:600;flex-shrink:0;font-size:14px}',
-    '.wbs-info{flex:1;min-width:0}',
-    '.wbs-row1{display:flex;align-items:center;gap:6px;margin-bottom:4px}',
+    '.wbs-info{min-width:0}',
+    '.wbs-row1{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px;min-height:26px}',
+    '.wbs-name-group{display:flex;align-items:center;gap:6px;min-width:0}',
     '.wbs-name{font-size:14px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-meta{display:flex;flex-direction:column;gap:2px}',
+    '.wbs-secondary-row{flex-direction:row;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}',
     '.wbs-mi{display:flex;align-items:center;gap:6px;font-size:12px;line-height:1.4}',
+    '.wbs-phone-cell,.wbs-token-cell{flex:1;min-width:0}',
+    '.wbs-phone-cell{gap:0}',
+    '.wbs-token-cell{justify-content:flex-end}',
+    '.wbs-phone-cell .wbs-lbl,.wbs-token-cell .wbs-lbl,.wbs-credit-label .wbs-lbl{width:auto}',
+    '.wbs-phone-cell .wbs-val,.wbs-token-cell .wbs-val{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.wbs-lbl{color:var(--wb-icon-tertiary,#999);flex-shrink:0;width:60px;white-space:nowrap}',
     '.wbs-val{color:var(--wb-color-text-primary,#1f1f1f);font-variant-numeric:tabular-nums;word-break:break-all}',
     '.wbs-warn{color:#f53f3f;font-weight:600}',
-    /* 积分余额 */
-    '.wbs-credit{display:inline-flex;align-items:center;gap:4px;color:var(--wb-color-text-primary,#1f1f1f);font-weight:700;font-variant-numeric:tabular-nums}',
+    /* 积分到期分布：每个色块代表一个独立额度，悬浮显示额度与到期时间 */
+    '.wbs-credit-cell{display:block!important;width:100%;min-width:0}',
+    '.wbs-credit-hidden{display:none!important}',
+    '.wbs-credit-block{width:100%;min-width:0}',
+    '.wbs-credit-line{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}',
+    '.wbs-credit-label{display:inline-flex;align-items:center;gap:8px;min-width:0}',
+    '.wbs-credit-total{display:inline-flex;align-items:center;gap:4px;color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;font-variant-numeric:tabular-nums}',
+    '.wbs-credit-total b{font-weight:700}',
+    '.wbs-credit-bar{display:flex;align-items:stretch;gap:2px;width:100%;height:5px;min-height:5px;border-radius:0;overflow:visible;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent)}',
+    '.wbs-credit-segment{position:relative;display:block;min-width:3px;height:5px;border-radius:0;background:#19191c;border:1px solid rgba(255,255,255,.16);cursor:default;transition:filter .15s,transform .15s}',
+    '.wbs-credit-segment:first-child{border-radius:3px 0 0 3px}',
+    '.wbs-credit-segment:last-child{border-radius:0 3px 3px 0}',
+    '.wbs-credit-segment:first-child:last-child{border-radius:3px}',
+    '.wbs-credit-segment:hover{z-index:3;filter:brightness(1.12);transform:scaleY(1.35)}',
+    /* 官方 WorkBuddy 主题：绿色梯度；越接近到期透明度越高，1 天内只保留很轻的颜色痕迹 */
+    '.wbs-credit-segment.safe{background:rgba(34,197,94,.78);border-color:rgba(34,197,94,.78)}',
+    '.wbs-credit-segment.within30{background:rgba(34,197,94,.62);border-color:rgba(34,197,94,.62)}',
+    '.wbs-credit-segment.within15{background:rgba(34,197,94,.46);border-color:rgba(34,197,94,.46)}',
+    '.wbs-credit-segment.within7{background:rgba(34,197,94,.32);border-color:rgba(34,197,94,.32)}',
+    '.wbs-credit-segment.within3{background:rgba(34,197,94,.20);border-color:rgba(34,197,94,.20)}',
+    '.wbs-credit-segment.within1{background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.10)}',
+    /* WorkDaddy 主题：蓝紫色梯度，保持深色背景上的柔和对比 */
+    'html.cb-dark .wbs-credit-segment.safe{background:rgba(126,134,255,.82);border-color:rgba(126,134,255,.82)}',
+    'html.cb-dark .wbs-credit-segment.within30{background:rgba(126,134,255,.68);border-color:rgba(126,134,255,.68)}',
+    'html.cb-dark .wbs-credit-segment.within15{background:rgba(126,134,255,.54);border-color:rgba(126,134,255,.54)}',
+    'html.cb-dark .wbs-credit-segment.within7{background:rgba(126,134,255,.40);border-color:rgba(126,134,255,.40)}',
+    'html.cb-dark .wbs-credit-segment.within3{background:rgba(126,134,255,.25);border-color:rgba(126,134,255,.25)}',
+    'html.cb-dark .wbs-credit-segment.within1{background:rgba(126,134,255,.12);border-color:rgba(126,134,255,.12)}',
+    '.wbs-credit-tooltip{display:none;position:fixed;z-index:2147483647;min-width:170px;max-width:260px;padding:8px 10px;border-radius:7px;background:#151518;color:#fff;font-size:11px;font-weight:500;line-height:1.55;white-space:pre-line;box-shadow:0 8px 22px rgba(0,0,0,.28);pointer-events:none}',
+    '.wbs-credit-empty{height:5px;border-radius:0;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent);color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:5px;text-align:center}',
     '.wbs-credit-icon{width:14px;height:14px;vertical-align:middle;flex-shrink:0}',
-    '.wbs-credit-val{font-size:12px}',
     '.wbs-credit-loading{color:var(--wb-icon-tertiary,#999);font-size:12px}',
     '.wbs-credit-na{color:var(--wb-icon-tertiary,#999);font-size:12px}',
-    '.wbs-ck{font-size:12px;font-weight:600}',
+    '.wbs-ck{font-size:11px;font-weight:600}',
+    '.wbs-checkin-tag{display:inline-flex;align-items:center;min-height:18px;padding:1px 7px;border-radius:999px;white-space:nowrap}',
+    '.wbs-checkin-tag.pending{background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-checkin-tag.ok{background:#edf9ef;border:1px solid #b9e8c0;color:#28753a;box-shadow:inset 0 0 0 1px rgba(255,255,255,.55)}',
+    'html.cb-dark .wbs-checkin-tag.ok{background:rgba(19,24,33,.78);border-color:rgba(214,220,232,.24);color:#f3f5fa;box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}',
+    '.wbs-checkin-tag.fail{background:rgba(239,68,68,.1);color:#dc2626}',
     '.wbs-ck.ok{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-ck.pending{color:var(--wb-icon-tertiary,#999)}',
     '.wbs-ck.fail{color:#f53f3f}',
@@ -3795,18 +4042,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sleep-mode input{accent-color:var(--wb-button-primary-bg,#1f1f1f);margin:0;flex-shrink:0}',
     '.wbs-sleep-mode-name{font-size:12px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f);white-space:nowrap}',
     '.wbs-sleep-mode-hint{font-size:11px;color:var(--wb-icon-tertiary,#999);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-    /* 关于页：项目信息卡（名字/标语/原理徽章/介绍 + 版本 + GitHub 图标按钮） */
+    /* 关于页：项目信息卡（名字/标语/原理徽章/介绍 + 支持项目入口 + 版本） */
     '.wbs-about-hero{display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px 16px 16px}',
     '.wbs-about-name{font-size:18px;font-weight:700;letter-spacing:.3px;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-about-tag{font-size:12.5px;color:var(--wb-icon-tertiary,#888);text-align:center;line-height:1.5}',
     '.wbs-about-badge{font-size:11px;font-weight:600;color:var(--wb-button-primary-bg,#1f1f1f);background:rgba(0,0,0,.05);border:1px solid rgba(0,0,0,.08);padding:3px 10px;border-radius:999px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}',
     '.wbs-about-desc{font-size:11.5px;line-height:1.6;color:var(--wb-icon-tertiary,#777);text-align:center;padding:2px 6px 0}',
     '.wbs-about-desc b{color:var(--wb-color-text-primary,#1f1f1f);font-weight:600}',
+    '.wbs-about-support{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;max-width:360px;box-sizing:border-box;margin-top:3px;padding:9px 10px;border-top:1px solid var(--wb-border-default,rgba(0,0,0,.08));border-bottom:1px solid var(--wb-border-default,rgba(0,0,0,.08))}',
+    '.wbs-about-support-text{min-width:0;flex:1 1 auto;font-size:11.5px;line-height:1.55;color:var(--wb-icon-tertiary,#777);text-align:left}',
     '.wbs-about-foot{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:10px}',
     '.wbs-about-ver{font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:11px;font-weight:500;color:var(--wb-icon-tertiary,#999);letter-spacing:.3px}',
     '.wbs-about-feedback{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;color:var(--wb-button-primary-bg,#1f1f1f);background:rgba(0,0,0,.05);padding:5px 12px;border-radius:999px;text-decoration:none;transition:background .15s}',
     '.wbs-about-feedback:hover{background:rgba(0,0,0,.1)}',
-    '.wbs-about-ghbtn{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.05);color:var(--wb-color-text-primary,#1f1f1f);text-decoration:none;transition:background .15s,transform .15s;flex-shrink:0}',
+    '.wbs-about-ghbtn{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.06);color:var(--wb-color-text-primary,#1f1f1f);text-decoration:none;transition:background .15s,transform .15s;flex:0 0 32px}',
     '.wbs-about-ghbtn:hover{background:rgba(0,0,0,.1);transform:translateY(-1px)}',
     /* 自动更新：tab 红点 + 更新卡片 */
     '.wbs-tab{position:relative}',

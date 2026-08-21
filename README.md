@@ -14,10 +14,13 @@
 
 ## 演示
 
+账号页演示图
 <p align="left">
-  <img src="docs/images/accounts.png" width="450" alt="账号">
+  <img src="docs/images/accounts-white.jpg" width="450" alt="账号">
+  <img src="docs/images/accounts-black.jpg" width="450" alt="账号">
 </p>
 
+v1.0.3 演示图（非最新版）
 ![WorkDaddy 演示](docs/images/demo.gif)
 
 ---
@@ -47,7 +50,7 @@
    3. 输入开机密码确认
    ![安装引导](docs/images/install-guide.png)
 
-4. 双击 `WorkDaddy.app` 启动：它会自带守护进程并把组件注入到 WorkBuddy 右下角
+4. 双击 `WorkDaddy.app` 启动：它会自带守护进程并把组件注入到 WorkBuddy
 5. 看到机器人按钮？**搞定**。
 
 
@@ -56,7 +59,7 @@
 1. 在 [Releases](../../releases) 下载最新 `WorkDaddy-x.y.z-win64.zip`
 2. **解压到桌面以外的文件夹，双击一键安装脚本 `Install-WorkDaddy.cmd`**，安装后即可关闭该窗口：
 3. 以后只需**右键以管理员身份运行 WorkDaddy 图标** 即可
-4. 几秒后就会自动打开 WorkBuddy ，看到右下角机器人按钮即成功；
+4. 几秒后就会自动打开 WorkBuddy ，看到机器人按钮即成功；
 
 
 ### 从源码运行（开发者）

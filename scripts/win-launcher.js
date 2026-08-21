@@ -4,8 +4,8 @@
  *
  * 幂等三步：
  *   1) 确保 daemon 运行 —— watchdog 常驻（崩溃自动拉起）；daemon 版本与内置不一致时强制重启
- *   2) WorkBuddy 已在 CDP 模式（9222）→ 直接注入组件即完成
- *   3) 否则退出 WorkBuddy 并以 --remote-debugging-port=9222 重启 → 等端口 → 注入
+ *   2) WorkBuddy 已在 CDP 模式（优先 9222，端口被占用时自动发现）→ 直接注入组件即完成
+ *   3) 否则退出 WorkBuddy 并以自动选择的 CDP 端口重启 → 等端口 → 注入
  *
  * 由 launcher.cmd 调用（cmd 负责兜底找 node），也可 node win-launcher.js 直接运行。
  * 所有操作用户态完成（HKCU / %LOCALAPPDATA% / %APPDATA%），无需管理员权限。
@@ -18,6 +18,7 @@ const os = require('os');
 const net = require('net');
 const http = require('http');
 const { spawn, spawnSync } = require('child_process');
+const { captureMessage, captureException } = require('./sentry-report.js');
 
 const SCRIPTS_DIR = __dirname;
 const DATA_DIR =
@@ -25,7 +26,8 @@ const DATA_DIR =
   path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy');
 const UI_PORT = parseInt(process.env.WBSWITCH_PORT || '47832', 10);
 const cliCdpPort = process.argv.find((arg) => /^--cdp-port=\d+$/i.test(arg));
-const CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || (cliCdpPort ? cliCdpPort.split('=')[1] : '') || '9222', 10);
+let CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || (cliCdpPort ? cliCdpPort.split('=')[1] : '') || '0', 10);
+const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const ELEVATED_HELPER_MODE = process.argv.includes('--inject-helper');
 
 function log(...args) {
@@ -36,6 +38,41 @@ function log(...args) {
 
 // ---------- 小工具 ----------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function reportAndExit(code, message, stage = 'windows-launcher') {
+  try { await captureMessage(message, { stage, extra: { exitCode: code } }); } catch (_) {}
+  process.exit(code);
+}
+
+function validCdpPort(port) {
+  return Number.isInteger(port) && port >= 1024 && port <= 65535;
+}
+
+function readCdpPortFile() {
+  try {
+    const port = JSON.parse(fs.readFileSync(CDP_PORT_FILE, 'utf8')).port;
+    return validCdpPort(port) ? port : 0;
+  } catch (_) { return 0; }
+}
+
+function writeCdpPortFile(port) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = CDP_PORT_FILE + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({ port, updatedAt: new Date().toISOString() }) + '\n');
+    fs.renameSync(tmp, CDP_PORT_FILE);
+  } catch (e) { log('保存 CDP 端口配置失败: ' + e.message); }
+}
+
+function cdpPortCandidates() {
+  const result = [];
+  const add = (port) => { if (validCdpPort(port) && !result.includes(port)) result.push(port); };
+  add(CDP_PORT);
+  add(readCdpPortFile());
+  for (let port = 9222; port <= 9232; port++) add(port);
+  add(9333);
+  return result;
+}
 
 // 当前进程是否为管理员（Windows）
 function isElevated() {
@@ -114,12 +151,36 @@ function httpPost(port, p) {
 }
 
 async function isWorkBuddyCdp() {
-  const version = await httpGet(CDP_PORT, '/json/version');
+  return isWorkBuddyCdpAt(CDP_PORT);
+}
+
+async function isWorkBuddyCdpAt(port) {
+  const version = await httpGet(port, '/json/version');
   if (!version || version.status !== 200) return false;
   try {
     const info = JSON.parse(version.body || '{}');
     return /workbuddy|codebuddy/i.test([info.Browser, info['User-Agent']].filter(Boolean).join(' '));
   } catch (_) { return false; }
+}
+
+async function configureCdpPort() {
+  for (const port of cdpPortCandidates()) {
+    if (await isWorkBuddyCdpAt(port)) {
+      CDP_PORT = port;
+      writeCdpPortFile(port);
+      log('发现 WorkBuddy CDP 端口: ' + port);
+      return port;
+    }
+  }
+  for (const port of cdpPortCandidates()) {
+    if (!(await portOpen(port))) {
+      CDP_PORT = port;
+      writeCdpPortFile(port);
+      log('选择空闲 CDP 端口: ' + port);
+      return port;
+    }
+  }
+  throw new Error('9222-9232、9333 均被占用，无法启动 WorkBuddy CDP');
 }
 
 function psOut(cmd) {
@@ -368,8 +429,10 @@ async function injectNow() {
   if (!nodeBin) {
     log('未找到 Node.js（需 .workbuddy\\binaries 托管 node 或 PATH 中的 node）');
     console.error('错误：未找到 Node.js。请先安装 Node.js 或安装 WorkBuddy（自带托管 node）。');
-    process.exit(1);
+    await reportAndExit(1, '未找到 Node.js（WorkBuddy 托管运行时或 PATH）', 'windows-launcher-node');
+    return;
   }
+  await configureCdpPort();
 
   // 提权助手接管时，先停掉普通权限启动的 watchdog/daemon，避免两个权限级别的
   // daemon 同时占用端口；WorkBuddy GUI 后续仍由 ShellExecute 以用户权限启动。
@@ -393,7 +456,8 @@ async function injectNow() {
   if (!wb) {
     console.error('未找到 WorkBuddy.exe。可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定完整路径。');
     log('未找到 WorkBuddy.exe');
-    process.exit(2);
+    await reportAndExit(2, '未找到 WorkBuddy.exe', 'windows-launcher-workbuddy-path');
+    return;
   }
 
   // WorkBuddy 常装在 C:\Program Files（受保护特权目录），结束已提升的旧进程可能需要管理员权限。
@@ -430,10 +494,11 @@ async function injectNow() {
   } else {
     log('等待 20 秒未检测到调试端口 ' + CDP_PORT);
     console.log('等待超时：未检测到调试端口 ' + CDP_PORT + '。可手动执行：cd /d ' + path.dirname(wb) + ' && "' + wb + '" --remote-debugging-port=' + CDP_PORT);
+    await captureMessage('等待 20 秒未检测到 WorkBuddy CDP 端口', { stage: 'windows-launcher-cdp-timeout', extra: { cdpPort: CDP_PORT, workBuddy: wb } }).catch(() => {});
   }
   process.exit(ok ? 0 : 3);
 })().catch((e) => {
   log('launcher 异常: ' + (e && e.stack || e));
   console.error('WorkDaddy 启动异常: ' + (e && e.message || e));
-  process.exit(4);
+  captureException(e, { stage: 'windows-launcher-uncaught' }).catch(() => {}).finally(() => process.exit(4));
 });

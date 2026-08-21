@@ -30,15 +30,24 @@ if (Test-Path $pidFile) {
 }
 
 # 2) 兜底：按 API 端口杀残留进程
+# watchdog PID 可能来自旧版本或已失效；不要在端口仍被占用时无条件等待 30 秒。
 $waitSec = 0
-while ($waitSec -lt 30) {
-  $listening = netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING'
-  if (-not $listening) { break }
-  # 尝试优雅等待
+while ($waitSec -lt 10) {
+  $listening = @(netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')
+  if ($listening.Count -eq 0) { break }
+  # 给被 taskkill 的进程最多几秒退出；仍占用时立即强制清理，避免更新假死。
+  if ($waitSec -ge 3) {
+    foreach ($line in $listening) {
+      $parts = ($line.ToString().Trim() -split '\s+')
+      $pid2 = $parts[$parts.Count - 1]
+      if ($pid2 -match '^\d+$') { taskkill /F /T /PID $pid2 2>$null | Out-Null }
+    }
+  }
   Start-Sleep -Seconds 1
   $waitSec++
 }
-foreach ($line in (netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')) {
+$listening = @(netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')
+foreach ($line in $listening) {
   $parts = ($line.ToString().Trim() -split '\s+')
   $pid2 = $parts[$parts.Count - 1]
   if ($pid2 -match '^\d+$') { taskkill /F /T /PID $pid2 2>$null | Out-Null }
@@ -82,19 +91,24 @@ if ($rc -ge 8) {
   exit 2
 }
 
-# 5) 清理备份 + 拉起（launcher 幂等：检测 daemon 后启动 watchdog）
-Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue
-$launcher = Join-Path $AppDir 'launcher.cmd'
-$launcherVbs = Join-Path $AppDir 'launcher-hidden.vbs'
-if (Test-Path $launcher) {
-  if (Test-Path $launcherVbs) {
-    # wscript.exe 不创建控制台，自动更新重启时也不再弹出空白 Windows Terminal。
-    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $launcherVbs + '"') -WorkingDirectory (Split-Path $launcher)
-  } else {
-    # 兼容旧版本目录：直接启动 launcher.cmd。
-    Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
-  }
+# 5) 校验启动器后清理备份并拉起（launcher 幂等：检测 daemon 后启动 watchdog）
+$launcher = Join-Path (Join-Path $AppDir 'scripts') 'launcher.cmd'
+$launcherVbs = Join-Path (Join-Path $AppDir 'scripts') 'launcher-hidden.vbs'
+if (-not (Test-Path $launcher)) {
+  Write-Host '[apply] 新版本缺少 scripts\\launcher.cmd，回滚旧版本'
+  Remove-Item -Recurse -Force $AppDir -ErrorAction SilentlyContinue
+  if (Test-Path $oldDir) { Move-Item -Force $oldDir $AppDir -ErrorAction SilentlyContinue }
+  Stop-Transcript
+  exit 3
 }
+if (Test-Path $launcherVbs) {
+  # wscript.exe 不创建控制台，自动更新重启时也不再弹出空白 Windows Terminal。
+  Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $launcherVbs + '"') -WorkingDirectory (Split-Path $launcher)
+} else {
+  # 兼容旧版本目录：直接启动 launcher.cmd。
+  Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
+}
+Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue
 Write-Host "[apply] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') done"
 Stop-Transcript
 exit 0
