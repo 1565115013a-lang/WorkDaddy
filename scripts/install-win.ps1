@@ -31,6 +31,39 @@ function Send-Sentry {
   } catch {}
 }
 
+function Test-ExclusiveFile {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return $true }
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($stream) { $stream.Dispose() }
+  }
+}
+
+function Release-LockedLauncher {
+  param([string]$LauncherPath)
+  if (Test-ExclusiveFile $LauncherPath) { return $true }
+  $needle = ([IO.Path]::GetFullPath($LauncherPath)).Replace('/', '\').ToLowerInvariant()
+  try {
+    Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+      $commandLine = ([string]$_.CommandLine).Replace('/', '\').ToLowerInvariant()
+      if ($commandLine.Contains($needle) -and $_.ProcessId -ne $PID) {
+        taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null
+      }
+    }
+  } catch {}
+  for ($i = 0; $i -lt 10; $i++) {
+    if (Test-ExclusiveFile $LauncherPath) { return $true }
+    Start-Sleep -Milliseconds 300
+  }
+  return (Test-ExclusiveFile $LauncherPath)
+}
+
 Write-Host '=============================================================='
 Write-Host ' WorkDaddy Windows 安装'
 Write-Host '=============================================================='
@@ -51,6 +84,12 @@ if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
   # 在 Windows 上容易出现“文件正被另一个进程使用”。此时只需继续执行后续注册/快捷方式步骤。
   Write-Host '  源目录与安装目录相同，跳过自拷贝。'
 } else {
+  $launcherToReplace = Join-Path $targetScripts 'launcher.cmd'
+  if (-not (Release-LockedLauncher $launcherToReplace)) {
+    Write-Host "复制前无法释放 launcher.cmd 文件锁: $launcherToReplace"
+    Send-Sentry 'windows-install-launcher-lock' "无法释放 launcher.cmd 文件锁: $launcherToReplace" 2
+    exit 2
+  }
   robocopy $SrcDir $targetScripts /E /XF *.log .DS_Store /XD win\probe /R:2 /W:1
   $rc = $LASTEXITCODE
   if ($rc -ge 8) {

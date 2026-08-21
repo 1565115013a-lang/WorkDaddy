@@ -29,6 +29,8 @@ const cliCdpPort = process.argv.find((arg) => /^--cdp-port=\d+$/i.test(arg));
 let CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || (cliCdpPort ? cliCdpPort.split('=')[1] : '') || '0', 10);
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const ELEVATED_HELPER_MODE = process.argv.includes('--inject-helper');
+// 便携版/低速磁盘上的 WorkBuddy 首次启动可能超过 20 秒；超时只应在足够长的窗口后报告。
+const CDP_STARTUP_TIMEOUT_MS = 60000;
 
 function log(...args) {
   const line = `[launcher] ${new Date().toISOString()} ${args.join(' ')}\n`;
@@ -217,11 +219,17 @@ function findNode() {
   return null;
 }
 
-// ---------- 定位 WorkBuddy.exe（环境变量 > 运行进程 > 注册表 > 常见路径） ----------
+// ---------- 定位 WorkBuddy.exe（环境变量 > 运行进程 > App Paths/卸载注册表 > 常见便携路径） ----------
 let wbBinaryCache = null;
 function findWorkBuddy() {
   if (wbBinaryCache) return wbBinaryCache;
-  const tryFile = (p) => { try { if (p && fs.existsSync(p)) return p; } catch (_) {} return null; };
+  const tryFile = (p) => {
+    try {
+      const candidate = String(p || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
+      if (candidate && fs.existsSync(candidate)) return candidate;
+    } catch (_) {}
+    return null;
+  };
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
   if (envBin) return (wbBinaryCache = envBin);
   try {
@@ -230,16 +238,39 @@ function findWorkBuddy() {
     if (hit) return (wbBinaryCache = hit);
   } catch (_) {}
   try {
+    const p = psOut("Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(WorkBuddy|CodeBuddy|WorkBuddyAI)\\.exe$' -and $_.ExecutablePath } | Select-Object -First 1 -ExpandProperty ExecutablePath").split(/\r?\n/).filter(Boolean).pop();
+    const hit = tryFile(p);
+    if (hit) return (wbBinaryCache = hit);
+  } catch (_) {}
+  // 便携版通常没有卸载项，但可能注册了 App Paths；优先读取其真实可执行路径。
+  try {
+    const p = psOut("$k=@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe'); Get-ItemProperty $k -ErrorAction SilentlyContinue | ForEach-Object { if ($_.'(default)') { $_.'(default)' } elseif ($_.Path) { $_.Path } } | Select-Object -First 1").split(/\r?\n/).filter(Boolean).pop();
+    const hit = tryFile(p);
+    if (hit) return (wbBinaryCache = hit);
+  } catch (_) {}
+  try {
     const p = psOut("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | Select-Object -First 1 DisplayIcon,InstallLocation | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }").split(/\r?\n/).filter(Boolean).pop();
     const hit = tryFile(p);
     if (hit) return (wbBinaryCache = hit);
   } catch (_) {}
-  for (const c of [
+  const roots = [
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
-    'D:\\workbody\\WorkBuddy\\WorkBuddy.exe',
-  ]) {
+    path.join(process.env.USERPROFILE || '', 'scoop', 'apps', 'workbuddy', 'current', 'WorkBuddy.exe'),
+    'D:\\workbuddy\\WorkBuddy.exe',
+  ];
+  if (process.env.WBSWITCH_WORKBUDDY_DIR) roots.push(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, 'WorkBuddy.exe'));
+  // 兼容类似 D:\Software\workbuddy\WorkBuddy.exe 的便携目录，不递归扫描整盘。
+  try {
+    const driveRoots = psOut('(Get-PSDrive -PSProvider FileSystem).Root').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    for (const root of driveRoots) {
+      roots.push(path.join(root, 'Software', 'workbuddy', 'WorkBuddy.exe'));
+      roots.push(path.join(root, 'workbuddy', 'WorkBuddy.exe'));
+      roots.push(path.join(root, 'WorkBuddy', 'WorkBuddy.exe'));
+    }
+  } catch (_) {}
+  for (const c of roots) {
     const hit = tryFile(c);
     if (hit) return (wbBinaryCache = hit);
   }
@@ -482,9 +513,10 @@ async function injectNow() {
   launchWorkBuddy(wb);
 
   let ok = false;
-  for (let i = 0; i < 20; i++) {
+  for (let elapsedMs = 0; elapsedMs < CDP_STARTUP_TIMEOUT_MS; elapsedMs += 1000) {
     await sleep(1000);
     if (await isWorkBuddyCdp()) { ok = true; break; }
+    if ((elapsedMs + 1000) % 5000 === 0) log('等待 WorkBuddy CDP: ' + (elapsedMs + 1000) + 'ms/' + CDP_STARTUP_TIMEOUT_MS + 'ms');
   }
   if (ok) {
     await sleep(1500);
@@ -492,9 +524,9 @@ async function injectNow() {
     log('WorkBuddy 已启动（调试模式），组件已注入');
     console.log('WorkDaddy：WorkBuddy 已启动（调试模式），组件已注入 ✓');
   } else {
-    log('等待 20 秒未检测到调试端口 ' + CDP_PORT);
+    log('等待 ' + (CDP_STARTUP_TIMEOUT_MS / 1000) + ' 秒未检测到调试端口 ' + CDP_PORT);
     console.log('等待超时：未检测到调试端口 ' + CDP_PORT + '。可手动执行：cd /d ' + path.dirname(wb) + ' && "' + wb + '" --remote-debugging-port=' + CDP_PORT);
-    await captureMessage('等待 20 秒未检测到 WorkBuddy CDP 端口', { stage: 'windows-launcher-cdp-timeout', extra: { cdpPort: CDP_PORT, workBuddy: wb } }).catch(() => {});
+    await captureMessage('等待 ' + (CDP_STARTUP_TIMEOUT_MS / 1000) + ' 秒未检测到 WorkBuddy CDP 端口', { stage: 'windows-launcher-cdp-timeout', extra: { cdpPort: CDP_PORT, workBuddy: wb, timeoutMs: CDP_STARTUP_TIMEOUT_MS } }).catch(() => {});
   }
   process.exit(ok ? 0 : 3);
 })().catch((e) => {

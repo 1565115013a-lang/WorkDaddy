@@ -20,6 +20,39 @@ Start-Transcript -Path $Log -Append -Force
 
 Write-Host "[apply] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') start src=$SrcZip dst=$AppDir"
 
+function Test-ExclusiveFile {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return $true }
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($stream) { $stream.Dispose() }
+  }
+}
+
+function Release-LockedLauncher {
+  param([string]$LauncherPath)
+  if (Test-ExclusiveFile $LauncherPath) { return $true }
+  $needle = ([IO.Path]::GetFullPath($LauncherPath)).Replace('/', '\').ToLowerInvariant()
+  try {
+    Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+      $commandLine = ([string]$_.CommandLine).Replace('/', '\').ToLowerInvariant()
+      if ($commandLine.Contains($needle) -and $_.ProcessId -ne $PID) {
+        taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null
+      }
+    }
+  } catch {}
+  for ($i = 0; $i -lt 10; $i++) {
+    if (Test-ExclusiveFile $LauncherPath) { return $true }
+    Start-Sleep -Milliseconds 300
+  }
+  return (Test-ExclusiveFile $LauncherPath)
+}
+
 # 1) 杀 watchdog（会连带终止 daemon；PID 文件在数据目录）
 $pidFile = Join-Path $DataDir 'watchdog.pid'
 if (Test-Path $pidFile) {
@@ -56,6 +89,16 @@ Start-Sleep -Seconds 1
 
 # 3) 备份旧目录（回滚：move AppDir.old AppDir）
 $oldDir = $AppDir + '.old'
+foreach ($launcherToRelease in @(
+  (Join-Path $AppDir 'scripts\launcher.cmd'),
+  (Join-Path $oldDir 'scripts\launcher.cmd')
+)) {
+  if (-not (Release-LockedLauncher $launcherToRelease)) {
+    Write-Host "[apply] 无法释放 launcher.cmd 文件锁: $launcherToRelease"
+    Stop-Transcript
+    exit 2
+  }
+}
 if (Test-Path $oldDir) { Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue }
 if (Test-Path $AppDir) { Move-Item -Force $AppDir $oldDir -ErrorAction SilentlyContinue }
 

@@ -23,6 +23,20 @@ test('Windows updater stops the watchdog before waiting for the API port', () =>
   assert.ok(stop < wait, 'watchdog shutdown must precede the port wait');
 });
 
+test('Windows install and update release a locked launcher before replacing it', () => {
+  const install = read('install-win.ps1');
+  const update = read('apply-update.ps1');
+  assert.match(install, /FileShare\]\s*::None/);
+  assert.match(install, /launcher\.cmd/);
+  assert.match(install, /Get-CimInstance\s+Win32_Process/);
+  assert.match(install, /taskkill \/F \/T \/PID/);
+  assert.ok(install.indexOf('Release-LockedLauncher') < install.indexOf('robocopy $SrcDir $targetScripts'), 'install must release launcher before robocopy');
+  assert.match(update, /FileShare\]\s*::None/);
+  assert.match(update, /launcher\.cmd/);
+  assert.match(update, /Get-CimInstance\s+Win32_Process/);
+  assert.ok(update.indexOf('Release-LockedLauncher') < update.indexOf('Move-Item -Force $AppDir $oldDir'), 'update must release launcher before moving the old app');
+});
+
 test('macOS updater stops the daemon before waiting for the API port', () => {
   const script = read('apply-update.sh');
   const stop = script.indexOf('pkill -f');
@@ -92,6 +106,25 @@ test('CDP startup supports a persisted fallback port instead of hardcoding 9222'
   assert.match(macLauncher, /--remote-debugging-port=\"\$PORT\"/);
   assert.match(winLauncher, /cdp-port\.json/);
   assert.match(winLauncher, /--remote-debugging-port=' \+ CDP_PORT/);
+});
+
+test('Windows launcher tolerates slow WorkBuddy startup beyond the old 20 second limit', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /CDP_STARTUP_TIMEOUT_MS\s*=\s*60000/);
+  assert.match(launcher, /elapsedMs\s*<\s*CDP_STARTUP_TIMEOUT_MS/);
+});
+
+test('Windows launcher discovers portable WorkBuddy installations', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /App Paths/);
+  assert.match(launcher, /Software[\\/].*workbuddy/i);
+  assert.match(launcher, /WBSWITCH_WORKBUDDY_BIN/);
+});
+
+test('Windows relaunch restores the WorkBuddy window after starting it', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /restoreWorkBuddyWindow/);
+  assert.match(daemon, /await restoreWorkBuddyWindow/);
 });
 
 test('account cards keep the compact three-row layout', () => {

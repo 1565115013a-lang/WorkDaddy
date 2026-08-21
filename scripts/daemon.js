@@ -84,8 +84,10 @@ const DATA_DIR = defaultDataDir();
 //         不退出 WorkBuddy 即可把新账号入库；/api/open-url 供系统浏览器打开授权页
 // 1.0.12：修复旧 daemon 与新版使用同一 build 标识导致启动器复用旧内存代码；
 //         账号切换始终使用 JSON 替换 + CDP 刷新，不退出 WorkBuddy
-const DAEMON_VERSION = '1.0.12';
-const DAEMON_BUILD_ID = 'seamless-login-20260821-r2';
+// 1.0.13：Windows 安装/更新释放 launcher.cmd 文件锁；延长 CDP 启动等待；
+//         补充便携版 WorkBuddy 路径探测，并在重启后恢复主窗口
+const DAEMON_VERSION = '1.0.13';
+const DAEMON_BUILD_ID = 'windows-hardening-20260821';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -1069,6 +1071,36 @@ function runCommand(command, args, options = {}) {
   });
 }
 
+// Windows 的 WorkBuddy 可能记住“最小化到托盘”状态；重启后显式恢复主窗口，避免只看到托盘图标。
+async function restoreWorkBuddyWindow(pid) {
+  if (!IS_WIN || !pid) return false;
+  const source = [
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'public static class WorkDaddyWindowBridge {',
+    '  delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);',
+    '  [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);',
+    '  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);',
+    '  [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hWnd, int command);',
+    '  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);',
+    '  public static void Restore(uint targetPid) {',
+    '    EnumWindows((hWnd, lParam) => { uint owner; GetWindowThreadProcessId(hWnd, out owner);',
+    '      if (owner == targetPid) { ShowWindowAsync(hWnd, 9); SetForegroundWindow(hWnd); return false; }',
+    '      return true; }, IntPtr.Zero);',
+    '  }',
+    '}',
+  ].join('\n');
+  const command = `Add-Type -TypeDefinition @'\n${source}\n'@; [WorkDaddyWindowBridge]::Restore(${Number(pid)})`;
+  const encoded = Buffer.from(command, 'utf16le').toString('base64');
+  const result = await runCommand('powershell', ['-NoProfile', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], { timeoutMs: 10000 });
+  if (result.error || result.code !== 0) {
+    log('[relaunch] 恢复 WorkBuddy 窗口失败: ' + (result.error ? result.error.message : 'powershell exit ' + result.code));
+    return false;
+  }
+  log('[relaunch] 已恢复并置前 WorkBuddy 窗口');
+  return true;
+}
+
 function workBuddyRunning() {
   try {
     if (IS_WIN) {
@@ -1161,6 +1193,11 @@ function relaunchWorkBuddy() {
         child.once('spawn', resolve);
       });
       child.unref();
+      // 窗口创建可能晚于 CDP/进程就绪，重复几次恢复，仍不影响重启流程本身。
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await sleep(1000);
+        await restoreWorkBuddyWindow(child.pid);
+      }
       return;
     }
     const workDaddy = findWorkDaddyApp();
