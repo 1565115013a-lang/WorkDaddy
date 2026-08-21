@@ -82,8 +82,10 @@ const DATA_DIR = defaultDataDir();
 // 1.0.10：daemon.log 按 10 MB 滚动保留最近 3 份，避免长期运行无限增长
 // 1.0.11：「登录新账号」新增「无感登录」（OAuth state 轮询采集，流程同 workbuddy-switch），
 //         不退出 WorkBuddy 即可把新账号入库；/api/open-url 供系统浏览器打开授权页
-const DAEMON_VERSION = '1.0.11';
-const DAEMON_BUILD_ID = 'seamless-login-20260821';
+// 1.0.12：修复旧 daemon 与新版使用同一 build 标识导致启动器复用旧内存代码；
+//         账号切换始终使用 JSON 替换 + CDP 刷新，不退出 WorkBuddy
+const DAEMON_VERSION = '1.0.12';
+const DAEMON_BUILD_ID = 'seamless-login-20260821-r2';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -3940,29 +3942,22 @@ function handleApi(req, res) {
     return readBody(req).then(async (body) => {
       const uid = (body.uid || '').trim();
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
-      let acct = null;
-      let hostStopped = false;
-      let reloaded = false;
       try {
-        // WorkBuddy 在宿主进程内缓存认证状态；仅刷新 renderer 会回到登录页。
-        // 先退出宿主，避免它在退出阶段把旧账号写回 auth 文件，再写入目标备份并重启。
-        if (body.reload) {
-          await quitWorkBuddy();
-          hostStopped = true;
-          log('[switch] WorkBuddy 已退出，准备写入目标账号登录文件');
-        }
-        acct = switchTo(DATA_DIR, uid, log);
+        const acct = switchTo(DATA_DIR, uid, log);
         const hint = '登录文件已切换，请重启 WorkBuddy 使新账号生效';
+        let reloaded = false;
         if (body.reload) {
           try {
-            await relaunchWorkBuddy();
+            await reloadWorkBuddyPage();
             reloaded = true;
-            log('[switch] 已重启 WorkBuddy，目标账号应在宿主启动时加载');
+            log('[switch] 已通过 CDP 刷新 WorkBuddy 窗口');
             // 切换后通过接口自动签到（带每日缓存，幂等）
             claimDailyForUid(uid)
               .then((r) => log('[checkin] 切换后自动签到 ' + uid + ': ' + (r.ok ? '已领取' : '失败 ' + (r.reason || r.message))))
               .catch((e) => log('[checkin] 切换后签到异常: ' + e.message));
-          } catch (e) { throw new Error('WorkBuddy 重启失败: ' + e.message); }
+          } catch (e) {
+            log(`[switch] CDP 刷新失败: ${e.message}`);
+          }
         }
         return json(res, 200, {
           ok: true,
@@ -3972,15 +3967,6 @@ function handleApi(req, res) {
           hint: reloaded ? '已切换并触发窗口刷新' : hint,
         });
       } catch (e) {
-        // 切换写入或重启失败时，尽量恢复宿主，避免面板操作把 WorkBuddy 留在退出状态。
-        if (hostStopped && !reloaded) {
-          try {
-            await relaunchWorkBuddy();
-            log('[switch] 切换失败，已尝试恢复启动 WorkBuddy');
-          } catch (recoverError) {
-            log(`[switch] 切换失败且恢复启动失败: ${recoverError.message}`);
-          }
-        }
         return json(res, 500, { ok: false, error: e.message });
       }
     });
