@@ -110,11 +110,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var SWITCH_SVG =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M16 3l4 4-4 4"/><path d="M20 7H8"/><path d="M8 21l-4-4 4-4"/><path d="M4 17h12"/></svg>';
+  var AUTO_COPY_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/><path d="M15 3l3 1-1 3"/></svg>';
   var TRASH_SVG =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/>' +
     '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>' +
     '<path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+  var MODEL_BACKUP_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>';
+  var MODEL_TEST_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 11 14 10 22 21 10 13 10 13 2"/></svg>';
+  var MODEL_COPY_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg>';
+  var MODEL_EDIT_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 16-.8 4.8L8 20l11.5-11.5a2.1 2.1 0 0 0-3-3L5 17z"/><path d="m14.5 7.5 2 2"/></svg>';
+  var MODEL_ENABLE_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><path d="M8 5.2a1 1 0 0 1 1.55-.83l9.6 6.8a1 1 0 0 1 0 1.66l-9.6 6.8A1 1 0 0 1 8 18.8V5.2Z"/></svg>';
+  // 小贴士提示图标（灯泡，tips 通知风格）
+  var MODEL_TIP_SVG =
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2Z"/></svg>';
   var GIFT_SVG =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
     '<rect x="3" y="8" width="18" height="4" rx="1"/>' +
@@ -560,6 +576,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<button class="wbs-tab active" type="button" data-tab="account"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span>账号</span></button>',
       '<button class="wbs-tab" type="button" data-tab="theme"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10c0-1.5-1-2-2-2h-3a2 2 0 0 1-2-2c0-1.5 1-2 1-2h2c0-3-2-4-6-4z"/><circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/><circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/></svg><span>主题</span></button>',
       '<button class="wbs-tab" type="button" data-tab="sessions"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>会话</span></button>',
+      '<button class="wbs-tab" type="button" data-tab="models"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span>模型</span></button>',
       '<button class="wbs-tab" type="button" data-tab="enhance"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span>增强</span></button>',
       '<button class="wbs-tab" type="button" data-tab="about"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg><span>关于</span></button>',
       '</div>',
@@ -567,6 +584,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<div class="wbs-pane active" data-pane="account"></div>',
       '<div class="wbs-pane" data-pane="theme"></div>',
       '<div class="wbs-pane" data-pane="sessions"></div>',
+      '<div class="wbs-pane" data-pane="models"></div>',
       '<div class="wbs-pane" data-pane="enhance"></div>',
       '<div class="wbs-pane" data-pane="about"></div>',
       '</div>',
@@ -1326,6 +1344,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var accountsPane = root.querySelector('[data-pane="account"]');
     var themePane = root.querySelector('[data-pane="theme"]');
     var sessionsPane = root.querySelector('[data-pane="sessions"]');
+    var modelsPane = root.querySelector('[data-pane="models"]');
     var enhancePane = root.querySelector('[data-pane="enhance"]');
     var aboutPane = root.querySelector('[data-pane="about"]');
     var logoutBtn = root.querySelector('[data-act="logout"]');
@@ -1459,6 +1478,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       for (var j = 0; j < panes.length; j++) panes[j].classList.toggle('active', panes[j].getAttribute('data-pane') === name);
       if (name === 'theme') { if (themePane && !themePane.dataset.built) buildThemePane(); loadWallpapers(); }
       if (name === 'sessions' && sessionsPane && !sessionsPane.dataset.built) buildSessionsPane();
+      if (name === 'models' && modelsPane && !modelsPane.dataset.built) buildModelsPane();
       if (name === 'enhance' && enhancePane && !enhancePane.dataset.built) buildEnhancePane();
       if (name === 'about' && aboutPane && !aboutPane.dataset.built) buildAboutPane();
     }
@@ -1470,7 +1490,25 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // ===== 会话 pane（构建：账号/时间筛选 + 按空间分组[默认2条/展开10条] + 刷新 + 批量操作[迁移/删除]）=====
-    var sessionsState = { uid: undefined, range: '7d', list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false };
+    var sessionsState = { uid: undefined, range: '7d', list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null };
+    function isTaskSessionRecordUI(cwd) {
+      return /[\\/]WorkBuddy[\\/]\d{4}-\d{2}-\d{2}[-]\d{2}[-]\d{2}[-]\d{2}/i.test(String(cwd || ''));
+    }
+    function canonicalWorkspaceUI(cwd) {
+      var value = String(cwd || '').trim().replace(/\\/g, '/');
+      if (!value) return '';
+      value = value.replace(/\/+/g, '/');
+      var parts = value.split('/');
+      var out = [];
+      parts.forEach(function (part) {
+        if (!part || part === '.') return;
+        if (part === '..') { if (out.length && out[out.length - 1] !== '..') out.pop(); return; }
+        out.push(part);
+      });
+      value = (value.charAt(0) === '/' ? '/' : '') + out.join('/');
+      if (value.length > 1) value = value.replace(/\/+$/, '');
+      return value;
+    }
     var SESS_WS_INIT = 2;    // 每个空间默认显示条数
     var SESS_WS_STEP = 10;   // 展开一次追加条数
     function buildSessionsPane() {
@@ -1554,6 +1592,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (sessionsState.uid !== undefined) url += '&uid=' + encodeURIComponent(sessionsState.uid);
       api(url).then(function (d) {
         sessionsState.list = (d && d.sessions) || [];
+        sessionsState.autoCopy = (d && d.autoCopy) || null;
         sessionsState.selected = {};
         sessionsState.wsExpanded = {};
         renderSessions();
@@ -1571,7 +1610,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
-    // 按空间分组渲染：每个空间最多显示 INIT 条 + 展开按钮（每次 +STEP）
+    // 按空间分组渲染：每个空间最多显示 INIT 条 + 展开按钮（每次 +STEP）。
+    // 自动复制只支持会话和空间；任务组本身没有自动复制按钮。
     function renderSessions() {
       var listEl = sessionsPane.querySelector('#wbs-sess-list');
       var countEl = sessionsPane.querySelector('#wbs-sess-count');
@@ -1581,99 +1621,115 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (countEl) countEl.textContent = '0 个会话';
         return;
       }
-      // 分组（保持空间出现顺序：按该空间最早会话时间倒序）
-      // 区分「任务」与「空间」：任务 = 未选择具体项目，cwd 为 WorkBuddy/<时间戳> 自动目录
-      function isTaskSession(s) {
-        return /\/WorkBuddy\/\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}/.test(s.cwd || '');
+      function canEditAutoCopy(uid) { return sessionsState.uid !== '' && !!uid; }
+      function autoCopyButton(kind, key, uid, enabled, inherited) {
+        if (!canEditAutoCopy(uid)) return '';
+        var title = inherited ? '随空间自动复制' : (enabled ? '取消自动复制' : '切换账号时自动复制');
+        var disabled = inherited ? ' disabled' : '';
+        return '<button class="wbs-sess-auto' + (enabled ? ' active' : '') + (inherited ? ' inherited' : '') + '" type="button" data-auto-kind="' + kind + '" data-auto-key="' + escAttr(key) + '" data-auto-uid="' + escAttr(uid) + '" aria-label="' + escAttr(title) + '" title="' + escAttr(title) + '" aria-pressed="' + (enabled ? 'true' : 'false') + '"' + disabled + '><span class="wbs-sess-auto-label">自动复制</span><span class="wbs-sess-auto-switch' + (enabled ? ' on' : '') + '" aria-hidden="true"><span></span></span></button>';
       }
       var tasks = [];
       var groups = {};
       var wsOrder = [];
       sessionsState.list.forEach(function (s) {
-        if (isTaskSession(s)) { tasks.push(s); return; }
-        var w = s.cwd || '(未指定空间)';
-        if (!groups[w]) { groups[w] = []; wsOrder.push(w); }
-        groups[w].push(s);
+        if (isTaskSessionRecordUI(s.cwd)) { tasks.push(s); return; }
+        var cwd = s.cwd || '(未指定空间)';
+        var owner = String(s.user_id || sessionsState.uid || '');
+        var groupKey = owner + '::' + cwd;
+        if (!groups[groupKey]) { groups[groupKey] = { cwd: cwd, uid: owner, items: [] }; wsOrder.push(groupKey); }
+        groups[groupKey].items.push(s);
       });
       var total = sessionsState.list.length;
       var html = '';
       var batch = sessionsState.batchMode;
-      // 任务区（未选择项目的会话）
       if (tasks.length) {
         var taskKey = '__TASKS__';
         var taskShown = (sessionsState.wsExpanded[taskKey] || SESS_WS_INIT);
         var taskVis = tasks.slice(0, taskShown);
         var taskMore = tasks.length - taskVis.length;
-        var taskCheckedAll = tasks.every(function (s) { return sessionsState.selected[s.id]; });
         html += '<div class="wbs-sess-group wbs-sess-tasks">' +
           '<div class="wbs-sess-group-head">' +
-          (batch ? '<input type="checkbox" class="wbs-ws-check" data-ws="__TASKS__"' + (taskCheckedAll ? ' checked' : '') + '>' : '') +
           '<span class="wbs-sess-group-name" title="未选择项目的会话"><span class="wbs-sess-group-type">任务</span></span>' +
           '<span class="wbs-sess-group-count">' + tasks.length + '</span>' +
           '</div>';
         taskVis.forEach(function (s) {
           var title = s.custom_title || s.title || '(无标题)';
-          var sel = sessionsState.selected[s.id] ? ' checked' : '';
-          html += '<label class="wbs-sess-row">' +
-            (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + s.id + '"' + sel + '>' : '') +
+          html += '<div class="wbs-sess-row">' +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
             '<span class="wbs-sess-meta">' + fmtHumanTime(s.created_at) + '</span></span>' +
-            '</label>';
+            '</div>';
         });
-        if (taskMore > 0) {
-          html += '<button class="wbs-sess-more" type="button" data-ws="__TASKS__">展开 ' + Math.min(taskMore, SESS_WS_STEP) + ' 条（剩余 ' + taskMore + '）</button>';
-        }
+        if (taskMore > 0) html += '<button class="wbs-sess-more" type="button" data-ws="__TASKS__">展开 ' + Math.min(taskMore, SESS_WS_STEP) + ' 条（剩余 ' + taskMore + '）</button>';
         html += '</div>';
       }
-      // 空间区（按 cwd 分组）
-      wsOrder.forEach(function (w) {
-        var arr = groups[w];
-        var shown = (sessionsState.wsExpanded[w] || SESS_WS_INIT);
+      wsOrder.forEach(function (groupKey) {
+        var group = groups[groupKey];
+        var arr = group.items;
+        var shown = (sessionsState.wsExpanded[groupKey] || SESS_WS_INIT);
         var vis = arr.slice(0, shown);
         var more = arr.length - vis.length;
         var checkedAll = arr.every(function (s) { return sessionsState.selected[s.id]; });
+        var workspaceMarked = arr.some(function (s) { return !!s.autoCopyWorkspace; });
+        var autoWorkspace = group.cwd === '(未指定空间)' ? '' : autoCopyButton('workspace', group.cwd, group.uid, workspaceMarked, false);
         html += '<div class="wbs-sess-group">' +
           '<div class="wbs-sess-group-head">' +
-          (batch ? '<input type="checkbox" class="wbs-ws-check" data-ws="' + esc(w) + '"' + (checkedAll ? ' checked' : '') + '>' : '') +
-          '<span class="wbs-sess-group-name" title="' + esc(w) + '"><span class="wbs-sess-group-type">空间</span>' + esc(shortWs(w)) + '</span>' +
+          (batch ? '<input type="checkbox" class="wbs-ws-check" data-ws="' + escAttr(groupKey) + '"' + (checkedAll ? ' checked' : '') + '>' : '') +
+          '<span class="wbs-sess-group-name" title="' + escAttr(group.cwd) + '"><span class="wbs-sess-group-type">空间</span>' + esc(shortWs(group.cwd)) + '</span>' +
+          (batch ? '' : autoWorkspace) +
           '<span class="wbs-sess-group-count">' + arr.length + '</span>' +
           '</div>';
         vis.forEach(function (s) {
           var title = s.custom_title || s.title || '(无标题)';
           var sel = sessionsState.selected[s.id] ? ' checked' : '';
-          html += '<label class="wbs-sess-row">' +
-            (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + s.id + '"' + sel + '>' : '') +
+          var inherited = !!s.autoCopyWorkspace;
+          var marked = !!s.autoCopySession || inherited;
+          html += '<div class="wbs-sess-row">' +
+            (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
             '<span class="wbs-sess-meta">' + fmtHumanTime(s.created_at) + '</span></span>' +
-            '</label>';
+            (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
+            '</div>';
         });
-        if (more > 0) {
-          html += '<button class="wbs-sess-more" type="button" data-ws="' + esc(w) + '">展开 ' + Math.min(more, SESS_WS_STEP) + ' 条（剩余 ' + more + '）</button>';
-        }
+        if (more > 0) html += '<button class="wbs-sess-more" type="button" data-ws="' + escAttr(groupKey) + '">展开 ' + Math.min(more, SESS_WS_STEP) + ' 条（剩余 ' + more + '）</button>';
         html += '</div>';
       });
       listEl.innerHTML = html;
-      if (countEl) countEl.textContent = total + ' 个会话';
+      updateSessionSummary(countEl);
       bindSessEvents(listEl);
     }
+    function activeAutoCopyCount() {
+      return sessionsState.list.filter(function (s) {
+        return !isTaskSessionRecordUI(s.cwd) && (!!s.autoCopySession || !!s.autoCopyWorkspace);
+      }).length;
+    }
+    function updateSessionSummary(countEl) {
+      if (!countEl) return;
+      countEl.innerHTML = '<span class="wbs-sess-summary-tag">共 ' + sessionsState.list.length + ' 个会话</span>' +
+        '<span class="wbs-sess-summary-tag wbs-sess-summary-auto">自动复制 ' + activeAutoCopyCount() + '</span>';
+    }
     function shortWs(w) {
-      var parts = w.split('/').filter(Boolean);
+      var parts = String(w || '').replace(/\\/g, '/').split('/').filter(Boolean);
       return parts.length >= 2 ? parts.slice(-2).join('/') : w;
     }
     // 会话列表内事件委托
     function bindSessEvents(listEl) {
       listEl.onclick = function (e) {
         var t = e.target;
+        var autoBtn = t.closest ? t.closest('.wbs-sess-auto') : null;
+        if (autoBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (autoBtn.disabled) return;
+          toggleAutoCopyRule(autoBtn.getAttribute('data-auto-kind'), autoBtn.getAttribute('data-auto-key'), autoBtn.getAttribute('data-auto-uid'), autoBtn.getAttribute('aria-pressed') !== 'true');
+          return;
+        }
         // 空间/任务勾选
         var wsCheck = t.closest ? t.closest('.wbs-ws-check') : null;
         if (wsCheck) {
           var w = wsCheck.getAttribute('data-ws');
-          var arr;
-          if (w === '__TASKS__') {
-            arr = sessionsState.list.filter(function (s) { return /\/WorkBuddy\/\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}/.test(s.cwd || ''); });
-          } else {
-            arr = sessionsState.list.filter(function (s) { return (s.cwd || '(未指定空间)') === w; });
-          }
+          var arr = sessionsState.list.filter(function (s) {
+            return !isTaskSessionRecordUI(s.cwd) && String(s.user_id || sessionsState.uid || '') + '::' + (s.cwd || '(未指定空间)') === w;
+          });
           var on = wsCheck.checked;
           arr.forEach(function (s) { sessionsState.selected[s.id] = on; });
           renderSessions();
@@ -1702,10 +1758,72 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         });
       });
     }
+    function toggleAutoCopyRule(kind, key, uid, enabled) {
+      if (!kind || !key || !uid) return;
+      var listEl = sessionsPane.querySelector('#wbs-sess-list');
+      var snapshot = sessionsState.list.map(function (s) {
+        return { id: s.id, autoCopySession: !!s.autoCopySession, autoCopyWorkspace: !!s.autoCopyWorkspace };
+      });
+      var oldAutoCopy = sessionsState.autoCopy;
+      var changedKey = kind === 'workspace' ? canonicalWorkspaceUI(key) : String(key);
+      sessionsState.list.forEach(function (s) {
+        if (kind === 'session' && String(s.id) === changedKey && String(s.user_id || '') === String(uid)) s.autoCopySession = enabled;
+        if (kind === 'workspace' && canonicalWorkspaceUI(s.cwd) === changedKey) s.autoCopyWorkspace = enabled;
+      });
+      updateAutoCopyButtons(listEl);
+      api('/api/sessions/auto-copy', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ uid: uid, kind: kind, key: key, enabled: enabled }),
+      }).then(function (response) {
+        if (response && response.rules) sessionsState.autoCopy = response.rules;
+        toast(enabled ? '已开启切换账号时自动复制' : '已关闭自动复制', false, root);
+        updateSessCount();
+      }).catch(function (e) {
+        sessionsState.list.forEach(function (s) {
+          var previous = snapshot.find(function (x) { return x.id === s.id; });
+          if (previous) { s.autoCopySession = previous.autoCopySession; s.autoCopyWorkspace = previous.autoCopyWorkspace; }
+        });
+        sessionsState.autoCopy = oldAutoCopy;
+        updateAutoCopyButtons(listEl);
+        toast('自动复制设置失败: ' + (e.message || e), true, root);
+      });
+    }
+    function updateAutoCopyButtons(listEl) {
+      if (!listEl) return;
+      listEl.querySelectorAll('.wbs-sess-auto').forEach(function (button) {
+        var kind = button.getAttribute('data-auto-kind');
+        var key = button.getAttribute('data-auto-key') || '';
+        var uid = button.getAttribute('data-auto-uid') || '';
+        var state = false;
+        var inherited = false;
+        if (kind === 'workspace') {
+          state = sessionsState.list.some(function (s) { return canonicalWorkspaceUI(s.cwd) === canonicalWorkspaceUI(key) && !!s.autoCopyWorkspace; });
+        } else {
+          var session = sessionsState.list.find(function (s) { return String(s.id) === String(key) && String(s.user_id || '') === String(uid); });
+          if (session) {
+            inherited = !!session.autoCopyWorkspace;
+            state = !!session.autoCopySession || inherited;
+          }
+        }
+        var title = inherited ? '随空间自动复制' : (state ? '取消自动复制' : '切换账号时自动复制');
+        button.classList.toggle('active', state);
+        button.classList.toggle('inherited', inherited);
+        button.disabled = inherited;
+        button.setAttribute('aria-pressed', state ? 'true' : 'false');
+        button.setAttribute('aria-label', title);
+        button.setAttribute('title', title);
+        var knob = button.querySelector('.wbs-sess-auto-switch');
+        if (knob) knob.classList.toggle('on', state);
+      });
+    }
     function updateSessCount() {
-      var n = Object.keys(sessionsState.selected).filter(function (k) { return sessionsState.selected[k]; }).length;
+      var n = sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd) && sessionsState.selected[s.id]; }).length;
       var countEl = sessionsPane.querySelector('#wbs-sess-count');
-      if (countEl) countEl.textContent = sessionsState.list.length + ' 个会话' + (sessionsState.batchMode ? '，已选 ' + n : '');
+      updateSessionSummary(countEl);
+      if (countEl && sessionsState.batchMode) {
+        countEl.insertAdjacentHTML('beforeend', '<span class="wbs-sess-summary-selected">已选 ' + n + '</span>');
+      }
       // 未选中会话时隐藏「复制/删除」按钮（仅批量模式可见）
       var cp = sessionsPane.querySelector('#wbs-sess-copy');
       var dl = sessionsPane.querySelector('#wbs-sess-delete');
@@ -1718,7 +1836,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!sessionsPane) return;
       var btn = sessionsPane.querySelector('#wbs-sess-check-all');
       if (!btn) return;
-      var allSel = sessionsState.list.length > 0 && sessionsState.list.every(function (s) { return sessionsState.selected[s.id]; });
+      var selectable = sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
+      var allSel = selectable.length > 0 && selectable.every(function (s) { return sessionsState.selected[s.id]; });
       var ico = btn.querySelector('.wbs-sess-check-ico');
       var lbl = btn.querySelector('.wbs-sess-check-label');
       if (ico) {
@@ -1733,6 +1852,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (lbl) lbl.textContent = allSel ? '取消全选' : '全选';
     }
     function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function escAttr(t) { return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
     // 人性化时间：刚刚 / x 分钟前 / x 小时前 / 昨天 / x 天前 / 日期
     function fmtHumanTime(ts) {
       if (!ts) return '-';
@@ -1793,9 +1913,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var checkAll = sessionsPane.querySelector('#wbs-sess-check-all');
       if (checkAll) {
         checkAll.addEventListener('click', function () {
-          var allSel = sessionsState.list.length > 0 && sessionsState.list.every(function (s) { return sessionsState.selected[s.id]; });
+          var selectable = sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
+          var allSel = selectable.length > 0 && selectable.every(function (s) { return sessionsState.selected[s.id]; });
           sessionsState.selected = {};
-          if (!allSel) sessionsState.list.forEach(function (s) { sessionsState.selected[s.id] = true; });
+          if (!allSel) selectable.forEach(function (s) { sessionsState.selected[s.id] = true; });
           renderSessions();
           updateSessCount();
         });
@@ -1911,11 +2032,307 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       };
     }
     function selectedSessIds() {
-      return sessionsState.list.filter(function (s) { return sessionsState.selected[s.id]; }).map(function (s) { return s.id; });
+      return sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd) && sessionsState.selected[s.id]; }).map(function (s) { return s.id; });
     }
     function showSessModal(show) {
       var mask = sessionsPane.querySelector('#wbs-sess-modal');
       if (mask) mask.style.display = show ? '' : 'none';
+    }
+
+    // ===== 模型 pane（当前模型 + WorkDaddy 本地备份） =====
+    var modelsState = { tab: 'official', official: [], groups: [], selected: {}, batch: false, officialError: '' };
+    function buildModelsPane() {
+      if (!modelsPane) return;
+      modelsPane.dataset.built = '1';
+      modelsPane.innerHTML =
+        '<div class="wbs-pcard wbs-model-card">' +
+        '<div class="wbs-model-tabs" role="tablist">' +
+        '<button class="wbs-model-tab active" type="button" data-model-tab="official">当前模型<span class="wbs-model-tab-count" id="wbs-model-official-count">0</span></button>' +
+        '<button class="wbs-model-tab" type="button" data-model-tab="mine">备选模型<span class="wbs-model-tab-count" id="wbs-model-mine-count">0</span></button>' +
+        '</div>' +
+        '<div class="wbs-model-toolbar">' +
+        '<span class="wbs-model-count" id="wbs-model-count"></span>' +
+        '<span class="wbs-model-toolbar-spacer"></span>' +
+        '<button class="wbs-sess-bbtn" type="button" id="wbs-model-batch" style="display:none">批量管理</button>' +
+        '</div>' +
+        '<div class="wbs-model-batchbar" id="wbs-model-batchbar" style="display:none">' +
+        '<button class="wbs-sess-bbtn wbs-model-check-all" type="button" id="wbs-model-check-all">全选</button>' +
+        '<span class="wbs-model-batch-count" id="wbs-model-batch-count">已选 0</span>' +
+        '<button class="wbs-sess-bbtn wbs-model-batch-action" type="button" id="wbs-model-batch-action"></button>' +
+        '<button class="wbs-sess-bbtn wbs-sess-done" type="button" id="wbs-model-done">取消</button>' +
+        '</div>' +
+        '<div class="wbs-model-tip" id="wbs-model-tip" style="display:none"><span class="wbs-model-tip-ico">' + MODEL_TIP_SVG + '</span><strong>小贴士</strong><span>解决 WorkBuddy 不支持多个同名模型的问题。</span></div>' +
+        '<div class="wbs-model-list" id="wbs-model-list"><div class="wbs-empty">加载中…</div></div>' +
+        '</div>' +
+        '<div class="wbs-modal-mask" id="wbs-model-confirm" style="display:none"><div class="wbs-modal"><div class="wbs-modal-title" id="wbs-model-confirm-title">确认操作</div><div class="wbs-modal-body" id="wbs-model-confirm-body"></div><div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-model-confirm-cancel">取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-model-confirm-ok">确定</button></div></div></div>' +
+        '<div class="wbs-modal-mask" id="wbs-model-edit" style="display:none"><div class="wbs-modal wbs-model-edit-modal"><div class="wbs-modal-title">编辑模型</div><div class="wbs-model-edit-form"><label class="wbs-model-edit-field"><span>名称</span><input id="wbs-model-edit-name" type="text" autocomplete="off"></label><label class="wbs-model-edit-field"><span>URL</span><input id="wbs-model-edit-url" type="url" autocomplete="off"></label><label class="wbs-model-edit-field"><span>API Key</span><span class="wbs-model-secret-wrap"><input id="wbs-model-edit-key" type="password" autocomplete="off"><button class="wbs-model-eye" id="wbs-model-edit-eye" type="button" title="显示或隐藏 API Key" aria-label="显示或隐藏 API Key"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></svg></button></span></label></div><div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-model-edit-cancel">取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-model-edit-save">保存</button></div></div></div>';
+      wireModelsPane();
+      loadModels();
+    }
+    // 前端脱敏：与后端 maskApiKey 一致。cell 列表展示短脱敏串，title 同样脱敏；编辑弹窗用明文原值
+    function maskModelKey(apiKey) {
+      var value = String(apiKey || '');
+      if (!value) return '';
+      if (value.length <= 8) return '••••••';
+      var prefix = value.slice(0, Math.min(3, value.length - 8));
+      return prefix + '••••' + value.slice(-4);
+    }
+    function modelDetailsHtml(model) {
+      var url = model.url || '-';
+      var masked = maskModelKey(model.apiKey);
+      var key = masked || '未设置';
+      return '<div class="wbs-model-details">' +
+        '<div class="wbs-model-field"><span>url</span><strong class="wbs-model-url" title="' + escAttr(url) + '">' + esc(url) + '</strong></div>' +
+        '<div class="wbs-model-field"><span>apiKey</span><strong class="wbs-model-key" title="' + escAttr(key) + '">' + esc(key) + '</strong></div>' +
+        '</div>';
+    }
+    function modelRowHtml(model, options) {
+      options = options || {};
+      var selectionKey = options.selectionKey || '';
+      var checked = selectionKey && modelsState.selected[selectionKey] ? ' checked' : '';
+      var checkbox = modelsState.batch && selectionKey ? '<input class="wbs-model-check" type="checkbox" data-model-select="' + escAttr(selectionKey) + '"' + checked + '>' : '';
+      // 按钮组占流固定在标题行右侧，仅 hover/focus cell 时由透明变不透明，布局与高度恒定
+      var actions = options.official
+        ? '<div class="wbs-model-actions">' +
+          '<button class="wbs-model-icon-action" type="button" data-model-backup="' + model.index + '" title="备份" aria-label="备份">' + MODEL_BACKUP_SVG + '</button>' +
+          '<button class="wbs-model-icon-action" type="button" data-model-test="' + model.index + '" title="连通测试" aria-label="连通测试">' + MODEL_TEST_SVG + '</button>' +
+          '<button class="wbs-model-icon-action wbs-model-danger-action" type="button" data-model-delete-official="' + model.index + '" title="删除" aria-label="删除">' + TRASH_SVG + '</button>' +
+          '</div>'
+        : '<div class="wbs-model-actions">' +
+          '<button class="wbs-model-icon-action" type="button" data-model-copy="' + escAttr(model.backupId) + '" title="复制" aria-label="复制">' + MODEL_COPY_SVG + '</button>' +
+          '<button class="wbs-model-icon-action" type="button" data-model-edit="' + escAttr(model.backupId) + '" title="编辑" aria-label="编辑">' + MODEL_EDIT_SVG + '</button>' +
+          '<button class="wbs-model-action wbs-model-enable" type="button" data-model-enable="' + escAttr(model.backupId) + '" title="启用"><span class="wbs-model-enable-icon">' + MODEL_ENABLE_SVG + '</span><span>启用</span></button>' +
+          '</div>';
+      var tags = '<span class="wbs-model-tag">' + esc(model.vendor || '-') + '</span>' +
+        '<span class="wbs-model-tag wbs-model-tag-id" title="' + escAttr(model.id || '-') + '">' + esc(model.id || '-') + '</span>';
+      return '<div class="wbs-model-row' + (options.official ? '' : ' wbs-model-backup-row') + '">' +
+        '<div class="wbs-model-main">' +
+        '<div class="wbs-model-title-row">' + checkbox +
+        '<div class="wbs-model-name" title="' + escAttr(model.name || model.id || '') + '">' + esc(model.name || model.id || '(未命名)') + '</div>' +
+        actions +
+        '</div>' +
+        '<div class="wbs-model-tag-row">' + tags + '</div>' +
+        modelDetailsHtml(model) +
+        '</div></div>';
+    }
+    function loadModels() {
+      if (!modelsPane) return;
+      var list = modelsPane.querySelector('#wbs-model-list');
+      if (list) list.innerHTML = '<div class="wbs-empty">加载中…</div>';
+      api('/api/models').then(function (data) {
+        modelsState.official = data.official || [];
+        modelsState.groups = data.backups || [];
+        modelsState.officialError = data.officialError || '';
+        renderModels();
+      }).catch(function (e) {
+        modelsState.official = [];
+        modelsState.groups = [];
+        modelsState.officialError = e.message || String(e);
+        if (list) list.innerHTML = '<div class="wbs-empty">模型加载失败：' + esc(e.message || e) + '</div>';
+        updateModelCounts();
+      });
+    }
+    function updateModelCounts() {
+      if (!modelsPane) return;
+      var officialCount = modelsPane.querySelector('#wbs-model-official-count');
+      var mineCount = modelsPane.querySelector('#wbs-model-mine-count');
+      var count = modelsPane.querySelector('#wbs-model-count');
+      var backupCount = modelsState.groups.reduce(function (n, group) { return n + (group.items || []).length; }, 0);
+      if (officialCount) officialCount.textContent = modelsState.official.length;
+      if (mineCount) mineCount.textContent = backupCount;
+      if (count) count.textContent = modelsState.tab === 'official' ? '共 ' + modelsState.official.length + ' 个模型' : '共 ' + backupCount + ' 个备选';
+    }
+    function renderModels() {
+      if (!modelsPane) return;
+      var list = modelsPane.querySelector('#wbs-model-list');
+      if (!list) return;
+      modelsPane.querySelectorAll('.wbs-model-tab').forEach(function (tab) {
+        tab.classList.toggle('active', tab.getAttribute('data-model-tab') === modelsState.tab);
+      });
+      var batchBtn = modelsPane.querySelector('#wbs-model-batch');
+      if (batchBtn) batchBtn.style.display = !modelsState.batch ? '' : 'none';
+      var batchbar = modelsPane.querySelector('#wbs-model-batchbar');
+      if (batchbar) batchbar.style.display = modelsState.batch ? '' : 'none';
+      var tip = modelsPane.querySelector('#wbs-model-tip');
+      if (tip) tip.style.display = modelsState.tab === 'mine' && !modelsState.batch ? '' : 'none';
+      updateModelCounts();
+      if (modelsState.tab === 'official') {
+        if (modelsState.officialError) { list.innerHTML = '<div class="wbs-empty">当前模型加载失败：' + esc(modelsState.officialError) + '</div>'; return; }
+        if (!modelsState.official.length) { list.innerHTML = '<div class="wbs-empty">没有找到当前模型配置</div>'; return; }
+        list.innerHTML = modelsState.official.map(function (model) { return modelRowHtml(model, { official: true, selectionKey: 'official:' + model.index }); }).join('');
+        updateModelBatchState();
+        return;
+      }
+      if (!modelsState.groups.length) { list.innerHTML = '<div class="wbs-empty">还没有模型备份</div>'; return; }
+      list.innerHTML = modelsState.groups.map(function (group) {
+        var items = group.items || [];
+        return '<div class="wbs-model-group"><div class="wbs-model-group-head"><span class="wbs-model-group-title">' + esc(group.name || '(未命名模型)') + '</span><span class="wbs-model-group-count">' + items.length + '</span></div>' + items.map(function (model) {
+          return modelRowHtml(model, { selectionKey: 'backup:' + model.backupId });
+        }).join('') + '</div>';
+      }).join('');
+      updateModelBatchState();
+    }
+    function updateModelBatchState() {
+      if (!modelsPane) return;
+      var ids = Object.keys(modelsState.selected).filter(function (id) { return modelsState.selected[id]; });
+      var count = modelsPane.querySelector('#wbs-model-batch-count');
+      var action = modelsPane.querySelector('#wbs-model-batch-action');
+      if (count) count.textContent = '已选 ' + ids.length;
+      if (action) {
+        action.disabled = !ids.length;
+        action.textContent = '删除选中';
+      }
+      var all = modelsState.tab === 'official' ? modelsState.official.map(function (m) { return 'official:' + m.index; }) : modelsState.groups.reduce(function (out, group) { return out.concat((group.items || []).map(function (m) { return 'backup:' + m.backupId; })); }, []);
+      var allSelected = all.length > 0 && all.every(function (id) { return modelsState.selected[id]; });
+      var checkAll = modelsPane.querySelector('#wbs-model-check-all');
+      if (checkAll) checkAll.textContent = allSelected ? '取消全选' : '全选';
+    }
+    function showModelConfirm(title, bodyText, onConfirm) {
+      var mask = modelsPane.querySelector('#wbs-model-confirm');
+      var titleEl = modelsPane.querySelector('#wbs-model-confirm-title');
+      var body = modelsPane.querySelector('#wbs-model-confirm-body');
+      var ok = modelsPane.querySelector('#wbs-model-confirm-ok');
+      var cancel = modelsPane.querySelector('#wbs-model-confirm-cancel');
+      titleEl.textContent = title;
+      body.textContent = bodyText;
+      mask.style.display = '';
+      var close = function () { mask.style.display = 'none'; ok.onclick = null; cancel.onclick = null; };
+      cancel.onclick = close;
+      mask.onclick = function (event) { if (event.target === mask) close(); };
+      ok.onclick = function () { close(); onConfirm(); };
+    }
+    function wireModelsPane() {
+      modelsPane.addEventListener('click', function (event) {
+        var tab = event.target.closest ? event.target.closest('.wbs-model-tab') : null;
+        if (tab) { modelsState.tab = tab.getAttribute('data-model-tab') || 'official'; modelsState.batch = false; modelsState.selected = {}; renderModels(); return; }
+        var backup = event.target.closest ? event.target.closest('[data-model-backup]') : null;
+        if (backup) {
+          api('/api/models/backup', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ index: Number(backup.getAttribute('data-model-backup')) }) })
+            .then(function () { toast('模型已备份到「备选模型」', false, root); modelsState.tab = 'mine'; modelsState.batch = false; modelsState.selected = {}; loadModels(); })
+            .catch(function (e) { toast('模型备份失败：' + (e.message || e), true, root); });
+          return;
+        }
+        var modelTest = event.target.closest ? event.target.closest('[data-model-test]') : null;
+        if (modelTest) {
+          var testIndex = Number(modelTest.getAttribute('data-model-test'));
+          modelTest.disabled = true;
+          api('/api/models/test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ index: testIndex }) })
+            .then(function (data) {
+              var result = data && data.result || {};
+              toast(result.message || ('接口返回 HTTP ' + (result.status || '-')), !(result.authorized), root);
+            })
+            .catch(function (e) { toast('连通测试失败：' + (e.message || e), true, root); })
+            .finally(function () { modelTest.disabled = false; });
+          return;
+        }
+        var officialDelete = event.target.closest ? event.target.closest('[data-model-delete-official]') : null;
+        if (officialDelete) {
+          var officialIndex = Number(officialDelete.getAttribute('data-model-delete-official'));
+          showModelConfirm('删除当前模型？', '删除后会直接修改官方 models.json，已备份到「备选模型」的配置不会受影响。', function () {
+            api('/api/models/delete-official', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ indexes: [officialIndex] }) })
+              .then(function () { toast('当前模型已删除', false, root); loadModels(); })
+              .catch(function (e) { toast('删除当前模型失败：' + (e.message || e), true, root); });
+          });
+          return;
+        }
+        var copy = event.target.closest ? event.target.closest('[data-model-copy]') : null;
+        if (copy) {
+          var copyId = copy.getAttribute('data-model-copy');
+          copy.disabled = true;
+          api('/api/models/copy', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backupId: copyId }) })
+            .then(function () { toast('模型已复制', false, root); loadModels(); })
+            .catch(function (e) { toast('复制模型失败：' + (e.message || e), true, root); copy.disabled = false; });
+          return;
+        }
+        var edit = event.target.closest ? event.target.closest('[data-model-edit]') : null;
+        if (edit) { openModelEdit(edit.getAttribute('data-model-edit')); return; }
+        var enable = event.target.closest ? event.target.closest('[data-model-enable]') : null;
+        if (enable) {
+          var backupId = enable.getAttribute('data-model-enable');
+          showModelConfirm('启用模型配置？', '这会把该备份覆盖到官方 models.json 中，同 id 的旧配置将被移除。', function () {
+            enable.disabled = true;
+            api('/api/models/enable', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backupId: backupId }) })
+              .then(function () { toast('模型已启用', false, root); loadModels(); })
+              .catch(function (e) { toast('启用模型失败：' + (e.message || e), true, root); renderModels(); });
+          });
+          return;
+        }
+        var batch = event.target.closest ? event.target.closest('#wbs-model-batch') : null;
+        if (batch) { modelsState.batch = true; modelsState.selected = {}; renderModels(); return; }
+        var checkAll = event.target.closest ? event.target.closest('#wbs-model-check-all') : null;
+        if (checkAll) {
+          var all = modelsState.tab === 'official' ? modelsState.official.map(function (m) { return 'official:' + m.index; }) : modelsState.groups.reduce(function (out, group) { return out.concat((group.items || []).map(function (m) { return 'backup:' + m.backupId; })); }, []);
+          var allSelected = all.length > 0 && all.every(function (id) { return modelsState.selected[id]; });
+          all.forEach(function (id) { modelsState.selected[id] = !allSelected; });
+          renderModels();
+          return;
+        }
+        var done = event.target.closest ? event.target.closest('#wbs-model-done') : null;
+        if (done) { modelsState.batch = false; modelsState.selected = {}; renderModels(); return; }
+        var batchAction = event.target.closest ? event.target.closest('#wbs-model-batch-action') : null;
+        if (batchAction && !batchAction.disabled) {
+          var ids = Object.keys(modelsState.selected).filter(function (id) { return modelsState.selected[id]; });
+          if (modelsState.tab === 'official') {
+            showModelConfirm('删除当前模型？', '删除后会直接修改官方 models.json，已备份到「备选模型」的配置不会受影响。', function () {
+              var indexes = ids.map(function (id) { return Number(id.slice('official:'.length)); });
+              api('/api/models/delete-official', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ indexes: indexes }) })
+                .then(function () { toast('已删除 ' + indexes.length + ' 个当前模型', false, root); modelsState.batch = false; modelsState.selected = {}; loadModels(); })
+                .catch(function (e) { toast('删除当前模型失败：' + (e.message || e), true, root); });
+            });
+          } else {
+            showModelConfirm('删除模型备份？', '删除后无法恢复，但不会影响官方 models.json。', function () {
+              var backupIds = ids.map(function (id) { return id.slice('backup:'.length); });
+              api('/api/models/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backupIds: backupIds }) })
+                .then(function () { toast('已删除 ' + backupIds.length + ' 个模型备份', false, root); modelsState.batch = false; modelsState.selected = {}; loadModels(); })
+                .catch(function (e) { toast('删除模型备份失败：' + (e.message || e), true, root); });
+            });
+          }
+        }
+      });
+      modelsPane.addEventListener('change', function (event) {
+        var checkbox = event.target.closest ? event.target.closest('.wbs-model-check') : null;
+        if (!checkbox) return;
+        modelsState.selected[checkbox.getAttribute('data-model-select')] = checkbox.checked;
+        updateModelBatchState();
+      });
+    }
+
+    function findModelBackup(backupId) {
+      for (var i = 0; i < modelsState.groups.length; i++) {
+        var item = (modelsState.groups[i].items || []).find(function (m) { return m.backupId === backupId; });
+        if (item) return item;
+      }
+      return null;
+    }
+    function openModelEdit(backupId) {
+      var item = findModelBackup(backupId);
+      var mask = modelsPane.querySelector('#wbs-model-edit');
+      if (!item || !mask) return;
+      var name = modelsPane.querySelector('#wbs-model-edit-name');
+      var url = modelsPane.querySelector('#wbs-model-edit-url');
+      var key = modelsPane.querySelector('#wbs-model-edit-key');
+      var eye = modelsPane.querySelector('#wbs-model-edit-eye');
+      var save = modelsPane.querySelector('#wbs-model-edit-save');
+      var cancel = modelsPane.querySelector('#wbs-model-edit-cancel');
+      name.value = item.name || item.id || '';
+      url.value = item.url || '';
+      key.value = item.apiKey || '';
+      key.type = 'password';
+      key.dataset.originalMask = item.apiKey || '';
+      save.disabled = false;
+      mask.style.display = '';
+      var close = function () { mask.style.display = 'none'; };
+      cancel.onclick = close;
+      mask.onclick = function (event) { if (event.target === mask) close(); };
+      eye.onclick = function () { key.type = key.type === 'password' ? 'text' : 'password'; };
+      save.onclick = function () {
+        var patch = { name: name.value, url: url.value };
+        if (key.value !== key.dataset.originalMask) patch.apiKey = key.value;
+        save.disabled = true;
+        api('/api/models/edit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backupId: backupId, patch: patch }) })
+          .then(function () { close(); toast('模型已保存', false, root); loadModels(); })
+          .catch(function (e) { toast('保存模型失败：' + (e.message || e), true, root); save.disabled = false; });
+      };
     }
 
     // ===== 主题 pane（构建：主题选择 + 背景图来源切换[官方壁纸/自定义上传] + 毛玻璃 + 头像）=====
@@ -2017,6 +2434,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             '<button class="wbs-update-btn" id="wbs-update-btn" type="button">立即更新</button>' +
             '<span class="wbs-update-progress" id="wbs-update-progress" style="display:none"></span>' +
           '</div>' +
+          '<div class="wbs-update-bar" id="wbs-update-bar" style="display:none;height:6px;border-radius:3px;background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 22%,transparent);overflow:hidden;margin-top:8px"><i id="wbs-update-bar-fill" style="display:block;height:100%;width:0;border-radius:3px;background:var(--wb-button-primary-bg,#1f1f1f);transition:width .6s ease"></i></div>' +
         '</div>' +
         '<div class="wbs-pcard wbs-about-hero">' +
           '<div class="wbs-about-name" id="wbs-about-name">WorkDaddy</div>' +
@@ -2061,9 +2479,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       checkForUpdate();
     }
 
-    // 自动更新 UI：查询 /api/update-check → 有新版则 tab 红点 + 更新卡片 → 点击走 下载→安装→自动重启
+    // 自动更新 UI：查询 /api/update-check（force=1 每次面板打开都强制刷新，不受 daemon 6 小时缓存限制）
+    // → 有新版则 tab 红点 + 更新卡片 → 点击走 下载→安装→自动重启
     function checkForUpdate() {
-      api('/api/update-check').then(function (d) {
+      api('/api/update-check?force=1').then(function (d) {
         if (!d || !d.hasUpdate) return; // 无更新或检查失败：不打扰
         var tab = root.querySelector('.wbs-tab[data-tab="about"]');
         if (tab) tab.classList.add('wbs-tab-dot');
@@ -2090,8 +2509,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var card = aboutPane.querySelector('#wbs-update-card');
       if (!btn || !card) return;
       btn.disabled = true;
-      btn.textContent = '准备中…';
-      if (prog) prog.style.display = '';
+      btn.textContent = '更新中…';
+      if (prog) { prog.style.display = ''; prog.textContent = '正在准备更新…'; }
       api('/api/update-download', { method: 'POST' }).then(function (d) {
         if (!d.ok) throw new Error(d.error || '下载失败');
         return pollUpdateProgress(prog, btn, card);
@@ -2102,52 +2521,100 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
-    // 轮询 /api/update-status 直到 installing → 触发 apply → 等待 done（daemon 即将退出，UI 不再轮询）
+    // 轮询 /api/update-status 直到下载完成 → 触发 apply → daemon 自我退出进入「重启等待」。
+    // 重启期间 /api/update-status 会连接失败（daemon 已退出换文件）——这属于"正常重启"而非失败，
+    // 继续重试直到新 daemon 起来并报告新版本号，才算完成。全程用分阶段文案反馈，不再一句「即将重启」了事。
+    // 重启等待阶段的分阶段预估进度（替换/启动真实耗时不透明，按安装向导惯例分步推进，
+    // 让用户看到进度而非一句「30~60 秒」干等；新 daemon 真正就绪后以实际版本收尾）
+    var REBOOT_STEPS = [
+      { t: 0,     pct: 12, text: '正在停止旧版服务…' },
+      { t: 3000,  pct: 30, text: '正在写入新版本文件…' },
+      { t: 9000,  pct: 55, text: '正在启动新版本…' },
+      { t: 16000, pct: 80, text: '正在连接新服务…' },
+      { t: 26000, pct: 95, text: '快完成了，请稍候…' },
+    ];
     function pollUpdateProgress(prog, btn, card) {
       return new Promise(function (resolve, reject) {
         var rounds = 0;
+        var rebooting = false;
+        var rebootElapsed = 0;
+        var bar = card ? card.querySelector('#wbs-update-bar') : null;
+        var barFill = bar ? bar.querySelector('#wbs-update-bar-fill') : null;
+        function renderRebootUi() {
+          var text = 'WorkDaddy 正在重启，更新即将完成，请稍候…';
+          var pct = 95;
+          for (var i = 0; i < REBOOT_STEPS.length; i++) {
+            if (rebootElapsed >= REBOOT_STEPS[i].t) { text = REBOOT_STEPS[i].text; pct = REBOOT_STEPS[i].pct; }
+          }
+          if (rebootElapsed > 45000) { text = '启动较慢，请耐心等待…（也可双击桌面 WorkDaddy 图标手动启动）'; pct = 99; }
+          if (prog) prog.textContent = text;
+          if (bar) bar.style.display = '';
+          if (barFill) barFill.style.width = pct + '%';
+        }
         var timer = setInterval(function () {
           rounds++;
           api('/api/update-status').then(function (s) {
             if (!prog) return;
-            if (s.status === 'downloading' || s.status === 'verifying') {
+            if (!s) throw new Error('status-empty');
+            if (rebooting) {
+              // 重启等待阶段：新 daemon 已就绪且有版本 → 完成
+              var newVer = s.version;
+              if (newVer && (!WBS_VERSION || WBS_VERSION.indexOf('__WBS_') === 0 || newVer !== WBS_VERSION)) {
+                clearInterval(timer);
+                if (bar) bar.style.display = '';
+                if (barFill) barFill.style.width = '100%';
+                prog.textContent = '✅ 已升级到 v' + newVer + '，更新完成';
+                if (btn) btn.textContent = '已完成';
+                resolve(true);
+              } else {
+                rebootElapsed += 1000;
+                renderRebootUi();
+              }
+              return;
+            }
+            var st = s.status;
+            if (st === 'downloading' || st === 'verifying') {
               prog.textContent = s.message + (s.progress ? ' ' + s.progress + '%' : '');
-            } else if (s.status === 'installing') {
-              prog.textContent = '安装中… 完成后将自动重启';
+            } else if (st === 'installing') {
+              prog.textContent = '正在安装新版本…';
               if (btn) btn.textContent = '安装中…';
-              // 触发安装
-              api('/api/update-apply', { method: 'POST' }).then(function (r) {
-                if (r.ok) {
-                  prog.textContent = r.message || '更新完成，正在重启…';
-                  if (btn) btn.textContent = '重启中…';
-                  clearInterval(timer);
-                  resolve(true);
-                } else {
-                  clearInterval(timer);
-                  reject(new Error(r.error || '安装失败'));
-                }
-              }).catch(function (e) { clearInterval(timer); reject(e); });
-            } else if (s.status === 'error') {
+              fireApply();
+            } else if (st === 'error') {
               clearInterval(timer);
               reject(new Error(s.error || s.message || '更新出错'));
-            } else if (s.status === 'idle' && s.downloaded) {
-              // 下载完成待安装
+            } else if (st === 'idle' && s.downloaded) {
               prog.textContent = '下载完成，准备安装…';
-              api('/api/update-apply', { method: 'POST' }).then(function (r) {
-                if (r.ok) {
-                  prog.textContent = r.message || '更新完成，正在重启…';
-                  if (btn) btn.textContent = '重启中…';
-                  clearInterval(timer);
-                  resolve(true);
-                } else {
-                  clearInterval(timer);
-                  reject(new Error(r.error || '安装失败'));
-                }
-              }).catch(function (e) { clearInterval(timer); reject(e); });
+              fireApply();
+            } else if (st === 'idle' && s.hasUpdate) {
+              prog.textContent = s.message || '发现新版本，准备更新…';
             }
-            if (rounds > 600) { clearInterval(timer); reject(new Error('更新超时')); } // 10 分钟兜底
-          }).catch(function (e) { clearInterval(timer); reject(e); });
-        }, 500);
+          }).catch(function (e) {
+            // 连接断开（daemon 已退出替换文件）= 正在重启；稍等片刻再进入等待态
+            if (!rebooting && rounds > 2) { enterRebootWait(); return; }
+            if (rebooting) { rebootElapsed += 1000; renderRebootUi(); return; }
+            clearInterval(timer); reject(new Error((e && e.message) || '更新失败'));
+          });
+
+          function fireApply() {
+            if (rebooting) return;
+            api('/api/update-apply', { method: 'POST' }).then(function (r) {
+              if (r && r.ok) { enterRebootWait(); }
+              else { clearInterval(timer); reject(new Error((r && r.error) || '安装失败')); }
+            }).catch(function (e2) {
+              var msg = String((e2 && e2.message) || e2);
+              if (/ECONNREFUSED|Failed to fetch|NetworkError|load failed/i.test(msg)) { enterRebootWait(); }
+              else { clearInterval(timer); reject(new Error((e2 && e2.message) || '安装失败')); }
+            });
+          }
+
+          function enterRebootWait() {
+            if (rebooting) return;
+            rebooting = true;
+            rebootElapsed = 0;
+            renderRebootUi();
+            if (btn) btn.textContent = '重启中…';
+          }
+        }, 1000);
       });
     }
 
@@ -2369,9 +2836,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 面板高度固定为主题页高度：防止切 tab 时高度忽高忽低（首次主题页壁纸渲染后锁定一次）
     function lockPanelHeight() {
       if (!panel || panel.dataset.hLocked) return;
-      var r = panel.getBoundingClientRect();
-      if (r.height < 100) return; // 面板未显示/尺寸异常不锁
-      panel.style.height = Math.round(r.height) + 'px';
+      panel.style.height = '650px';
+      panel.style.maxHeight = '650px';
       panel.dataset.hLocked = '1';
       var bodyEl = panel.querySelector('.wbs-body');
       if (bodyEl) bodyEl.style.overflowY = 'auto';
@@ -2443,6 +2909,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       fab.classList.toggle('hidden', open); // 打开时隐藏按钮
       if (open) {
         refresh();
+        checkForUpdate(); // 打开面板即检测更新（每次打开都强制查一次新版本）
       } else {
         stopCheckinPolling();
         state.creditRunId++;
@@ -3427,6 +3894,33 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
+    function pollAutoCopyJob(jobId, accountName) {
+      if (!jobId) return;
+      var attempts = 0;
+      var poll = function () {
+        attempts++;
+        api('/api/sessions/auto-copy/status?id=' + encodeURIComponent(jobId)).then(function (d) {
+          var job = d && d.job;
+          if (!job) return;
+          if (job.status === 'queued' || job.status === 'running') {
+            if (attempts < 120) setBuildTimeout(poll, 700);
+            return;
+          }
+          if (job.status === 'done') {
+            toast('已切换到「' + accountName + '」，已复制 ' + job.total + ' 个会话', false, root);
+          } else if (job.status === 'partial') {
+            toast('已切换到「' + accountName + '」，复制完成，' + job.failed + ' 项失败', true, root);
+          } else {
+            toast('已切换到「' + accountName + '」，自动复制失败', true, root);
+          }
+          setBuildTimeout(refresh, 900);
+        }).catch(function () {
+          if (attempts < 120) setBuildTimeout(poll, 1000);
+        });
+      };
+      setBuildTimeout(poll, 700);
+    }
+
     // token 过期状态：< 7 天 / 已过期 -> 红字高亮
     function tokenState(expiresAt, account) {
       if (isIdentityExpired(account)) return { warn: true, expired: true, label: expiresAt ? fmtDateTime(expiresAt) : '-' };
@@ -3507,13 +4001,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             body: JSON.stringify({ uid: btn.dataset.uid, reload: true }),
           })
             .then(function (r) {
+              var autoCopy = r && r.autoCopy;
               toast(
                 r.reloaded
-                  ? '已切换为「' + (r.nickname || r.uid) + '」，开始领取积分…'
+                  ? (autoCopy && autoCopy.jobId ? '已切换为「' + (r.nickname || r.uid) + '」，正在复制已标记会话…' : '已切换为「' + (r.nickname || r.uid) + '」，开始领取积分…')
                   : '已切换为「' + (r.nickname || r.uid) + '」，重启后生效',
                 false,
                 root
               );
+              if (autoCopy && autoCopy.jobId) pollAutoCopyJob(autoCopy.jobId, r.nickname || r.uid);
               setBuildTimeout(refresh, 1500);
             })
             .catch(function (e) { toast('切换失败: ' + e.message, true, root); })
@@ -3918,7 +4414,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-fab:hover{transform:scale(0.5)}',
     '.wbs-fab:active{transform:scale(0.5) translate(2px,2px)}',
     /* 面板：毛玻璃主题（半透明 + 模糊，背景图透出） */
-    '.wbs-panel{position:absolute;right:0;bottom:0;width:460px;max-height:min(78vh,660px);background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
+    '.wbs-panel{position:absolute;right:0;bottom:0;width:460px;height:650px;max-height:650px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
     '.wbs-panel.show{display:flex}',
     '.wbs-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 12px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 30%,transparent)}',
     '.wbs-head-left{display:flex;align-items:center;gap:9px;min-width:0}',
@@ -3928,7 +4424,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-ghbtn svg{display:block}',
     '.wbs-btn-close{border:none;background:none;color:var(--wb-icon-tertiary,#999);font-size:16px;cursor:pointer;padding:4px 6px;border-radius:6px;line-height:1}',
     '.wbs-btn-close:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
-    '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;max-height:calc(min(78vh,660px) - 170px)}',
+    '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;min-height:0;height:calc(650px - 170px);max-height:none}',
     /* 账号卡片：头像 + 信息 + 右侧操作 */
     '.wbs-card{display:block;padding:10px 12px;border-radius:12px;margin-bottom:4px;transition:background .12s}',
     '.wbs-card:hover{background:var(--wb-bg-hover,#f7f8fa)}',
@@ -4123,7 +4619,81 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-delbtn{padding:7px;color:var(--wb-icon-secondary,#555)}',
     '.wbs-sess-delbtn:hover{color:#ff6b6b;border-color:color-mix(in srgb,#ff6b6b 45%,transparent);background:color-mix(in srgb,#ff6b6b 8%,transparent)}',
     '.wbs-sess-delbtn.armed{color:#fff;background:#ff6b6b;border-color:#ff6b6b}',
-    '.wbs-sess-count{font-size:12px;color:var(--wb-icon-tertiary,#999);margin-left:auto}',
+    '.wbs-sess-count{display:flex;align-items:center;gap:5px;margin-left:auto;min-width:0}',
+    '.wbs-sess-summary-tag{display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:999px;background:color-mix(in srgb,var(--wb-bg-tertiary,#f0f0f0) 70%,transparent);color:var(--wb-icon-secondary,#666);font-size:11px;white-space:nowrap}',
+    '.wbs-sess-summary-auto{border-color:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 24%,var(--wb-border-default,#e5e5e5));color:var(--wb-button-primary-bg,#1f1f1f);background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 8%,transparent)}',
+    '.wbs-sess-summary-selected{font-size:11px;color:var(--wb-icon-tertiary,#999);white-space:nowrap}',
+    '.wbs-model-card{display:flex;flex:1;flex-direction:column;min-height:0;padding:10px 12px 12px}',
+    '.wbs-model-tabs{display:flex;gap:4px;padding:3px;margin-bottom:10px;border-radius:10px;background:var(--wb-bg-tertiary,#f0f0f0)}',
+    '.wbs-model-tab{display:flex;align-items:center;justify-content:center;gap:7px;flex:1;min-width:0;padding:9px 8px;border:0;border-radius:8px;background:transparent;color:var(--wb-icon-secondary,#666);font-size:14px;font-weight:650;line-height:1;font-family:inherit;cursor:pointer;transition:background .15s,color .15s}',
+    '.wbs-model-tab:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-model-tab.active{background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);box-shadow:0 1px 4px rgba(0,0,0,.16)}',
+    '.wbs-model-tab-count{font-size:12px;opacity:.72;font-variant-numeric:tabular-nums}',
+    '.wbs-model-toolbar{display:flex;align-items:center;gap:6px;min-height:28px;margin-bottom:7px}',
+    '.wbs-model-toolbar-spacer{flex:1}',
+    '.wbs-model-count{font-size:13px;color:var(--wb-icon-tertiary,#888)}',
+    '.wbs-model-batchbar{display:flex;align-items:center;gap:6px;margin-bottom:7px;padding:6px 8px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 18%,transparent)}',
+    '.wbs-model-batch-count{font-size:11px;color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-model-batch-action{margin-left:auto}',
+    '.wbs-model-batchbar .wbs-sess-done{margin-left:0}',
+    '.wbs-model-batch-action:disabled{opacity:.45;cursor:not-allowed}',
+    '.wbs-model-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:6px;max-height:none;overflow-y:auto;scrollbar-width:thin;scrollbar-color:transparent transparent}',
+    '.wbs-model-list:hover{scrollbar-color:rgba(128,128,128,.45) transparent}',
+    '.wbs-model-list::-webkit-scrollbar{width:6px}',
+    '.wbs-model-list::-webkit-scrollbar-thumb{background:transparent;border-radius:3px}',
+    '.wbs-model-list:hover::-webkit-scrollbar-thumb{background:rgba(128,128,128,.45)}',
+    '.wbs-model-row{display:flex;align-items:flex-start;box-sizing:border-box;width:100%;gap:10px;padding:10px 8px;border:0;border-radius:10px;background:transparent;transition:background .15s}',
+    '.wbs-model-row:hover{background:var(--wb-bg-hover,#f5f5f5)}',
+    '.wbs-model-main{min-width:0;flex:1}',
+    // 第一行：自定义名（左）+ 操作按钮组（右，占流固定；hover/focus cell 时由透明变不透明）
+    '.wbs-model-title-row{display:flex;align-items:center;gap:9px;min-width:0;margin-bottom:6px}',
+    '.wbs-model-name{min-width:0;flex:0 1 auto;font-size:14px;font-weight:650;color:var(--wb-color-text-primary,#1f1f1f);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.wbs-model-details{display:flex;flex-direction:column;gap:4px;min-width:0}',
+    // 第二行：vendor 标签 + 模型 id 标签
+    '.wbs-model-tag-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;margin-bottom:6px}',
+    '.wbs-model-tag{display:inline-flex;align-items:center;max-width:100%;padding:2px 8px;border:1px solid color-mix(in srgb,var(--wb-border-default,#e5e5e5) 85%,transparent);border-radius:999px;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-secondary,#555);font-size:11px;font-weight:500;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.wbs-model-tag-id{color:var(--wb-icon-secondary,#666);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}',
+    '.wbs-model-field{display:grid;grid-template-columns:52px minmax(0,1fr);align-items:center;gap:6px;min-width:0;font-size:12px;line-height:1.35}',
+    '.wbs-model-field span{min-width:0;color:var(--wb-icon-tertiary,#999);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}',
+    '.wbs-model-field strong{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--wb-icon-secondary,#666);font-weight:500;text-align:left}',
+    // url 与 apiKey：完整展示，允许换行，不做省略截断（批量/悬浮切换不影响宽度与行高）
+    '.wbs-model-field strong.wbs-model-url,.wbs-model-field strong.wbs-model-key{white-space:normal;overflow-wrap:anywhere;word-break:break-all}',
+    '.wbs-model-key{letter-spacing:.2px}',
+    // 按钮组占流于标题行右侧，位置恒定；仅 hover/focus cell 时透明度 0→1
+    '.wbs-model-actions{display:flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:auto;opacity:0;transition:opacity .15s}',
+    '.wbs-model-row:hover .wbs-model-actions,.wbs-model-row:focus-within .wbs-model-actions{opacity:1}',
+    '.wbs-model-action{display:inline-flex;align-items:center;justify-content:center;gap:4px;flex:0 0 auto;min-height:28px;padding:6px 10px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:8px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:11px;font-weight:600;line-height:1;font-family:inherit;cursor:pointer;transition:background .15s,color .15s,border-color .15s}',
+    '.wbs-model-action:hover{background:var(--wb-button-primary-bg,#1f1f1f);border-color:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff)}',
+    '.wbs-model-icon-action{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px solid transparent;border-radius:7px;background:var(--wb-bg-hover,#f7f8fa);color:var(--wb-icon-secondary,#555);cursor:pointer;transition:background .15s,color .15s,border-color .15s}',
+    '.wbs-model-icon-action:hover{background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 12%,transparent);border-color:transparent;color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-model-icon-action:disabled{opacity:.45;cursor:wait}',
+    '.wbs-model-danger-action{background:var(--wb-bg-hover,#f7f8fa);color:var(--wb-icon-secondary,#555)}',
+    '.wbs-model-danger-action:hover{background:#ffecec;color:#f53f3f;border-color:transparent}',
+    '.wbs-model-enable{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-tertiary,#f0f0f0)}',
+    '.wbs-model-enable:hover{background:var(--wb-button-primary-bg,#1f1f1f);border-color:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff)}',
+    '.wbs-model-enable-icon{display:inline-flex;align-items:center}',
+    '.wbs-model-group{display:flex;flex-direction:column;gap:3px}',
+    // 备选模型组与组之间：浅色细分隔线（仅出现在组间，首个组无）
+    '.wbs-model-group + .wbs-model-group{border-top:1px solid color-mix(in srgb,var(--wb-border-default,#e5e5e5) 55%,transparent);padding-top:9px}',
+    '.wbs-model-group-head{display:flex;align-items:center;gap:7px;padding:5px 4px 4px}',
+    '.wbs-model-group-title{display:inline-flex;align-items:center;max-width:calc(100% - 30px);padding:3px 9px;border-radius:999px;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-secondary,#555);font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.wbs-model-group-count{margin-left:auto;flex:0 0 auto;padding:2px 7px;border-radius:999px;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-tertiary,#999);font-size:11px}',
+    '.wbs-model-check{margin:0;accent-color:var(--wb-button-primary-bg,#1f1f1f);flex:0 0 auto}',
+    // 小贴士：tips 通知条样式（圆角浅底 + 灯泡图标 + 标题）
+    '.wbs-model-tip{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:7px 11px;border:1px solid color-mix(in srgb,var(--wb-border-default,#e5e5e5) 82%,transparent);border-radius:10px;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-tertiary,#777);font-size:11px;line-height:1.5;box-shadow:0 1px 3px rgba(0,0,0,.05)}',
+    '.wbs-model-tip-ico{display:inline-flex;align-items:center;flex:0 0 auto;color:var(--wb-icon-secondary,#555)}',
+    '.wbs-model-tip strong{flex:0 0 auto;color:var(--wb-color-text-secondary,#555);font-weight:650}',
+    '.wbs-model-tip span{min-width:0}',
+    '.wbs-model-edit-modal{width:min(390px,calc(100vw - 36px))}',
+    '.wbs-model-edit-form{display:flex;flex-direction:column;gap:11px;margin-bottom:20px}',
+    '.wbs-model-edit-field{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--wb-icon-secondary,#666)}',
+    '.wbs-model-edit-field input{box-sizing:border-box;width:100%;min-height:32px;padding:6px 9px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:8px;background:var(--wb-bg-secondary,#fff);color:var(--wb-color-text-primary,#1f1f1f);font:inherit;outline:none}',
+    '.wbs-model-edit-field input:focus{border-color:var(--wb-button-primary-bg,#1f1f1f);box-shadow:0 0 0 2px color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 16%,transparent)}',
+    '.wbs-secret-wrap,.wbs-model-secret-wrap{position:relative;display:block}',
+    '.wbs-model-secret-wrap input{padding-right:34px}',
+    '.wbs-model-eye{position:absolute;right:4px;top:3px;width:27px;height:27px;display:flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:var(--wb-icon-tertiary,#888);cursor:pointer}',
+    '.wbs-model-eye:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-model-edit-field small{font-size:10px;color:var(--wb-icon-tertiary,#999)}',
     '.wbs-sess-list{max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-bottom:8px;scrollbar-width:thin;scrollbar-color:transparent transparent}',
     '.wbs-sess-list:hover{scrollbar-color:rgba(128,128,128,.45) transparent}',
     '.wbs-sess-list::-webkit-scrollbar{width:6px}',
@@ -4138,13 +4708,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-group-count{font-size:10px;color:var(--wb-icon-tertiary,#999);background:var(--wb-bg-tertiary,#f0f0f0);border-radius:9px;padding:1px 7px}',
     '.wbs-sess-more{width:100%;padding:5px 8px;margin-top:4px;border:1px dashed var(--wb-border-default,#e5e5e5);border-radius:8px;background:transparent;color:var(--wb-icon-secondary,#555);font-size:11px;cursor:pointer;transition:all .15s;line-height:1}',
     '.wbs-sess-more:hover{border-color:var(--wb-border-strong,#bbb);color:var(--wb-color-text-primary,#1f1f1f)}',
-    '.wbs-sess-row{display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border:1px solid transparent;border-radius:8px;cursor:pointer;transition:all .15s}',
+    '.wbs-sess-row{display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border:1px solid transparent;border-radius:8px;cursor:pointer;transition:background .15s}',
     '.wbs-sess-row:hover{background:var(--wb-bg-hover,#f5f5f5)}',
+    '.wbs-sess-tasks .wbs-sess-row{cursor:default}',
     '.wbs-sess-row:has(input:checked){border-color:#fff;background:color-mix(in srgb,#fff 10%,transparent)}',
     '.wbs-sess-row input{margin:2px 0 0;accent-color:#fff;flex-shrink:0}',
-    '.wbs-sess-main{display:flex;flex-direction:column;gap:2px;min-width:0}',
+    '.wbs-sess-main{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}',
     '.wbs-sess-title{font-size:12px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.wbs-sess-meta{font-size:11px;color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-sess-auto{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 0 auto;min-width:76px;height:26px;margin-top:-2px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--wb-icon-tertiary,#999);cursor:pointer;padding:0 3px 0 5px;transition:background .15s,color .15s,opacity .15s;font:inherit}',
+    '.wbs-sess-auto:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-sess-auto.active{color:var(--wb-button-primary-bg,#1f1f1f)}',
+    '.wbs-sess-auto.inherited{color:var(--wb-button-primary-bg,#1f1f1f);opacity:.62;cursor:default}',
+    '.wbs-sess-auto:disabled{cursor:default}',
+    '.wbs-sess-auto-label{font-size:11px;line-height:1;white-space:nowrap}',
+    '.wbs-sess-auto-switch{position:relative;display:inline-flex;align-items:center;width:24px;height:14px;flex:0 0 24px;border-radius:999px;background:var(--wb-bg-tertiary,#dedede);transition:background .15s}',
+    '.wbs-sess-auto-switch span{width:10px;height:10px;margin-left:2px;border-radius:50%;background:var(--wb-bg-popover,#fff);box-shadow:0 1px 2px rgba(0,0,0,.18);transition:transform .15s}',
+    '.wbs-sess-auto-switch.on{background:var(--wb-button-primary-bg,#1f1f1f)}',
+    '.wbs-sess-auto-switch.on span{transform:translateX(10px);background:var(--wb-button-primary-fg,#fff)}',
     '.wbs-sess-actions{display:flex;gap:8px;justify-content:flex-end;padding-top:2px}',
     '.wbs-sess-del{flex-shrink:0;padding:7px 12px;border:1px solid #ff6b6b;border-radius:9px;background:color-mix(in srgb,#ff6b6b 10%,transparent);color:#ff6b6b;font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
     '.wbs-sess-del:hover{background:#ff6b6b;color:#fff}',

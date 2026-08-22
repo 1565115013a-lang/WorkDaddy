@@ -56,6 +56,28 @@ const {
   deleteAccount,
   backupPath,
   updateMeta,
+  canonicalWorkspace,
+  getAutoCopyRules,
+  setAutoCopyRule,
+  getAutoCopySession,
+  ensureAutoCopySession,
+  addAutoCopySessionMember,
+  moveAutoCopySession,
+  removeAutoCopySession,
+  removeAutoCopyAccount,
+  getAutoCopyMapping,
+  setAutoCopyMapping,
+  deleteAutoCopyMapping,
+  workbuddyModelsFile,
+  listOfficialModels,
+  readOfficialModel,
+  deleteOfficialModels,
+  listModelBackups,
+  backupOfficialModel,
+  copyModelBackup,
+  editModelBackup,
+  deleteModelBackups,
+  enableModelBackup,
 } = require('./lib.js');
 const { extractCreditSegments, sortCreditSegments } = require('./credit-segments.js');
 const { captureException } = require('./sentry-report.js');
@@ -74,7 +96,18 @@ const DATA_DIR = defaultDataDir();
 // 1.0.5：修复自动更新「缺少解包后的新应用」——下载阶段只落 .dmg 从未解包，
 //       applyUpdate 现改为在安装前调用 extractAppFromDmg 解出 WorkDaddy.app（幂等），
 //       解包函数亦增强（清理残留挂载点、只读挂载、校验 dmg 内存在 WorkDaddy.app）
-// 1.0.6：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照；
+// 1.0.5（修复版打包）：修复 Windows 自动更新三大卡死根因，让「更新已启动，WorkDaddy 即将重启」
+//     到真正更新完成：
+//     ① daemon spawn powershell 曾被 detached:true + stdio:'ignore' 拉起，PowerShell 5.1（console 程序）
+//       在 detached（无控制台）下宿主静默退出、-File 脚本从不执行 → apply.log 永不生成、替换永不发生；
+//     ② 即便去掉 detached，Node 在 Windows 上给子进程套的 Job Object 会在 daemon 退出时（KILL_ON_JOB_CLOSE）
+//       连带杀死 powershell，替换中断在「停止 watchdog」一步；
+//     ③ 发布包内曾混入非 ASCII 文件名（安装失败自主解决提示词.txt），Windows .NET Expand-Archive 解压时
+//       文件名解码成非法字符直接抛「路径中具有非法字符」→ 备份/替换/回滚全部失效。
+//     修复：更新脚本改由 wscript.exe（GUI 子系统）+ apply-update.vbs 中介经 ShellExecute 启动独立进程树，
+//     daemon 随即自我退出释放文件锁；apply-update.ps1 对 watchdog 与端口进程一律 taskkill 不带 /T 精确杀，
+//     避免连坐自身；打包脚本 build-win-zip.sh 增加非 ASCII 文件名守护，杜绝中文/特殊字符条目进入安装包。
+//     另：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照；
 //       修复跨平台自动更新并展示按到期时间拆分的积分明细
 // 1.0.7：兼容无全局 WebSocket 的 Node 18/20，使用内置 ws 建立 CDP
 // 1.0.8：去除 launchd 重定向造成的重复日志，并记录 launcher 选择的 Node 运行时
@@ -86,8 +119,17 @@ const DATA_DIR = defaultDataDir();
 //         账号切换始终使用 JSON 替换 + CDP 刷新，不退出 WorkBuddy
 // 1.0.13：Windows 安装/更新释放 launcher.cmd 文件锁；延长 CDP 启动等待；
 //         补充便携版 WorkBuddy 路径探测，并在重启后恢复主窗口
-const DAEMON_VERSION = '1.0.13';
-const DAEMON_BUILD_ID = 'windows-hardening-20260821';
+// 1.0.14：自动更新使用独立尝试记录、严格脚本退出码、安装后 daemon 校验；
+//         macOS 不再把更新目标硬编码为 /Applications/WorkDaddy.app
+// 1.0.15：会话/空间自动复制规则，切换账号后异步幂等复制并提供进度状态
+// 1.0.16：全局会话 lineage、迁移/删除清理、快速切换复制队列与任务组只读
+// 1.0.17：会话摘要去重统计与本地模型备份/启用管理
+// 1.0.18：模型页展示脱敏详情，支持官方/本地模型批量操作及本地备份复制/编辑
+// 1.0.19：官方模型批量删除、模型卡片稳定布局与固定 650px 面板
+// 1.0.20：模型卡片悬浮操作、官方连通测试、完整长度脱敏 API Key
+// 1.0.21：模型页改为当前/备选模型列表风格，去除刷新入口并优化字段排版
+const DAEMON_VERSION = '1.0.7';
+const DAEMON_BUILD_ID = 'release-1.0.7-20260822';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -185,6 +227,7 @@ const UPDATE_CHECK_INTERVAL = 6 * 3600 * 1000; // 每 6 小时检查一次（Git
 const UPDATE_REQ_TIMEOUT = 10000; // 网络超时，超时静默失败不阻塞面板
 const UPDATE_DIR = path.join(DATA_DIR, 'update'); // 下载/解包目录
 const UPDATE_CHECK_CACHE = path.join(DATA_DIR, 'update-check.json');
+const UPDATE_ATTEMPT_FILE = path.join(UPDATE_DIR, 'last-attempt.json');
 // 更新状态机（面板轮询用）：idle | checking | downloading | verifying | installing | done | error
 const updateState = {
   status: 'idle',
@@ -195,8 +238,27 @@ const updateState = {
   message: '',
   error: null,
   checkedAt: 0,
+  attemptId: null,
 };
 let updateTimer = null;
+
+function writeUpdateAttempt(attempt) {
+  try {
+    fs.mkdirSync(UPDATE_DIR, { recursive: true });
+    const tmp = UPDATE_ATTEMPT_FILE + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(attempt, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(tmp, UPDATE_ATTEMPT_FILE);
+  } catch (e) {
+    log('[update] 更新尝试记录写入失败: ' + e.message);
+  }
+}
+
+function macWorkDaddyAppPath() {
+  if (process.env.WBSWITCH_APP_PATH) return path.resolve(process.env.WBSWITCH_APP_PATH);
+  const bundledInfo = path.resolve(__dirname, '../../..', 'Contents', 'Info.plist');
+  if (fs.existsSync(bundledInfo)) return path.resolve(__dirname, '../../..');
+  return '/Applications/WorkDaddy.app';
+}
 
 // 简单 semver 比较：a > b → 1，a < b → -1，相等 → 0（忽略预发布后缀）
 function semverCompare(a, b) {
@@ -592,27 +654,101 @@ function applyUpdate() {
   if (!updateState.downloaded) return Promise.reject(new Error('尚未下载完成'));
   updateState.status = 'installing';
   updateState.message = '正在安装新版本…';
-  const { execFile } = require('child_process');
+  updateState.error = null;
+  const { spawn } = require('child_process');
+  const attempt = {
+    id: crypto.randomUUID(),
+    status: 'starting',
+    platform: process.platform,
+    fromVersion: DAEMON_VERSION,
+    targetVersion: updateState.latest,
+    startedAt: new Date().toISOString(),
+    pid: process.pid,
+    dataDir: DATA_DIR,
+  };
+  updateState.attemptId = attempt.id;
+  writeUpdateAttempt(attempt);
+  const applyLog = path.join(UPDATE_DIR, 'apply.log');
+  const markAttemptFailure = (error, stage = 'update-script') => {
+    attempt.status = stage;
+    attempt.finishedAt = new Date().toISOString();
+    attempt.error = error && error.message ? error.message : String(error);
+    writeUpdateAttempt(attempt);
+    log('[update] 更新尝试失败 stage=' + stage + ': ' + attempt.error);
+    captureException(error, { stage, extra: { platform: process.platform, attemptId: attempt.id, targetVersion: updateState.latest } }).catch(() => {});
+  };
+  const markSpawnFailure = (error) => markAttemptFailure(error, 'spawn-error');
   if (IS_WIN) {
     // Windows 安装位置由 install.ps1 铺好（%LOCALAPPDATA%\Programs\WorkDaddy）
     const scriptPath = path.join(__dirname, 'apply-update.ps1');
     const appDir = WORKDADDY_DIR_WIN;
     const srcZip = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.zip');
-    if (!fs.existsSync(scriptPath)) return Promise.reject(new Error('缺少 apply-update.ps1'));
-    if (!fs.existsSync(srcZip)) return Promise.reject(new Error('缺少解压后的新版本包'));
-    log('[update] 执行 apply-update.ps1，daemon 即将退出');
-    const child = require('child_process').spawn(
-      'powershell',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, srcZip, appDir, String(ACTUAL_PORT)],
+    if (!fs.existsSync(scriptPath)) {
+      const error = new Error('缺少 apply-update.ps1');
+      markAttemptFailure(error, 'preflight-error');
+      return Promise.reject(error);
+    }
+    if (!fs.existsSync(srcZip)) {
+      const error = new Error('缺少解压后的新版本包');
+      markAttemptFailure(error, 'preflight-error');
+      return Promise.reject(error);
+    }
+    attempt.sourcePackage = srcZip;
+    attempt.targetApp = appDir;
+    writeUpdateAttempt(attempt);
+    log('[update] 执行 apply-update.ps1 attempt=' + attempt.id + ' log=' + applyLog);
+    // 【更新标记】写入 pending.json：watchdog 检测到它在 daemon 退出后【不自动重启 daemon】，
+    // 双重保险（配合本函数末尾「先精确停 watchdog 再自我退出」），彻底杜绝 watchdog 在替换窗口期
+    // 复活 daemon 抢占 47832 端口的竞态（历史上第一轮更新偶发失败、需点第二次才成功的根因）。
+    // apply-update.ps1 成功/失败都负责删除该标记。
+    const pendingFile = path.join(UPDATE_DIR, 'pending.json');
+    try { fs.writeFileSync(pendingFile, JSON.stringify({ attempt: attempt.id, at: new Date().toISOString() })); } catch (_) {}
+    // 【Windows 更新进程模型真相 · 挖坑实录 2.0】这条路踩遍三种写法，全部实例验证：
+    //  ① detached:true + stdio:'ignore'：PowerShell 5.1（console 程序）在 detached（无控制台）下宿主
+    //     初始化静默退出，-File 脚本根本不执行 → apply.log 永不生成、替换永不发生，面板一直「重启中」。
+    //  ② 不 detached + pipe 收集输出：脚本能跑，但 Node 在 Windows 上 spawn 的子进程位于 Job Object，
+    //     daemon 自我退出 → job 关闭 → powershell 被连带杀死（实测日志停在「停止 watchdog」一步）。
+    //  ③ detached + cmd.exe /c 中转：cmd 同为 console 程序，一样不执行。
+    // 唯一可靠的「父进程死后子进程照跑」通道：wscript.exe（GUI 子系统，不依赖控制台）做中介，
+    // VBS 内 WScript.Shell.Run 用 ShellExecute 创建完全独立于 Node Job Object 的 powershell 进程。
+    const applyVbs = path.join(__dirname, 'apply-update.vbs');
+    if (!fs.existsSync(applyVbs)) {
+      const error = new Error('缺少 apply-update.vbs');
+      markAttemptFailure(error, 'preflight-error');
+      return Promise.reject(error);
+    }
+    const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+    const child = spawn(
+      wscript,
+      ['//nologo', applyVbs, scriptPath, srcZip, appDir, String(ACTUAL_PORT), applyLog, attempt.id],
       { detached: true, stdio: 'ignore', windowsHide: true }
     );
+    child.once('error', markSpawnFailure);
+    child.once('spawn', () => {
+      attempt.status = 'script-started';
+      attempt.scriptPid = child.pid;
+      writeUpdateAttempt(attempt);
+      log('[update] apply-update.ps1 已启动(经 wscript 中介) pid=' + child.pid);
+    });
     child.unref();
-    return Promise.resolve({ ok: true, message: '更新已启动，WorkDaddy 即将重启' });
+    // 【竞态加固 · 更新标记】daemon 自我退出后，watchdog 默认会在 3s 后重启新的 daemon 抢占 47832，
+    // 干扰替换。防复活职责完全交给「update/pending.json 更新标记」：watchdog 检测到标记后不自动
+    // 重启 daemon（见 watchdog.js），标记由 apply-update.ps1 finally 清理。
+    // ⚠️ 千万不要在这里用 spawnSync 去杀 watchdog / 做任何同步操作：spawnSync 会阻塞 Node 事件循环，
+    // daemon 将既无法响应 API（面板报「daemon 不可达」）也无法执行下面这行 process.exit(0)，
+    // 安装目录一直被占用 → Mov-Item 报「正在使用中」→ 更新必失败（实测 4 连败的根因）。
+    // 直接干净退出即可，退出过程零阻塞（毫秒级）。
+    setTimeout(() => { try { process.exit(0); } catch (_) {} }, 800);
+    return Promise.resolve({ ok: true, message: '已启动更新，正在替换文件并自动重启，请稍候…' });
   }
   const scriptPath = path.join(__dirname, 'apply-update.sh');
-  const appPath = '/Applications/WorkDaddy.app';
+  const appPath = macWorkDaddyAppPath();
   const srcApp = path.join(UPDATE_DIR, 'WorkDaddy.app');
-  if (!fs.existsSync(scriptPath)) return Promise.reject(new Error('缺少 apply-update.sh'));
+  if (!fs.existsSync(scriptPath)) {
+    const error = new Error('缺少 apply-update.sh');
+    markAttemptFailure(error, 'preflight-error');
+    return Promise.reject(error);
+  }
   // 解出新应用：下载阶段只落了 .dmg，这里才把 WorkDaddy.app 从 dmg 解到 UPDATE_DIR（幂等：已解出则复用）
   const dmgPath = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.dmg');
   const preUnpack = fs.existsSync(srcApp)
@@ -621,15 +757,24 @@ function applyUpdate() {
         ? (updateState.message = '正在解包新应用…', extractAppFromDmg(dmgPath))
         : Promise.reject(new Error('缺少安装包（未找到已下载的 dmg）')));
   return preUnpack.then((p) => {
-    if (!fs.existsSync(p)) return Promise.reject(new Error('缺少解包后的新应用'));
-    // 停掉自身 launchd 服务（KeepAlive 会在新版本启动后接管）
-    execFile('launchctl', ['bootout', 'gui/' + process.getuid(), 'com.workbuddy.workdaddy'], () => {
-      execFile('launchctl', ['remove', 'com.workbuddy.workdaddy'], () => {});
+    if (!fs.existsSync(p)) throw new Error('缺少解包后的新应用');
+    attempt.sourceApp = p;
+    attempt.targetApp = appPath;
+    writeUpdateAttempt(attempt);
+    log('[update] 执行 apply-update.sh attempt=' + attempt.id + ' src=' + p + ' dst=' + appPath + ' log=' + applyLog);
+    const child = spawn('bash', [scriptPath, p, appPath, String(ACTUAL_PORT), applyLog, attempt.id], { detached: true, stdio: 'ignore' });
+    child.once('error', markSpawnFailure);
+    child.once('spawn', () => {
+      attempt.status = 'script-started';
+      attempt.scriptPid = child.pid;
+      writeUpdateAttempt(attempt);
+      log('[update] apply-update.sh 已启动 pid=' + child.pid);
     });
-    log('[update] 执行 apply-update.sh，daemon 即将退出');
-    const child = require('child_process').spawn('bash', [scriptPath, p, appPath, String(ACTUAL_PORT)], { detached: true, stdio: 'ignore' });
     child.unref();
-    return { ok: true, message: '更新已启动，WorkDaddy 即将重启' };
+    return { ok: true, message: '已启动更新，正在替换文件并自动重启，请稍候…' };
+  }).catch((error) => {
+    if (attempt.status === 'starting') markAttemptFailure(error, 'preflight-error');
+    throw error;
   });
 }
 
@@ -1714,12 +1859,17 @@ function sessionRangeMs(range) {
 // tasks/<id>/、file-history/<id>/、artifact-index/<id>.json（全部以新 id 命名复制）
 function copySessionFiles(wbHome, oldId, newId) {
   const fsMod = fs;
+  const result = { copied: 0, failed: 0 };
   const copyOne = (from, to) => {
     try {
       if (!fsMod.existsSync(from)) return;
       fsMod.mkdirSync(path.dirname(to), { recursive: true });
       fsMod.cpSync(from, to, { recursive: true, force: true });
-    } catch (e) { log('[sessions-copy] 复制文件失败 ' + from + ': ' + e.message); }
+      result.copied++;
+    } catch (e) {
+      result.failed++;
+      log('[sessions-copy] 复制文件失败 ' + from + ': ' + e.message);
+    }
   };
   // 1) projects/<项目hash>/<id>.jsonl 与 <id>/ 目录（消息正文核心）
   const projDir = path.join(wbHome, 'projects');
@@ -1743,6 +1893,238 @@ function copySessionFiles(wbHome, oldId, newId) {
   // 5) artifact-index/<id>.json
   copyOne(path.join(wbHome, 'artifact-index', oldId + '.json'), path.join(wbHome, 'artifact-index', newId + '.json'));
   log('[sessions-copy] 已复制消息文件 ' + oldId + ' -> ' + newId);
+  return result;
+}
+
+const SESSION_COPY_COLUMNS = [
+  'id', 'cwd', 'user_id', 'title', 'custom_title', 'status', 'created_at', 'updated_at',
+  'last_activity_at', 'is_playground', 'source_mode', 'is_background_automation', 'mode', 'model',
+  'expert_id', 'expert_locale', 'expert_runtime_identity', 'expert_marketplace', 'permission_mode',
+  'use_sandbox_cli', 'project_id',
+];
+const sessionCopyLocks = new Map();
+
+function isTaskSessionRecord(cwd) {
+  return /[\\/]WorkBuddy[\\/]\d{4}-\d{2}-\d{2}[-]\d{2}[-]\d{2}[-]\d{2}/i.test(String(cwd || ''));
+}
+
+function sqlQuote(value) {
+  return "'" + String(value == null ? '' : value).replace(/'/g, "''") + "'";
+}
+
+function sqlNullable(value) {
+  return value === null || value === undefined || value === '' ? 'NULL' : sqlQuote(value);
+}
+
+async function insertCopiedSession(src, targetUid, newId) {
+  const vals = [
+    sqlQuote(newId),
+    sqlQuote(src.cwd || ''),
+    sqlQuote(targetUid),
+    sqlQuote(src.title || ''),
+    sqlQuote(src.custom_title || ''),
+    sqlQuote(src.status || 'Pending'),
+    String(src.created_at || Date.now()),
+    String(Date.now()),
+    String(src.last_activity_at || src.updated_at || Date.now()),
+    String(src.is_playground || 0),
+    sqlNullable(src.source_mode),
+    src.is_background_automation === null || src.is_background_automation === undefined || src.is_background_automation === '' ? 'NULL' : String(src.is_background_automation),
+    sqlNullable(src.mode),
+    sqlNullable(src.model),
+    sqlNullable(src.expert_id),
+    sqlNullable(src.expert_locale),
+    sqlNullable(src.expert_runtime_identity),
+    sqlNullable(src.expert_marketplace),
+    sqlNullable(src.permission_mode),
+    src.use_sandbox_cli === null || src.use_sandbox_cli === undefined || src.use_sandbox_cli === '' ? 'NULL' : String(src.use_sandbox_cli),
+    sqlNullable(src.project_id),
+  ];
+  await sqliteRun('INSERT INTO sessions (' + SESSION_COPY_COLUMNS.join(',') + ') VALUES (' + vals.join(',') + ');');
+}
+
+async function copySessionRecord(src, targetUid, options = {}) {
+  const sourceUid = String(options.sourceUid || src.user_id || '').trim();
+  const auto = !!options.auto;
+  const wbHome = path.join(os.homedir(), '.workbuddy');
+  let lineageId = options.lineageId || null;
+  const sourceLineage = sourceUid ? getAutoCopySession(DATA_DIR, sourceUid, src.id) : { lineageId: null, enabled: false };
+  if (!lineageId && sourceLineage.enabled) lineageId = sourceLineage.lineageId;
+  if (auto && sourceUid && !lineageId) lineageId = ensureAutoCopySession(DATA_DIR, sourceUid, src.id);
+  const perform = async () => {
+  if (sourceUid && lineageId) {
+    const mapping = getAutoCopyMapping(DATA_DIR, lineageId, targetUid);
+    if (mapping && mapping.targetId) {
+      const existing = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id = ' + sqlQuote(mapping.targetId) + ' AND deleted_at IS NULL LIMIT 1;');
+      if (existing.length && String(existing[0].user_id || '') === String(targetUid)) {
+        const files = copySessionFiles(wbHome, src.id, mapping.targetId);
+        addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, mapping.targetId);
+        setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
+          targetId: mapping.targetId,
+          status: files.failed ? 'partial' : 'copied',
+          failedFiles: files.failed,
+        });
+        return { status: files.failed ? 'partial' : 'skipped', sourceId: src.id, targetId: mapping.targetId, failedFiles: files.failed };
+      }
+      deleteAutoCopyMapping(DATA_DIR, lineageId, targetUid);
+    }
+  }
+
+  const newId = crypto.randomUUID();
+  await insertCopiedSession(src, targetUid, newId);
+  const files = copySessionFiles(wbHome, src.id, newId);
+  if (lineageId) {
+    addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, newId);
+    setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
+      targetId: newId,
+      status: files.failed ? 'partial' : 'copied',
+      failedFiles: files.failed,
+    });
+  }
+  return { status: files.failed ? 'partial' : 'copied', sourceId: src.id, targetId: newId, failedFiles: files.failed };
+  };
+  if (!lineageId) return perform();
+  const lockKey = JSON.stringify([lineageId, String(targetUid || '')]);
+  const previous = sessionCopyLocks.get(lockKey) || Promise.resolve();
+  const current = previous.catch(() => {}).then(perform);
+  sessionCopyLocks.set(lockKey, current);
+  try {
+    return await current;
+  } finally {
+    if (sessionCopyLocks.get(lockKey) === current) sessionCopyLocks.delete(lockKey);
+  }
+}
+
+async function buildAutoCopyPlan(sourceUid, targetUid) {
+  const source = String(sourceUid || '').trim();
+  const target = String(targetUid || '').trim();
+  if (!source || !target || source === target) return [];
+  const rules = getAutoCopyRules(DATA_DIR, source);
+  if (!rules.sessionIds.length && !rules.workspaces.length) return [];
+  const rows = await sqliteQuery(
+    'SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id ' +
+    'FROM sessions WHERE deleted_at IS NULL AND user_id = ' + sqlQuote(source) + ' ORDER BY created_at DESC;'
+  );
+  const sessionSet = new Set(rules.sessionIds);
+  const workspaceSet = new Set(rules.workspaces.map(canonicalWorkspace));
+  return rows
+    .filter((row) => !isTaskSessionRecord(row.cwd))
+    .filter((row) => sessionSet.has(String(row.id)) || workspaceSet.has(canonicalWorkspace(row.cwd)))
+    .map((row) => Object.assign({}, row, { lineageId: rules.lineages[String(row.id)] || null }));
+}
+
+const autoCopyJobs = new Map();
+const autoCopyQueue = [];
+let autoCopyWorkerRunning = false;
+
+function hasPendingAutoCopyTo(uid) {
+  const target = String(uid || '').trim();
+  if (!target) return false;
+  for (const job of autoCopyJobs.values()) {
+    if (job.targetUid === target && (job.status === 'queued' || job.status === 'running')) return true;
+  }
+  return false;
+}
+
+function pruneAutoCopyJobs() {
+  const completed = Array.from(autoCopyJobs.values())
+    .filter((job) => job.status === 'done' || job.status === 'partial' || job.status === 'error')
+    .sort((a, b) => (a.finishedAt || 0) - (b.finishedAt || 0));
+  while (completed.length > 100) {
+    const oldest = completed.shift();
+    autoCopyJobs.delete(oldest.id);
+  }
+}
+
+function runAutoCopyQueue() {
+  if (autoCopyWorkerRunning || !autoCopyQueue.length) return;
+  autoCopyWorkerRunning = true;
+  const item = autoCopyQueue.shift();
+  item.run()
+    .catch((e) => {
+      const job = item.job;
+      job.status = 'error';
+      job.error = e.message;
+      job.finishedAt = Date.now();
+      log(`[sessions-auto-copy] 任务失败: ${e.message}`);
+      const cleanup = setTimeout(() => autoCopyJobs.delete(job.id), 30 * 60 * 1000);
+      if (cleanup.unref) cleanup.unref();
+      pruneAutoCopyJobs();
+    })
+    .finally(() => {
+      autoCopyWorkerRunning = false;
+      runAutoCopyQueue();
+    });
+}
+
+function startAutoCopyJob(sourceUid, targetUid, plan) {
+  const id = crypto.randomUUID();
+  const job = {
+    id,
+    status: 'queued',
+    sourceUid,
+    targetUid,
+    plan: Array.isArray(plan) ? plan : [],
+    total: Array.isArray(plan) ? plan.length : 0,
+    processed: 0,
+    copied: 0,
+    skipped: 0,
+    failed: 0,
+    partial: 0,
+    error: null,
+    startedAt: Date.now(),
+  };
+  autoCopyJobs.set(id, job);
+  const run = async () => {
+    job.status = 'running';
+    // A rapid switch chain may enqueue this job before the previous copy has
+    // created the target rows. Re-plan after the queue reaches this job.
+    job.plan = await buildAutoCopyPlan(sourceUid, targetUid);
+    job.total = job.plan.length;
+    for (const src of job.plan) {
+      try {
+        const result = await copySessionRecord(src, targetUid, {
+          sourceUid,
+          lineageId: src.lineageId || undefined,
+          auto: true,
+        });
+        if (result.status === 'skipped') job.skipped++;
+        else if (result.status === 'partial') job.partial++;
+        else job.copied++;
+        if (result.failedFiles) job.failed += result.failedFiles;
+      } catch (e) {
+        job.failed++;
+        log(`[sessions-auto-copy] ${sourceUid} -> ${targetUid} 会话 ${src.id} 失败: ${e.message}`);
+      }
+      job.processed++;
+    }
+    job.status = job.failed || job.partial ? 'partial' : 'done';
+    job.finishedAt = Date.now();
+    log(`[sessions-auto-copy] ${sourceUid} -> ${targetUid} 完成 total=${job.total} copied=${job.copied} skipped=${job.skipped} partial=${job.partial} failed=${job.failed}`);
+    const cleanup = setTimeout(() => autoCopyJobs.delete(id), 30 * 60 * 1000);
+    if (cleanup.unref) cleanup.unref();
+    pruneAutoCopyJobs();
+  };
+  // Serialising jobs makes a chain such as h -> s -> x observe the sessions
+  // created by the preceding job, even when the user switches rapidly.
+  autoCopyQueue.push({ job, run });
+  runAutoCopyQueue();
+  return job;
+}
+
+function publicAutoCopyJob(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    status: job.status,
+    total: job.total,
+    processed: job.processed,
+    copied: job.copied,
+    skipped: job.skipped,
+    partial: job.partial,
+    failed: job.failed,
+    error: job.error,
+  };
 }
 
 // 真实删除会话的消息文件：projects/<项目>/<id>.jsonl + <id>/、workspace/sessions/<id>/、
@@ -3075,8 +3457,9 @@ function handleApi(req, res) {
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
       try {
         const r = deleteAccount(DATA_DIR, uid);
+        const rulesRemoved = removeAutoCopyAccount(DATA_DIR, uid);
         log(`[delete] 已永久删除账号备份 ${uid}`);
-        return json(res, 200, { ok: true, deleted: r.deleted, uid });
+        return json(res, 200, { ok: true, deleted: r.deleted, uid, rulesRemoved });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }
@@ -3462,14 +3845,206 @@ function handleApi(req, res) {
     if (uid) clauses.push("user_id = '" + uid.replace(/'/g, "''") + "'");
     if (rangeMs) clauses.push('created_at >= ' + rangeMs);
     return sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, project_id FROM sessions WHERE " + clauses.join(' AND ') + " ORDER BY created_at DESC;")
-      .then((rows) => json(res, 200, { ok: true, sessions: rows, count: rows.length, uid, range }))
+      .then((rows) => {
+        const rulesByUid = {};
+        rows.forEach((row) => {
+          const owner = String(row.user_id || '').trim();
+          if (!owner || rulesByUid[owner]) return;
+          const rules = getAutoCopyRules(DATA_DIR, owner);
+          rulesByUid[owner] = { sessions: new Set(rules.sessionIds), workspaces: new Set(rules.workspaces) };
+        });
+        const sessions = rows.map((row) => {
+          const rules = rulesByUid[String(row.user_id || '').trim()] || { sessions: new Set(), workspaces: new Set() };
+          return Object.assign({}, row, {
+            autoCopySession: rules.sessions.has(String(row.id)),
+            autoCopyWorkspace: rules.workspaces.has(canonicalWorkspace(row.cwd)),
+          });
+        });
+        const currentRules = uid
+          ? (rulesByUid[uid] || (() => {
+              const rules = getAutoCopyRules(DATA_DIR, uid);
+              return { sessions: new Set(rules.sessionIds), workspaces: new Set(rules.workspaces) };
+            })())
+          : null;
+        return json(res, 200, {
+          ok: true,
+          sessions,
+          count: sessions.length,
+          uid,
+          range,
+          autoCopy: currentRules ? { sessionIds: Array.from(currentRules.sessions), workspaces: Array.from(currentRules.workspaces) } : null,
+        });
+      })
       .catch((e) => json(res, 500, { ok: false, error: e.message }));
   }
   // 会话空间列表：GET /api/sessions/workspaces
   if (req.method === 'GET' && p === '/api/sessions/workspaces') {
-    return sqliteQuery("SELECT DISTINCT cwd FROM sessions WHERE deleted_at IS NULL AND cwd IS NOT NULL AND cwd != '' ORDER BY cwd;")
+      return sqliteQuery("SELECT DISTINCT cwd FROM sessions WHERE deleted_at IS NULL AND cwd IS NOT NULL AND cwd != '' ORDER BY cwd;")
       .then((rows) => json(res, 200, { ok: true, workspaces: rows.map((r) => r.cwd) }))
       .catch((e) => json(res, 500, { ok: false, error: e.message }));
+  }
+  // 模型连通测试：只返回网络/HTTP 状态，不记录或回传 URL 查询参数、API Key 等敏感内容。
+  // 大多数 OpenAI 兼容服务的根路径不响应（404），因此按候选顺序探测真实端点：
+  //   {base}/models → {base}/v1/models（base 未带版本前缀时）→ base 本身。
+  // 2xx/3xx/401/403/400/405 视为端点真实命中并立即返回；404/5xx/网络错误则继续尝试下一个候选。
+  async function probeModelEndpoint(model) {
+    // url 可能是完整端点（.../v1/chat/completions），先规约到 base 再按候选探测
+    let base = String(model && model.url || '').trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(base)) throw new Error('模型 URL 仅支持 http/https');
+    if (/\/chat\/completions$/i.test(base)) base = base.replace(/\/chat\/completions$/i, '');
+    const headers = { Accept: 'application/json, text/plain, */*', 'User-Agent': 'WorkDaddy probe/1.0' };
+    if (model.apiKey) headers.Authorization = 'Bearer ' + String(model.apiKey);
+    const candidates = [base + '/models'];
+    if (!/\/v\d+$/i.test(base)) candidates.push(base + '/v1/models');
+    candidates.push(base);
+    let lastStatus = 0;
+    let lastError = '';
+    for (const target of candidates) {
+      let response = null;
+      try {
+        response = await fetch(target, { method: 'HEAD', headers, redirect: 'manual', signal: AbortSignal.timeout(6000) });
+        if (response.status === 405 || response.status === 501) {
+          response = await fetch(target, { method: 'GET', headers, redirect: 'manual', signal: AbortSignal.timeout(6000) });
+        }
+      } catch (e) {
+        lastError = (e && e.message) || String(e);
+        continue;
+      }
+      const status = response.status;
+      lastStatus = status;
+      if (status === 404) continue; // 路径不存在：尝试下一个候选
+      if (status >= 200 && status < 500) {
+        return {
+          status,
+          reachable: true,
+          authorized: status >= 200 && status < 300,
+          message: status >= 200 && status < 300
+            ? '接口可用'
+            : (status === 401 || status === 403 ? '接口可达，但 API Key 可能无效' : `接口返回 HTTP ${status}`),
+        };
+      }
+    }
+    const message = lastStatus ? `接口返回 HTTP ${lastStatus}` : (lastError ? `请求失败：${lastError}` : '无法连接模型服务');
+    return { status: lastStatus, reachable: false, authorized: false, message };
+  }
+
+  // 模型管理：列表返回供模型页 UI 展示的摘要（apiKey 明文，供 cell/编辑弹窗直接展示；
+  // 仅本机 loopback 服务，不写日志、不上传）。备份文件保留完整配置，参考 docs 下工作流说明。
+  if (req.method === 'GET' && p === '/api/models') {
+    let official = [];
+    let officialError = null;
+    try {
+      official = listOfficialModels();
+    } catch (e) {
+      officialError = e.message;
+    }
+    return json(res, 200, { ok: true, file: workbuddyModelsFile(), official, officialError, backups: listModelBackups(DATA_DIR) });
+  }
+  if (req.method === 'POST' && p === '/api/models/backup') {
+    return readBody(req).then((body) => {
+      try {
+        const backup = backupOfficialModel(DATA_DIR, body && body.index);
+        return json(res, 200, { ok: true, backup });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/delete-official') {
+    return readBody(req).then((body) => {
+      try {
+        const indexes = Array.isArray(body && body.indexes) ? body.indexes : [];
+        const result = deleteOfficialModels(workbuddyModelsFile(), indexes);
+        return json(res, 200, { ok: true, deleted: result.deleted, official: result.official, backups: listModelBackups(DATA_DIR) });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/test') {
+    return readBody(req).then(async (body) => {
+      try {
+        const index = Number(body && body.index);
+        const model = readOfficialModel(workbuddyModelsFile(), index);
+        const result = await probeModelEndpoint(model);
+        return json(res, 200, { ok: true, result });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/copy') {
+    return readBody(req).then((body) => {
+      try {
+        const backupId = String((body && body.backupId) || '');
+        if (!backupId) return json(res, 400, { ok: false, error: '缺少模型备份标识' });
+        const copied = copyModelBackup(DATA_DIR, backupId);
+        return json(res, 200, { ok: true, copied, backups: listModelBackups(DATA_DIR) });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/edit') {
+    return readBody(req).then((body) => {
+      try {
+        const backupId = String((body && body.backupId) || '');
+        if (!backupId) return json(res, 400, { ok: false, error: '缺少模型备份标识' });
+        const patch = body && body.patch && typeof body.patch === 'object' ? body.patch : {};
+        const edited = editModelBackup(DATA_DIR, backupId, patch);
+        return json(res, 200, { ok: true, edited, backups: listModelBackups(DATA_DIR) });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/delete') {
+    return readBody(req).then((body) => {
+      try {
+        const ids = Array.isArray(body && body.backupIds) ? body.backupIds : [];
+        if (!ids.length) return json(res, 400, { ok: false, error: '未选择模型备份' });
+        const deleted = deleteModelBackups(DATA_DIR, ids);
+        return json(res, 200, { ok: true, deleted, backups: listModelBackups(DATA_DIR) });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'POST' && p === '/api/models/enable') {
+    return readBody(req).then((body) => {
+      try {
+        const backupId = String((body && body.backupId) || '');
+        if (!backupId) return json(res, 400, { ok: false, error: '缺少模型备份标识' });
+        const enabled = enableModelBackup(DATA_DIR, backupId);
+        return json(res, 200, { ok: true, enabled, official: listOfficialModels(), backups: listModelBackups(DATA_DIR) });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  // 自动复制规则：POST /api/sessions/auto-copy { uid, kind: session|workspace, key, enabled }
+  if (req.method === 'POST' && p === '/api/sessions/auto-copy') {
+    return readBody(req).then(async (body) => {
+      try {
+        const uid = String(body.uid || '').trim();
+        const kind = body.kind === 'workspace' ? 'workspace' : 'session';
+        const key = String(body.key || '').trim();
+        if (!uid || !key) return json(res, 400, { ok: false, error: '缺少自动复制规则参数' });
+        if (kind === 'session') {
+          const rows = await sqliteQuery('SELECT user_id FROM sessions WHERE id = ' + sqlQuote(key) + ' AND deleted_at IS NULL LIMIT 1;');
+          if (!rows.length || String(rows[0].user_id || '') !== uid) return json(res, 404, { ok: false, error: '会话不存在或不属于该账号' });
+        }
+        const rules = setAutoCopyRule(DATA_DIR, { uid, kind, key, enabled: body.enabled !== false });
+        return json(res, 200, { ok: true, uid, kind, key: kind === 'workspace' ? canonicalWorkspace(key) : key, rules });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
+    });
+  }
+  // 自动复制任务状态：GET /api/sessions/auto-copy/status?id=<jobId>
+  if (req.method === 'GET' && p === '/api/sessions/auto-copy/status') {
+    const job = autoCopyJobs.get(url.searchParams.get('id') || '');
+    return job ? json(res, 200, { ok: true, job: publicAutoCopyJob(job) }) : json(res, 404, { ok: false, error: '自动复制任务不存在' });
   }
   // 复制会话：POST /api/sessions/copy { ids, targetUid }（保留原会话，复制记录+消息文件到目标账号）
   if (req.method === 'POST' && p === '/api/sessions/copy') {
@@ -3480,42 +4055,12 @@ function handleApi(req, res) {
       if (!targetUid) return json(res, 400, { ok: false, error: '未指定目标账号' });
       try {
         const esc = ids.map((i) => "'" + String(i).replace(/'/g, "''") + "'").join(',');
-        const tU = targetUid.replace(/'/g, "''");
         // 1) 取出源会话（含 cwd 用于定位消息文件）
         const srcRows = await sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id FROM sessions WHERE id IN (" + esc + ") AND deleted_at IS NULL;");
         if (!srcRows.length) return json(res, 404, { ok: false, error: '源会话不存在' });
-        const wbHome = path.join(os.homedir(), '.workbuddy');
         let copied = 0;
         for (const src of srcRows) {
-          const newId = crypto.randomUUID();
-          // 2) INSERT 新会话记录
-          const cols = ['id', 'cwd', 'user_id', 'title', 'custom_title', 'status', 'created_at', 'updated_at', 'last_activity_at', 'is_playground', 'source_mode', 'is_background_automation', 'mode', 'model', 'expert_id', 'expert_locale', 'expert_runtime_identity', 'expert_marketplace', 'permission_mode', 'use_sandbox_cli', 'project_id'];
-          const vals = [
-            "'" + newId + "'",
-            "'" + String(src.cwd || '').replace(/'/g, "''") + "'",
-            "'" + tU + "'",
-            "'" + String(src.title || '').replace(/'/g, "''") + "'",
-            "'" + String(src.custom_title || '').replace(/'/g, "''") + "'",
-            "'" + String(src.status || 'Pending').replace(/'/g, "''") + "'",
-            String(src.created_at || Date.now()),
-            String(Date.now()),
-            String(src.last_activity_at || src.updated_at || Date.now()),
-            String(src.is_playground || 0),
-            src.source_mode ? "'" + String(src.source_mode).replace(/'/g, "''") + "'" : 'NULL',
-            src.is_background_automation === null || src.is_background_automation === undefined || src.is_background_automation === '' ? 'NULL' : String(src.is_background_automation),
-            src.mode ? "'" + String(src.mode).replace(/'/g, "''") + "'" : 'NULL',
-            src.model ? "'" + String(src.model).replace(/'/g, "''") + "'" : 'NULL',
-            src.expert_id ? "'" + String(src.expert_id).replace(/'/g, "''") + "'" : 'NULL',
-            src.expert_locale ? "'" + String(src.expert_locale).replace(/'/g, "''") + "'" : 'NULL',
-            src.expert_runtime_identity ? "'" + String(src.expert_runtime_identity).replace(/'/g, "''") + "'" : 'NULL',
-            src.expert_marketplace ? "'" + String(src.expert_marketplace).replace(/'/g, "''") + "'" : 'NULL',
-            src.permission_mode ? "'" + String(src.permission_mode).replace(/'/g, "''") + "'" : 'NULL',
-            src.use_sandbox_cli === null || src.use_sandbox_cli === undefined || src.use_sandbox_cli === '' ? 'NULL' : String(src.use_sandbox_cli),
-            src.project_id ? "'" + String(src.project_id).replace(/'/g, "''") + "'" : 'NULL',
-          ];
-          await sqliteRun("INSERT INTO sessions (" + cols.join(',') + ") VALUES (" + vals.join(',') + ");");
-          // 3) 复制消息文件（jsonl + 目录 + 索引）
-          copySessionFiles(wbHome, src.id, newId);
+          await copySessionRecord(src, targetUid);
           copied++;
         }
         return json(res, 200, { ok: true, copied, targetUid });
@@ -3526,15 +4071,29 @@ function handleApi(req, res) {
   }
   // 迁移会话：POST /api/sessions/migrate { ids, targetUid }
   if (req.method === 'POST' && p === '/api/sessions/migrate') {
-    return readBody(req).then((body) => {
+    return readBody(req).then(async (body) => {
       const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string') : [];
       const targetUid = (body.targetUid || '').trim();
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
       if (!targetUid) return json(res, 400, { ok: false, error: '未指定目标账号' });
-      const esc = ids.map((i) => "'" + String(i).replace(/'/g, "''") + "'").join(',');
-      return sqliteRun("UPDATE sessions SET user_id = '" + targetUid.replace(/'/g, "''") + "', updated_at = " + Date.now() + " WHERE id IN (" + esc + ");")
-        .then(() => json(res, 200, { ok: true, moved: ids.length, targetUid }))
-        .catch((e) => json(res, 500, { ok: false, error: e.message }));
+      try {
+        const esc = ids.map((i) => sqlQuote(i)).join(',');
+        const before = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + esc + ') AND deleted_at IS NULL;');
+        await sqliteRun("UPDATE sessions SET user_id = " + sqlQuote(targetUid) + ", updated_at = " + Date.now() + " WHERE id IN (" + esc + ");");
+        let rulesMoved = 0;
+        for (const row of before) {
+          if (String(row.user_id || '') === targetUid) continue;
+          try {
+            if (moveAutoCopySession(DATA_DIR, row.user_id, targetUid, row.id)) rulesMoved++;
+          } catch (e) {
+            // The DB move is complete; surface rule maintenance separately so it can be retried.
+            log(`[sessions-auto-copy] 迁移规则 ${row.id} 失败: ${e.message}`);
+          }
+        }
+        return json(res, 200, { ok: true, moved: before.length, requested: ids.length, targetUid, rulesMoved });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: e.message });
+      }
     });
   }
   // 删除会话（真实删除）：POST /api/sessions/delete { ids }——删除 DB 记录 + 该账号下全部会话文件（不可恢复）
@@ -3543,15 +4102,24 @@ function handleApi(req, res) {
       const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string') : [];
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
       try {
-        const esc = ids.map((i) => "'" + String(i).replace(/'/g, "''") + "'").join(',');
+        const esc = ids.map((i) => sqlQuote(i)).join(',');
+        const before = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + esc + ');');
         // 1) 真实删除 DB 记录（非软删）
         await sqliteRun("DELETE FROM sessions WHERE id IN (" + esc + ");");
         // 2) 删除本地消息文件（jsonl/目录/workspace/tasks/file-history/artifact-index）
         const wbHome = path.join(os.homedir(), '.workbuddy');
         let filesRemoved = 0;
         for (const id of ids) filesRemoved += deleteSessionFiles(wbHome, id);
+        let rulesRemoved = 0;
+        for (const row of before) {
+          try {
+            if (removeAutoCopySession(DATA_DIR, row.user_id, row.id)) rulesRemoved++;
+          } catch (e) {
+            log(`[sessions-auto-copy] 删除规则 ${row.id} 失败: ${e.message}`);
+          }
+        }
         log(`[sessions-delete] 已真实删除 ${ids.length} 个会话（DB + ${filesRemoved} 项文件）`);
-        return json(res, 200, { ok: true, deleted: ids.length, filesRemoved });
+        return json(res, 200, { ok: true, deleted: before.length, requested: ids.length, filesRemoved, rulesRemoved });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }
@@ -3788,6 +4356,8 @@ function handleApi(req, res) {
       latest: updateState.latest,
       hasUpdate: updateState.hasUpdate,
       downloaded: updateState.downloaded,
+      attemptId: updateState.attemptId,
+      applyLog: path.join(UPDATE_DIR, 'apply.log'),
     });
   }
   if (req.method === 'POST' && p === '/api/update-download') {
@@ -3802,7 +4372,7 @@ function handleApi(req, res) {
   }
   if (req.method === 'POST' && p === '/api/update-apply') {
     return applyUpdate()
-      .then((r) => json(res, 200, r))
+      .then((r) => json(res, 200, { ...r, attemptId: updateState.attemptId, applyLog: path.join(UPDATE_DIR, 'apply.log') }))
       .catch((e) => json(res, 200, { ok: false, error: e.message }));
   }
 
@@ -3980,6 +4550,16 @@ function handleApi(req, res) {
       const uid = (body.uid || '').trim();
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
       try {
+        // 先记录源账号并规划自动复制内容；切换后异步执行，避免阻塞 WorkBuddy 刷新。
+        const sourceUid = String((currentAccount() || {}).uid || '').trim();
+        let autoCopyPlan = [];
+        if (sourceUid && sourceUid !== uid) {
+          try {
+            autoCopyPlan = await buildAutoCopyPlan(sourceUid, uid);
+          } catch (e) {
+            log(`[sessions-auto-copy] 规划失败 ${sourceUid} -> ${uid}: ${e.message}`);
+          }
+        }
         const acct = switchTo(DATA_DIR, uid, log);
         const hint = '登录文件已切换，请重启 WorkBuddy 使新账号生效';
         let reloaded = false;
@@ -3996,11 +4576,15 @@ function handleApi(req, res) {
             log(`[switch] CDP 刷新失败: ${e.message}`);
           }
         }
+        const autoCopyJob = (autoCopyPlan.length || hasPendingAutoCopyTo(sourceUid))
+          ? startAutoCopyJob(sourceUid, uid, autoCopyPlan)
+          : null;
         return json(res, 200, {
           ok: true,
           uid: acct.uid,
           nickname: acct.nickname,
           reloaded,
+          autoCopy: autoCopyJob ? { jobId: autoCopyJob.id, total: autoCopyJob.total } : { total: 0 },
           hint: reloaded ? '已切换并触发窗口刷新' : hint,
         });
       } catch (e) {

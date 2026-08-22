@@ -22,6 +22,7 @@ const DATA_DIR =
   path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy');
 const PID_FILE = path.join(DATA_DIR, 'watchdog.pid');
 const LOG_FILE = path.join(DATA_DIR, 'watchdog.log');
+const UPDATE_PENDING_FILE = path.join(DATA_DIR, 'update', 'pending.json'); // 自动更新进行中标记（update 目录由 apply 流程创建）
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
@@ -85,6 +86,13 @@ function startDaemon() {
   child.on('exit', (code, signal) => {
     child = null;
     if (stopping) { log('daemon 已退出（watchdog 停止中）'); return; }
+    // 自动更新标记存在：daemon 是在「更新替换」窗口内退出的（apply-update.ps1 正在换文件），
+    // 绝不能立刻重启 daemon 抢占 47832 端口，否则会干扰替换甚至导致更新失败（历史偶发根因）。
+    // 标记由 apply-update.ps1 成功/失败后删除；删除后靠新版 launcher/手动启动重新拉起。
+    if (fs.existsSync(UPDATE_PENDING_FILE)) {
+      log('检测到更新标记 pending.json，跳过自动重启 daemon（等待 apply-update.ps1 完成替换）');
+      return;
+    }
     log('daemon 退出 code=' + code + ' signal=' + signal + '，' + restartDelay + 'ms 后重启');
     setTimeout(startDaemon, restartDelay);
     restartDelay = Math.min(restartDelay * 2, 60000);

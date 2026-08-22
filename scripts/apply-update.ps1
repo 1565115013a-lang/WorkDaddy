@@ -1,24 +1,38 @@
-﻿# WorkDaddy Windows 自动更新替换脚本（apply-update.sh 的 Windows 对应物）
-# 由 daemon.js applyUpdate() 调用，参数：
-#   $1 更新包 zip 路径（update 目录里下载好的 WorkDaddy-<ver>.zip）
-#   $2 安装目录（默认 %LOCALAPPDATA%\Programs\WorkDaddy）
-#   $3 本地 API 端口（等待旧 daemon 退出用，默认 47832）
-# 流程：等端口释放 → 杀 watchdog/daemon → 备份旧目录(.old 可回滚) → 解压替换 → 拉起
-# 注意：Windows 运行中的 exe/js 有文件锁，必须先杀进程再替换。
+﻿# WorkDaddy Windows 自动更新替换脚本。
+# 独立于 daemon 运行：停止 watchdog、替换安装目录、启动新版并验证 API；失败时保留日志并回滚。
+[CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$SrcZip,
   [string]$AppDir = (Join-Path $env:LOCALAPPDATA 'Programs\WorkDaddy'),
-  [string]$Port = '47832'
+  [string]$Port = '47832',
+  [string]$LogPath = '',
+  [string]$AttemptId = 'unknown'
 )
 
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 $DataDir = Join-Path $env:APPDATA 'WorkDaddy'
 $LogDir = Join-Path $DataDir 'update'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$Log = Join-Path $LogDir 'apply.log'
-Start-Transcript -Path $Log -Append -Force
+if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $LogDir 'apply.log' }
+$transcriptStarted = $false
+try {
+  Start-Transcript -Path $LogPath -Append -Force | Out-Null
+  $transcriptStarted = $true
+} catch {
+  # Transcript is diagnostic only; continue with Write-Host if the file cannot be opened.
+}
 
-Write-Host "[apply] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') start src=$SrcZip dst=$AppDir"
+function Write-ApplyLog {
+  param([Parameter(Mandatory = $true)][string]$Message)
+  Write-Host ("[apply] {0} {1}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'), $Message)
+}
+
+function Stop-ApplyTranscript {
+  if ($script:transcriptStarted) {
+    try { Stop-Transcript | Out-Null } catch {}
+    $script:transcriptStarted = $false
+  }
+}
 
 function Test-ExclusiveFile {
   param([string]$Path)
@@ -42,116 +56,146 @@ function Release-LockedLauncher {
     Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
       $commandLine = ([string]$_.CommandLine).Replace('/', '\').ToLowerInvariant()
       if ($commandLine.Contains($needle) -and $_.ProcessId -ne $PID) {
-        taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null
+        & taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null
       }
     }
-  } catch {}
-  for ($i = 0; $i -lt 10; $i++) {
+  } catch {
+    Write-ApplyLog "扫描 launcher.cmd 锁失败: $($_.Exception.Message)"
+  }
+  for ($i = 0; $i -lt 20; $i++) {
     if (Test-ExclusiveFile $LauncherPath) { return $true }
     Start-Sleep -Milliseconds 300
   }
   return (Test-ExclusiveFile $LauncherPath)
 }
 
-# 1) 杀 watchdog（会连带终止 daemon；PID 文件在数据目录）
-$pidFile = Join-Path $DataDir 'watchdog.pid'
-if (Test-Path $pidFile) {
-  try {
-    $wpid = [int]((Get-Content $pidFile -Raw).Trim())
-    if ($wpid -gt 0) { taskkill /F /T /PID $wpid 2>$null | Out-Null }
-  } catch {}
-}
-
-# 2) 兜底：按 API 端口杀残留进程
-# watchdog PID 可能来自旧版本或已失效；不要在端口仍被占用时无条件等待 30 秒。
-$waitSec = 0
-while ($waitSec -lt 10) {
-  $listening = @(netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')
-  if ($listening.Count -eq 0) { break }
-  # 给被 taskkill 的进程最多几秒退出；仍占用时立即强制清理，避免更新假死。
-  if ($waitSec -ge 3) {
-    foreach ($line in $listening) {
-      $parts = ($line.ToString().Trim() -split '\s+')
-      $pid2 = $parts[$parts.Count - 1]
-      if ($pid2 -match '^\d+$') { taskkill /F /T /PID $pid2 2>$null | Out-Null }
+function Stop-WatchdogAndPort {
+  $pidFile = Join-Path $DataDir 'watchdog.pid'
+  if (Test-Path -LiteralPath $pidFile) {
+    try {
+      $watchdogPid = [int]((Get-Content -LiteralPath $pidFile -Raw).Trim())
+      if ($watchdogPid -gt 0) {
+        Write-ApplyLog "停止 watchdog pid=$watchdogPid"
+        # 【重要】绝不能带 /T！taskkill 的 /T 按 ParentProcessId 递归连坐整棵子树，
+        # 而本脚本(powershell)就是 watchdog→daemon→powershell 链上的叶子，/T 会把自身也杀掉，
+        # 导致替换从未执行（apply.log 里做完「停止 watchdog」这步就没下文了）。
+        # 只精确杀 watchdog 一个进程即可；daemon 已被 daemon.js 自我退出，端口兜底逻辑单独处理。
+        & taskkill /F /PID $watchdogPid 2>$null | Out-Null
+      }
+    } catch {
+      Write-ApplyLog "停止 watchdog 失败: $($_.Exception.Message)"
     }
   }
-  Start-Sleep -Seconds 1
-  $waitSec++
-}
-$listening = @(netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')
-foreach ($line in $listening) {
-  $parts = ($line.ToString().Trim() -split '\s+')
-  $pid2 = $parts[$parts.Count - 1]
-  if ($pid2 -match '^\d+$') { taskkill /F /T /PID $pid2 2>$null | Out-Null }
-}
-Start-Sleep -Seconds 1
 
-# 3) 备份旧目录（回滚：move AppDir.old AppDir）
-$oldDir = $AppDir + '.old'
-foreach ($launcherToRelease in @(
-  (Join-Path $AppDir 'scripts\launcher.cmd'),
-  (Join-Path $oldDir 'scripts\launcher.cmd')
-)) {
-  if (-not (Release-LockedLauncher $launcherToRelease)) {
-    Write-Host "[apply] 无法释放 launcher.cmd 文件锁: $launcherToRelease"
-    Stop-Transcript
-    exit 2
+  for ($wait = 0; $wait -lt 15; $wait++) {
+    $listening = @(netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')
+    if ($listening.Count -eq 0) { return }
+    if ($wait -ge 3) {
+      foreach ($line in $listening) {
+        $parts = ($line.ToString().Trim() -split '\s+')
+        $portPid = $parts[$parts.Count - 1]
+        if ($portPid -match '^\d+$') {
+          Write-ApplyLog "端口 $Port 仍被 pid=$portPid 占用，强制结束"
+          # 同样不要 /T：占用端口的进程极可能是 daemon（本脚本的父链成员），/T 会连坐自身。
+          & taskkill /F /PID $portPid 2>$null | Out-Null
+        }
+      }
+    }
+    Start-Sleep -Seconds 1
+  }
+  $remaining = @(netstat -ano | Select-String (":$Port\s") | Select-String 'LISTENING')
+  if ($remaining.Count -gt 0) { throw "端口 $Port 在 15 秒后仍被占用" }
+}
+
+function Rollback-App {
+  param([string]$OldDir, [string]$TargetDir)
+  Write-ApplyLog "开始回滚旧版本"
+  try { Stop-WatchdogAndPort } catch { Write-ApplyLog "回滚前停止新版进程失败: $($_.Exception.Message)" }
+  try { if (Test-Path -LiteralPath $TargetDir) { Remove-Item -LiteralPath $TargetDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
+  if (Test-Path -LiteralPath $OldDir) {
+    try { Move-Item -LiteralPath $OldDir -Destination $TargetDir -Force -ErrorAction Stop } catch {
+      Write-ApplyLog "回滚失败: $($_.Exception.Message)"
+    }
+  }
+  $oldLauncher = Join-Path $TargetDir 'scripts\launcher.cmd'
+  $oldLauncherVbs = Join-Path $TargetDir 'scripts\launcher-hidden.vbs'
+  try {
+    if (Test-Path -LiteralPath $oldLauncherVbs) {
+      Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $oldLauncherVbs + '"') -WorkingDirectory (Split-Path $oldLauncher) -ErrorAction Stop | Out-Null
+    } elseif (Test-Path -LiteralPath $oldLauncher) {
+      Start-Process -FilePath $oldLauncher -WorkingDirectory (Split-Path $oldLauncher) -ErrorAction Stop | Out-Null
+    }
+  } catch {
+    Write-ApplyLog "回滚后启动旧 launcher 失败: $($_.Exception.Message)"
   }
 }
-if (Test-Path $oldDir) { Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue }
-if (Test-Path $AppDir) { Move-Item -Force $AppDir $oldDir -ErrorAction SilentlyContinue }
 
-# 4) 解压新版到临时目录，再移动到位（Expand-Archive 无法原地覆盖已存在目录）
+$oldDir = "$AppDir.old"
 $tmpDir = Join-Path $env:TEMP ("workdaddy-update-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+$backupMade = $false
 try {
-  Expand-Archive -Path $SrcZip -DestinationPath $tmpDir -Force
+  Write-ApplyLog "start attempt=$AttemptId src=$SrcZip dst=$AppDir port=$Port pid=$PID"
+  if (-not (Test-Path -LiteralPath $SrcZip -PathType Leaf)) { throw "更新包不存在: $SrcZip" }
+  Stop-WatchdogAndPort
+
+  foreach ($launcherPath in @((Join-Path $AppDir 'scripts\launcher.cmd'), (Join-Path $oldDir 'scripts\launcher.cmd'))) {
+    if (-not (Release-LockedLauncher $launcherPath)) { throw "无法释放 launcher.cmd 文件锁: $launcherPath" }
+  }
+
+  if (Test-Path -LiteralPath $oldDir) { Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction Stop }
+  if (Test-Path -LiteralPath $AppDir) {
+    Move-Item -LiteralPath $AppDir -Destination $oldDir -Force -ErrorAction Stop
+    $backupMade = $true
+  }
+
+  New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+  Expand-Archive -LiteralPath $SrcZip -DestinationPath $tmpDir -Force
+  $srcRoot = $tmpDir
+  if (-not (Test-Path (Join-Path $tmpDir 'scripts\daemon.js'))) {
+    $hit = Get-ChildItem -LiteralPath $tmpDir -Recurse -Filter 'daemon.js' -File | Select-Object -First 1
+    if ($hit) { $srcRoot = Split-Path $hit.FullName -Parent | Split-Path -Parent }
+  }
+  foreach ($required in @('scripts\daemon.js', 'scripts\launcher.cmd', 'scripts\win-launcher.js')) {
+    if (-not (Test-Path (Join-Path $srcRoot $required) -PathType Leaf)) { throw "更新包缺少 $required" }
+  }
+
+  New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+  & robocopy $srcRoot $AppDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+  $rc = $LASTEXITCODE
+  Write-ApplyLog "robocopy code=$rc"
+  if ($rc -ge 8) { throw "robocopy 复制失败 (code=$rc)" }
+
+  $launcher = Join-Path $AppDir 'scripts\launcher.cmd'
+  $launcherVbs = Join-Path $AppDir 'scripts\launcher-hidden.vbs'
+  if (Test-Path -LiteralPath $launcherVbs) {
+    $started = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $launcherVbs + '"') -WorkingDirectory (Split-Path $launcher) -PassThru -ErrorAction Stop
+  } else {
+    $started = Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher) -PassThru -ErrorAction Stop
+  }
+  Write-ApplyLog "已启动新版 launcher pid=$($started.Id)，等待 daemon"
+  $ready = $false
+  for ($i = 0; $i -lt 60; $i++) {
+    try {
+      $status = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/api/status" -f $Port) -Method Get -TimeoutSec 2
+      if ($status.version) { $ready = $true; Write-ApplyLog "新版 daemon 已就绪 version=$($status.version)"; break }
+    } catch {}
+    Start-Sleep -Seconds 1
+  }
+  if (-not $ready) { throw '新版 daemon 在 60 秒内未就绪' }
+
+  if (Test-Path -LiteralPath $oldDir) {
+    Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  Write-ApplyLog "done attempt=$AttemptId"
+  Stop-ApplyTranscript
+  exit 0
 } catch {
-  Write-Host "[apply] 解压失败: $($_.Exception.Message)"
-  if (Test-Path $oldDir) { Move-Item -Force $oldDir $AppDir -ErrorAction SilentlyContinue }  # 回滚
-  Stop-Transcript
+  Write-ApplyLog "FAILED attempt=$AttemptId error=$($_.Exception.Message)"
+  if ($backupMade) { Rollback-App -OldDir $oldDir -TargetDir $AppDir }
+  Stop-ApplyTranscript
   exit 1
+} finally {
+  try { if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue } } catch {}
+  # 清除更新标记：无论成败都不再阻止 watchdog 拉起 daemon（避免留下「daemon 死光」的悬空状态）
+  try { Remove-Item -LiteralPath (Join-Path $LogDir 'pending.json') -Force -ErrorAction SilentlyContinue } catch {}
 }
-
-# 定位 zip 内的应用根：顶层含 scripts\daemon.js（打包结构）→ 顶层即根；个别情况顶层直接是文件
-$srcRoot = $tmpDir
-if (-not (Test-Path (Join-Path $tmpDir 'scripts\daemon.js')) -and -not (Test-Path (Join-Path $tmpDir 'daemon.js'))) {
-  $hit = Get-ChildItem $tmpDir -Recurse -Filter 'daemon.js' -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($hit) { $srcRoot = Split-Path $hit.FullName -Parent }
-}
-New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-
-# 复制内容（robocopy /MIR 保留结构；失败则回滚）
-$rc = 1
-robocopy $srcRoot $AppDir /MIR /NFL /NDL /NJH /NJS /NP
-$rc = $LASTEXITCODE  # robocopy 0-7 都算成功
-if ($rc -ge 8) {
-  Write-Host "[apply] 复制失败(robocopy=$rc)，回滚旧版本"
-  Remove-Item -Recurse -Force $AppDir -ErrorAction SilentlyContinue
-  if (Test-Path $oldDir) { Move-Item -Force $oldDir $AppDir }
-  Stop-Transcript
-  exit 2
-}
-
-# 5) 校验启动器后清理备份并拉起（launcher 幂等：检测 daemon 后启动 watchdog）
-$launcher = Join-Path (Join-Path $AppDir 'scripts') 'launcher.cmd'
-$launcherVbs = Join-Path (Join-Path $AppDir 'scripts') 'launcher-hidden.vbs'
-if (-not (Test-Path $launcher)) {
-  Write-Host '[apply] 新版本缺少 scripts\\launcher.cmd，回滚旧版本'
-  Remove-Item -Recurse -Force $AppDir -ErrorAction SilentlyContinue
-  if (Test-Path $oldDir) { Move-Item -Force $oldDir $AppDir -ErrorAction SilentlyContinue }
-  Stop-Transcript
-  exit 3
-}
-if (Test-Path $launcherVbs) {
-  # wscript.exe 不创建控制台，自动更新重启时也不再弹出空白 Windows Terminal。
-  Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -ArgumentList ('//nologo "' + $launcherVbs + '"') -WorkingDirectory (Split-Path $launcher)
-} else {
-  # 兼容旧版本目录：直接启动 launcher.cmd。
-  Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
-}
-Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue
-Write-Host "[apply] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') done"
-Stop-Transcript
-exit 0

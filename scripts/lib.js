@@ -15,6 +15,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const IS_WIN = process.platform === 'win32';
 
@@ -68,6 +69,538 @@ function accountsDir(dataDir) {
 }
 function metaFile(dataDir) {
   return path.join(dataDir, 'meta.json');
+}
+
+function workbuddyModelsFile() {
+  return path.join(os.homedir(), '.workbuddy', 'models.json');
+}
+
+function modelBackupsDir(dataDir) {
+  return path.join(dataDir, 'models');
+}
+
+function maskApiKey(apiKey) {
+  const value = String(apiKey || '');
+  if (!value) return '';
+  if (value.length <= 8) return '••••••';
+  const prefix = value.slice(0, Math.min(3, value.length - 4));
+  const suffix = value.slice(-4);
+  const middleLength = Math.max(1, value.length - prefix.length - suffix.length);
+  return `${prefix}${'•'.repeat(middleLength)}${suffix}`;
+}
+
+// 模型列表摘要。默认脱敏 apiKey；UI 需要明文展示（模型页 cell / 编辑弹窗）时传 { revealKey: true }。
+function sanitizeModel(model, opts) {
+  const value = model && typeof model === 'object' && !Array.isArray(model) ? model : {};
+  const revealKey = !!(opts && opts.revealKey);
+  return {
+    id: String(value.id || value.name || ''),
+    name: String(value.name || value.id || ''),
+    vendor: String(value.vendor || ''),
+    url: String(value.url || '').split('?')[0].split('#')[0],
+    apiKey: revealKey ? String(value.apiKey || '') : maskApiKey(value.apiKey),
+    supportsToolCall: !!value.supportsToolCall,
+    supportsImages: !!value.supportsImages,
+    supportsReasoning: !!value.supportsReasoning,
+  };
+}
+
+function readModelsFile(file = workbuddyModelsFile()) {
+  if (!fs.existsSync(file)) throw new Error(`未找到模型配置文件: ${file}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    throw new Error(`模型配置文件不是有效 JSON: ${e.message}`);
+  }
+  if (Array.isArray(parsed)) return { file, format: 'array', models: parsed };
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.models)) {
+    return { file, format: 'object', models: parsed.models, wrapper: parsed };
+  }
+  throw new Error('模型配置文件格式不受支持：应为数组或包含 models 数组的对象');
+}
+
+function writeModelsFile(parsed, models) {
+  const output = parsed.format === 'array' ? models : Object.assign({}, parsed.wrapper, { models });
+  const file = parsed.file;
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  let mode = 0o600;
+  try { mode = fs.statSync(file).mode & 0o777; } catch (_) {}
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(output, null, 2) + '\n', { mode });
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, mode); } catch (_) {}
+}
+
+function modelBackupPath(dataDir, backupId) {
+  const id = String(backupId || '');
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(id)) throw new Error('非法模型备份标识');
+  return path.join(modelBackupsDir(dataDir), `${id}.json`);
+}
+
+function readModelBackup(dataDir, backupId) {
+  const file = modelBackupPath(dataDir, backupId);
+  if (!fs.existsSync(file)) throw new Error('模型备份不存在');
+  let record;
+  try { record = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { throw new Error(`模型备份损坏: ${e.message}`); }
+  if (!record || record.schema !== 1 || !record.model || typeof record.model !== 'object' || Array.isArray(record.model)) {
+    throw new Error('模型备份格式不受支持');
+  }
+  return { file, record };
+}
+
+function listModelBackups(dataDir) {
+  const dir = modelBackupsDir(dataDir);
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((name) => /^[A-Za-z0-9_-]{8,100}\.json$/.test(name)); } catch (_) {}
+  const records = [];
+  for (const name of names) {
+    const backupId = name.slice(0, -5);
+    try {
+      const { record } = readModelBackup(dataDir, backupId);
+      const summary = sanitizeModel(record.model, { revealKey: true });
+      records.push({ backupId, createdAt: record.createdAt || null, ...summary });
+    } catch (_) {
+      // Ignore damaged files in the list; an explicit enable/delete still reports an error.
+    }
+  }
+  records.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  const groups = {};
+  for (const record of records) {
+    const key = record.id || '(未命名模型)';
+    // 组名用模型名（id）：组内每个备份的自定义 name 可能不同，只有模型名一致
+    if (!groups[key]) groups[key] = { id: key, name: key, items: [] };
+    groups[key].items.push(record);
+  }
+  return Object.values(groups);
+}
+
+function listOfficialModels(file = workbuddyModelsFile()) {
+  const parsed = readModelsFile(file);
+  return parsed.models.map((model, index) => Object.assign({ index }, sanitizeModel(model, { revealKey: true })));
+}
+
+function readOfficialModel(file = workbuddyModelsFile(), index) {
+  const parsed = readModelsFile(file);
+  const position = Number(index);
+  if (!Number.isInteger(position) || position < 0 || position >= parsed.models.length) throw new Error('模型索引无效');
+  const model = parsed.models[position];
+  if (!model || typeof model !== 'object' || Array.isArray(model)) throw new Error('模型配置无效');
+  return model;
+}
+
+function deleteOfficialModels(file = workbuddyModelsFile(), indexes) {
+  const parsed = readModelsFile(file);
+  const positions = Array.isArray(indexes)
+    ? Array.from(new Set(indexes.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0 && value < parsed.models.length)))
+    : [];
+  if (!positions.length) throw new Error('未选择当前模型');
+  const selected = new Set(positions);
+  const next = parsed.models.filter((_, index) => !selected.has(index));
+  writeModelsFile(parsed, next);
+  return { deleted: positions.length, official: next.map((model, index) => Object.assign({ index }, sanitizeModel(model))) };
+}
+
+function backupOfficialModel(dataDir, index, modelsFile = workbuddyModelsFile()) {
+  const parsed = readModelsFile(modelsFile);
+  const position = Number(index);
+  if (!Number.isInteger(position) || position < 0 || position >= parsed.models.length) throw new Error('模型索引无效');
+  const model = parsed.models[position];
+  if (!model || typeof model !== 'object' || Array.isArray(model)) throw new Error('模型配置无效');
+  const backupId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  fs.mkdirSync(modelBackupsDir(dataDir), { recursive: true, mode: 0o700 });
+  const file = modelBackupPath(dataDir, backupId);
+  fs.writeFileSync(file, JSON.stringify({ schema: 1, backupId, createdAt, model }, null, 2) + '\n', { mode: 0o600 });
+  return { backupId, createdAt, ...sanitizeModel(model) };
+}
+
+function writeModelBackup(dataDir, record) {
+  fs.mkdirSync(modelBackupsDir(dataDir), { recursive: true, mode: 0o700 });
+  const file = modelBackupPath(dataDir, record.backupId);
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, 0o600); } catch (_) {}
+}
+
+function copyModelBackup(dataDir, backupId) {
+  const { record } = readModelBackup(dataDir, backupId);
+  const copied = Object.assign({}, record, {
+    backupId: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    model: Object.assign({}, record.model),
+  });
+  writeModelBackup(dataDir, copied);
+  return { backupId: copied.backupId, createdAt: copied.createdAt, ...sanitizeModel(copied.model) };
+}
+
+function editModelBackup(dataDir, backupId, patch) {
+  const { record } = readModelBackup(dataDir, backupId);
+  const input = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+  const model = Object.assign({}, record.model);
+  for (const field of ['name', 'url', 'apiKey']) {
+    if (!Object.prototype.hasOwnProperty.call(input, field)) continue;
+    if (typeof input[field] !== 'string' || input[field].length > 20000) throw new Error(`模型${field}格式无效`);
+    model[field] = input[field];
+  }
+  const modelId = String(model.id || model.name || '').trim();
+  if (!modelId) throw new Error('模型备份缺少 id/name，无法保存');
+  if (!String(model.name || '').trim()) model.name = modelId;
+  const updated = Object.assign({}, record, { model });
+  writeModelBackup(dataDir, updated);
+  return { backupId: updated.backupId, createdAt: updated.createdAt || null, ...sanitizeModel(model) };
+}
+
+function deleteModelBackups(dataDir, backupIds) {
+  const ids = Array.isArray(backupIds) ? backupIds : [];
+  let deleted = 0;
+  for (const id of ids) {
+    try {
+      const file = modelBackupPath(dataDir, id);
+      if (fs.existsSync(file)) { fs.unlinkSync(file); deleted++; }
+    } catch (_) {}
+  }
+  return deleted;
+}
+
+function enableModelBackup(dataDir, backupId, file = workbuddyModelsFile()) {
+  const { record } = readModelBackup(dataDir, backupId);
+  const modelId = String(record.model.id || record.model.name || '').trim();
+  if (!modelId) throw new Error('模型备份缺少 id/name，无法启用');
+  const parsed = readModelsFile(file);
+  const models = parsed.models.slice();
+  const first = models.findIndex((model) => String(model && (model.id || model.name) || '') === modelId);
+  const next = [];
+  let inserted = false;
+  for (const model of models) {
+    const id = String(model && (model.id || model.name) || '');
+    if (id === modelId) {
+      if (!inserted) { next.push(record.model); inserted = true; }
+    } else next.push(model);
+  }
+  if (!inserted) next.push(record.model);
+  writeModelsFile(parsed, next);
+  return { backupId, id: modelId, replaced: first >= 0, ...sanitizeModel(record.model) };
+}
+
+function readMeta(dataDir) {
+  let meta = { accounts: {} };
+  try {
+    meta = JSON.parse(fs.readFileSync(metaFile(dataDir), 'utf8'));
+  } catch (_) {
+    /* 首次运行或旧版本没有 meta.json */
+  }
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) meta = {};
+  if (!meta.accounts || typeof meta.accounts !== 'object' || Array.isArray(meta.accounts)) meta.accounts = {};
+  return meta;
+}
+
+function writeMeta(dataDir, meta) {
+  ensureDirs(dataDir);
+  const mf = metaFile(dataDir);
+  const tmp = `${mf}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, mf);
+  try { fs.chmodSync(mf, 0o600); } catch (_) {}
+}
+
+/** 使用稳定路径键，不要求路径当前存在（空间可能已被移动或卸载）。 */
+function canonicalWorkspace(cwd) {
+  let value = String(cwd || '').trim();
+  if (!value) return '';
+  value = value.replace(/\\/g, '/');
+  value = path.posix.normalize(value);
+  if (value === '.') return '';
+  if (value.length > 1) value = value.replace(/\/+$/, '');
+  return IS_WIN ? value.toLowerCase() : value;
+}
+
+function ensureAutoCopyMeta(meta) {
+  const current = meta.autoCopy;
+  if (current && current.version === 2 && current.sessions && current.sessionIndex && current.workspaces && current.copies) {
+    return current;
+  }
+
+  // 1.0.15 stored rules under sourceUid. Convert them once to global session lineages
+  // and global workspace paths so a migration/copy keeps the same shared identity.
+  const legacy = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  const next = { version: 2, sessions: {}, sessionIndex: {}, workspaces: {}, copies: {} };
+  const legacySessions = legacy.sessions && typeof legacy.sessions === 'object' ? legacy.sessions : {};
+  for (const sourceUid of Object.keys(legacySessions)) {
+    const bucket = legacySessions[sourceUid];
+    if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) continue;
+    for (const sessionId of Object.keys(bucket)) {
+      const legacyRule = bucket[sessionId];
+      if (legacyRule === false || (legacyRule && typeof legacyRule === 'object' && legacyRule.enabled === false)) continue;
+      const lineageId = crypto.randomUUID();
+      next.sessions[lineageId] = { enabled: true, members: [{ uid: sourceUid, id: sessionId }], createdAt: Date.now() };
+      if (!next.sessionIndex[sourceUid]) next.sessionIndex[sourceUid] = {};
+      next.sessionIndex[sourceUid][sessionId] = lineageId;
+    }
+  }
+  const legacyWorkspaces = legacy.workspaces && typeof legacy.workspaces === 'object' ? legacy.workspaces : {};
+  for (const sourceUid of Object.keys(legacyWorkspaces)) {
+    const bucket = legacyWorkspaces[sourceUid];
+    if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) continue;
+    for (const cwd of Object.keys(bucket)) {
+      if (bucket[cwd] === false) continue;
+      const canonical = canonicalWorkspace(cwd);
+      if (canonical) next.workspaces[canonical] = String(bucket[cwd] || cwd);
+    }
+  }
+  const legacyCopies = legacy.copies && typeof legacy.copies === 'object' ? legacy.copies : {};
+  for (const oldKey of Object.keys(legacyCopies)) {
+    try {
+      const parts = JSON.parse(oldKey);
+      if (!Array.isArray(parts) || parts.length !== 3) continue;
+      const lineageId = next.sessionIndex[String(parts[0] || '')] && next.sessionIndex[String(parts[0] || '')][String(parts[2] || '')];
+      if (lineageId) next.copies[JSON.stringify([lineageId, String(parts[1] || '')])] = legacyCopies[oldKey];
+    } catch (_) {}
+  }
+  meta.autoCopy = next;
+  return next;
+}
+
+function readAutoCopyConfig(dataDir) {
+  const meta = readMeta(dataDir);
+  const wasCurrent = !!(meta.autoCopy && meta.autoCopy.version === 2);
+  const autoCopy = ensureAutoCopyMeta(meta);
+  if (!wasCurrent) writeMeta(dataDir, meta);
+  return {
+    sessions: autoCopy.sessions,
+    sessionIndex: autoCopy.sessionIndex,
+    workspaces: autoCopy.workspaces,
+    copies: autoCopy.copies,
+  };
+}
+
+function autoCopyRuleKey(lineageId, targetUid) {
+  return JSON.stringify([String(lineageId || ''), String(targetUid || '')]);
+}
+
+function getAutoCopyRules(dataDir, uid) {
+  const config = readAutoCopyConfig(dataDir);
+  const sourceUid = String(uid || '').trim();
+  const index = config.sessionIndex[sourceUid] || {};
+  const sessionIds = [];
+  const lineages = {};
+  for (const sessionId of Object.keys(index)) {
+    const lineageId = index[sessionId];
+    const lineage = config.sessions[lineageId];
+    if (lineage && lineage.enabled !== false) {
+      sessionIds.push(sessionId);
+      lineages[sessionId] = lineageId;
+    }
+  }
+  return {
+    sessionIds,
+    lineages,
+    workspaces: Object.keys(config.workspaces),
+  };
+}
+
+function setAutoCopyRule(dataDir, { uid, kind, key, enabled }) {
+  const sourceUid = String(uid || '').trim();
+  if (kind !== 'session' && kind !== 'workspace') throw new Error('无效的自动复制规则类型');
+  const value = kind === 'workspace' ? canonicalWorkspace(key) : String(key || '').trim();
+  if (!value) throw new Error('缺少自动复制规则标识');
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  if (kind === 'workspace') {
+    if (enabled) config.workspaces[value] = String(key || '').trim();
+    else delete config.workspaces[value];
+    writeMeta(dataDir, meta);
+    return getAutoCopyRules(dataDir, sourceUid);
+  }
+  if (!sourceUid) throw new Error('缺少源账号 uid');
+  if (!config.sessionIndex[sourceUid]) config.sessionIndex[sourceUid] = {};
+  const lineageId = config.sessionIndex[sourceUid][value];
+  if (enabled) {
+    const lineage = lineageId && config.sessions[lineageId]
+      ? config.sessions[lineageId]
+      : { enabled: true, members: [], createdAt: Date.now() };
+    if (!lineageId) {
+      const createdId = crypto.randomUUID();
+      config.sessions[createdId] = lineage;
+      config.sessionIndex[sourceUid][value] = createdId;
+      addLineageMember(lineage, sourceUid, value);
+    } else {
+      lineage.enabled = true;
+      addLineageMember(lineage, sourceUid, value);
+    }
+  } else {
+    if (lineageId && config.sessions[lineageId]) config.sessions[lineageId].enabled = false;
+  }
+  writeMeta(dataDir, meta);
+  return getAutoCopyRules(dataDir, sourceUid);
+}
+
+function addLineageMember(lineage, uid, id) {
+  if (!Array.isArray(lineage.members)) lineage.members = [];
+  if (!lineage.members.some((member) => member && member.uid === uid && member.id === id)) {
+    lineage.members.push({ uid, id });
+  }
+}
+
+function getAutoCopySession(dataDir, uid, sessionId) {
+  const config = readAutoCopyConfig(dataDir);
+  const lineageId = config.sessionIndex[String(uid || '').trim()] && config.sessionIndex[String(uid || '').trim()][String(sessionId || '').trim()];
+  const lineage = lineageId ? config.sessions[lineageId] : null;
+  return { lineageId: lineageId || null, enabled: !!(lineage && lineage.enabled !== false) };
+}
+
+function ensureAutoCopySession(dataDir, uid, sessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const sourceUid = String(uid || '').trim();
+  const id = String(sessionId || '').trim();
+  if (!sourceUid || !id) throw new Error('缺少共享会话标识');
+  if (!config.sessionIndex[sourceUid]) config.sessionIndex[sourceUid] = {};
+  let lineageId = config.sessionIndex[sourceUid][id];
+  if (!lineageId || !config.sessions[lineageId]) {
+    lineageId = crypto.randomUUID();
+    config.sessions[lineageId] = { enabled: true, members: [], createdAt: Date.now() };
+    config.sessionIndex[sourceUid][id] = lineageId;
+  }
+  addLineageMember(config.sessions[lineageId], sourceUid, id);
+  writeMeta(dataDir, meta);
+  return lineageId;
+}
+
+function addAutoCopySessionMember(dataDir, lineageId, uid, sessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const lineage = config.sessions[String(lineageId || '')];
+  if (!lineage) return false;
+  const sourceUid = String(uid || '').trim();
+  const id = String(sessionId || '').trim();
+  if (!sourceUid || !id) return false;
+  if (!config.sessionIndex[sourceUid]) config.sessionIndex[sourceUid] = {};
+  const previousLineageId = config.sessionIndex[sourceUid][id];
+  if (previousLineageId && previousLineageId !== String(lineageId) && config.sessions[previousLineageId]) {
+    config.sessions[previousLineageId].members = (config.sessions[previousLineageId].members || [])
+      .filter((member) => !(member && member.uid === sourceUid && member.id === id));
+  }
+  config.sessionIndex[sourceUid][id] = String(lineageId);
+  addLineageMember(lineage, sourceUid, id);
+  writeMeta(dataDir, meta);
+  return true;
+}
+
+function moveAutoCopySession(dataDir, fromUid, toUid, sessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const from = String(fromUid || '').trim();
+  const to = String(toUid || '').trim();
+  const id = String(sessionId || '').trim();
+  if (!from || !to || !id || from === to) return false;
+  const lineageId = config.sessionIndex[from] && config.sessionIndex[from][id];
+  if (!lineageId || !config.sessions[lineageId]) return false;
+  if (config.sessionIndex[from]) delete config.sessionIndex[from][id];
+  if (!config.sessionIndex[to]) config.sessionIndex[to] = {};
+  config.sessionIndex[to][id] = lineageId;
+  const lineage = config.sessions[lineageId];
+  lineage.members = (lineage.members || []).filter((member) => !(member && member.uid === from && member.id === id));
+  addLineageMember(lineage, to, id);
+  writeMeta(dataDir, meta);
+  return true;
+}
+
+function removeAutoCopySession(dataDir, uid, sessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const sourceUid = String(uid || '').trim();
+  const id = String(sessionId || '').trim();
+  const lineageId = config.sessionIndex[sourceUid] && config.sessionIndex[sourceUid][id];
+  if (!lineageId) return false;
+  delete config.sessionIndex[sourceUid][id];
+  const lineage = config.sessions[lineageId];
+  if (lineage) {
+    lineage.members = (lineage.members || []).filter((member) => !(member && member.uid === sourceUid && member.id === id));
+    if (!lineage.members.length) {
+      delete config.sessions[lineageId];
+      for (const key of Object.keys(config.copies)) {
+        try {
+          const parts = JSON.parse(key);
+          if (Array.isArray(parts) && parts[0] === lineageId) delete config.copies[key];
+        } catch (_) {
+          // Ignore malformed legacy mapping keys; they cannot match a valid lineage.
+        }
+      }
+    }
+  }
+  writeMeta(dataDir, meta);
+  return true;
+}
+
+function removeAutoCopyAccount(dataDir, uid) {
+  const sourceUid = String(uid || '').trim();
+  if (!sourceUid) return 0;
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const index = config.sessionIndex[sourceUid] || {};
+  const entries = Object.keys(index).map((sessionId) => ({ sessionId, lineageId: index[sessionId] }));
+  let removed = 0;
+  for (const entry of entries) {
+    delete index[entry.sessionId];
+    const lineage = config.sessions[entry.lineageId];
+    if (!lineage) continue;
+    lineage.members = (lineage.members || []).filter((member) => !(member && member.uid === sourceUid && member.id === entry.sessionId));
+    if (!lineage.members.length) {
+      delete config.sessions[entry.lineageId];
+      for (const key of Object.keys(config.copies)) {
+        try {
+          const parts = JSON.parse(key);
+          if (Array.isArray(parts) && parts[0] === entry.lineageId) delete config.copies[key];
+        } catch (_) {}
+      }
+    }
+    removed++;
+  }
+  if (entries.length) {
+    delete config.sessionIndex[sourceUid];
+    writeMeta(dataDir, meta);
+  }
+  return removed;
+}
+
+function resolveMappingLineage(config, lineageOrUid, maybeSessionId) {
+  if (maybeSessionId === undefined) return String(lineageOrUid || '');
+  const sourceUid = String(lineageOrUid || '').trim();
+  const sessionId = String(maybeSessionId || '').trim();
+  return config.sessionIndex[sourceUid] && config.sessionIndex[sourceUid][sessionId]
+    ? config.sessionIndex[sourceUid][sessionId]
+    : '';
+}
+
+// The optional legacy sessionId argument keeps 1.0.15 local callers compatible
+// while all persisted keys use lineageId + targetUid.
+function getAutoCopyMapping(dataDir, lineageOrUid, targetUid, maybeSessionId) {
+  const config = readAutoCopyConfig(dataDir);
+  const lineageId = resolveMappingLineage(config, lineageOrUid, maybeSessionId);
+  return config.copies[autoCopyRuleKey(lineageId, targetUid)] || null;
+}
+
+function setAutoCopyMapping(dataDir, lineageOrUid, targetUid, mappingOrSessionId, maybeMapping) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const legacyCall = arguments.length >= 5;
+  const lineageId = resolveMappingLineage(config, lineageOrUid, legacyCall ? mappingOrSessionId : undefined);
+  const mapping = legacyCall ? maybeMapping : mappingOrSessionId;
+  const key = autoCopyRuleKey(lineageId, targetUid);
+  config.copies[key] = Object.assign({}, mapping, { updatedAt: Date.now() });
+  writeMeta(dataDir, meta);
+  return config.copies[key];
+}
+
+function deleteAutoCopyMapping(dataDir, lineageOrUid, targetUid, maybeSessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const lineageId = resolveMappingLineage(config, lineageOrUid, maybeSessionId);
+  delete config.copies[autoCopyRuleKey(lineageId, targetUid)];
+  writeMeta(dataDir, meta);
 }
 function logFile(dataDir) {
   return path.join(dataDir, 'daemon.log');
@@ -192,14 +725,7 @@ function readAuthFile() {
 
 /** 更新 meta.json（uid -> nickname/uin/phone/时间） */
 function updateMeta(dataDir, info) {
-  const mf = metaFile(dataDir);
-  let meta = { accounts: {} };
-  try {
-    meta = JSON.parse(fs.readFileSync(mf, 'utf8'));
-    if (!meta.accounts) meta.accounts = {};
-  } catch (_) {
-    /* 首次运行 */
-  }
+  const meta = readMeta(dataDir);
   const now = Date.now();
   const prev = meta.accounts[info.uid] || {};
   meta.accounts[info.uid] = {
@@ -210,7 +736,7 @@ function updateMeta(dataDir, info) {
     firstSeen: prev.firstSeen || now,
     lastSeen: now,
   };
-  fs.writeFileSync(mf, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  writeMeta(dataDir, meta);
   return meta;
 }
 
@@ -355,12 +881,38 @@ module.exports = {
   migrateLegacyDataDir,
   accountsDir,
   metaFile,
+  workbuddyModelsFile,
+  modelBackupsDir,
+  maskApiKey,
+  sanitizeModel,
+  listOfficialModels,
+  readOfficialModel,
+  readModelBackup,
+  deleteOfficialModels,
+  listModelBackups,
+  backupOfficialModel,
+  copyModelBackup,
+  editModelBackup,
+  deleteModelBackups,
+  enableModelBackup,
   logFile,
   backupPath,
   retireLogoutMarker,
   ensureDirs,
   readAuthFile,
   updateMeta,
+  canonicalWorkspace,
+  getAutoCopyRules,
+  setAutoCopyRule,
+  getAutoCopySession,
+  ensureAutoCopySession,
+  addAutoCopySessionMember,
+  moveAutoCopySession,
+  removeAutoCopySession,
+  removeAutoCopyAccount,
+  getAutoCopyMapping,
+  setAutoCopyMapping,
+  deleteAutoCopyMapping,
   backupCurrent,
   listAccounts,
   switchTo,

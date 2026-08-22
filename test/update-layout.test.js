@@ -7,17 +7,20 @@ const test = require('node:test');
 
 const repoRoot = path.resolve(__dirname, '..');
 const read = (name) => fs.readFileSync(path.join(repoRoot, 'scripts', name), 'utf8');
+const lib = require(path.join(repoRoot, 'scripts', 'lib.js'));
 
 test('Windows updater launches the installed scripts launcher', () => {
   const script = read('apply-update.ps1');
-  assert.match(script, /Join-Path\s+\(Join-Path\s+\$AppDir\s+'scripts'\)\s+'launcher\.cmd'/);
-  assert.match(script, /Join-Path\s+\(Join-Path\s+\$AppDir\s+'scripts'\)\s+'launcher-hidden\.vbs'/);
+  assert.match(script, /Join-Path\s+\$AppDir\s+'scripts\\launcher\.cmd'/);
+  assert.match(script, /Join-Path\s+\$AppDir\s+'scripts\\launcher-hidden\.vbs'/);
+  assert.match(script, /Start-Process[\s\S]*-ErrorAction Stop/);
+  assert.match(script, /Invoke-RestMethod[\s\S]*\/api\/status/);
 });
 
 test('Windows updater stops the watchdog before waiting for the API port', () => {
   const script = read('apply-update.ps1');
-  const stop = script.indexOf('taskkill /F /T /PID $wpid');
-  const wait = script.indexOf('$waitSec = 0');
+  const stop = script.indexOf('function Stop-WatchdogAndPort');
+  const wait = script.indexOf('for ($wait = 0; $wait -lt 15; $wait++)');
   assert.notEqual(stop, -1);
   assert.notEqual(wait, -1);
   assert.ok(stop < wait, 'watchdog shutdown must precede the port wait');
@@ -34,7 +37,7 @@ test('Windows install and update release a locked launcher before replacing it',
   assert.match(update, /FileShare\]\s*::None/);
   assert.match(update, /launcher\.cmd/);
   assert.match(update, /Get-CimInstance\s+Win32_Process/);
-  assert.ok(update.indexOf('Release-LockedLauncher') < update.indexOf('Move-Item -Force $AppDir $oldDir'), 'update must release launcher before moving the old app');
+  assert.ok(update.indexOf('Release-LockedLauncher') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must release launcher before moving the old app');
 });
 
 test('macOS updater stops the daemon before waiting for the API port', () => {
@@ -44,6 +47,21 @@ test('macOS updater stops the daemon before waiting for the API port', () => {
   assert.notEqual(stop, -1);
   assert.notEqual(wait, -1);
   assert.ok(stop < wait, 'daemon shutdown must precede the port wait');
+});
+
+test('updaters fail loudly and leave a durable attempt trail', () => {
+  const daemon = read('daemon.js');
+  const mac = read('apply-update.sh');
+  const win = read('apply-update.ps1');
+  assert.match(daemon, /UPDATE_ATTEMPT_FILE/);
+  assert.match(daemon, /script-started/);
+  assert.match(daemon, /macWorkDaddyAppPath/);
+  assert.match(mac, /set -Eeuo pipefail/);
+  assert.match(mac, /rollback/);
+  assert.match(mac, /等待 daemon 端口恢复/);
+  assert.match(win, /\$ErrorActionPreference = 'Stop'/);
+  assert.match(win, /Rollback-App/);
+  assert.match(win, /新版 daemon 在 60 秒内未就绪/);
 });
 
 test('account switching refreshes WorkBuddy after replacing auth without restarting it', () => {
@@ -190,4 +208,85 @@ test('home composer keeps the robot button at the WorkBuddy bottom-right', () =>
 test('zero credits omit the empty-state label', () => {
   const script = read('inject.js');
   assert.match(script, /if \(!list\.length\) return Number\(credits\) === 0 \? '' : '<div class="wbs-credit-empty">暂无可用积分<\/div>'/);
+});
+
+test('auto-copy rules persist sessions and canonical workspace keys without leaking account metadata', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-auto-copy-'));
+  try {
+    lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'session', key: 'session-1', enabled: true });
+    lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'workspace', key: '/Users/example/project/', enabled: true });
+    let rules = lib.getAutoCopyRules(dir, 'source-a');
+    assert.deepEqual(rules.sessionIds, ['session-1']);
+    assert.deepEqual(rules.workspaces, ['/Users/example/project']);
+    assert.equal(lib.canonicalWorkspace('/Users/example/project/'), '/Users/example/project');
+
+    const lineageId = lib.getAutoCopySession(dir, 'source-a', 'session-1').lineageId;
+    lib.setAutoCopyMapping(dir, lineageId, 'target-b', { targetId: 'copied-1', status: 'copied' });
+    assert.equal(lib.getAutoCopyMapping(dir, lineageId, 'target-b').targetId, 'copied-1');
+    lib.deleteAutoCopyMapping(dir, lineageId, 'target-b');
+    assert.equal(lib.getAutoCopyMapping(dir, lineageId, 'target-b'), null);
+
+    lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'session', key: 'session-1', enabled: false });
+    rules = lib.getAutoCopyRules(dir, 'source-a');
+    assert.deepEqual(rules.sessionIds, []);
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+    assert.ok(meta.autoCopy);
+    assert.equal(meta.accounts && Object.keys(meta.accounts).length, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('automatic session copy has a status endpoint, idempotency mapping, and no task-level marker', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(daemon, /POST' && p === '\/api\/sessions\/auto-copy'/);
+  assert.match(daemon, /GET' && p === '\/api\/sessions\/auto-copy\/status'/);
+  assert.match(daemon, /getAutoCopyMapping\(DATA_DIR, lineageId, targetUid\)/);
+  assert.match(daemon, /startAutoCopyJob\(sourceUid, uid, autoCopyPlan\)/);
+  assert.match(inject, /data-auto-kind="' \+ kind \+ '"/);
+  assert.match(inject, /autoCopyButton\('workspace'/);
+  assert.match(inject, /autoCopyButton\('session'/);
+  assert.match(inject, /任务组本身没有自动复制按钮/);
+});
+
+test('session summary counts effective sessions and models tab only exposes sanitized model APIs', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(inject, /function activeAutoCopyCount\(\)/);
+  assert.match(inject, /wbs-sess-summary-tag/);
+  assert.match(inject, /data-tab="models"/);
+  assert.match(inject, /data-model-tab="official"/);
+  assert.match(inject, /data-model-tab="mine"/);
+  assert.match(daemon, /GET' && p === '\/api\/models'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/backup'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/delete-official'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/test'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/copy'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/edit'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/delete'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/enable'/);
+  // 模型页 UI 明文展示 apiKey：列表走 sanitizeModel(model, { revealKey: true })，默认仍脱敏
+  assert.match(read('lib.js'), /function sanitizeModel\(model, opts\)/);
+  assert.match(read('lib.js'), /revealKey/);
+  assert.match(read('lib.js'), /function maskApiKey\(apiKey\)/);
+  assert.match(read('lib.js'), /function copyModelBackup\(dataDir, backupId\)/);
+  assert.match(read('lib.js'), /function editModelBackup\(dataDir, backupId, patch\)/);
+  assert.match(read('lib.js'), /modelBackupsDir\(dataDir\)/);
+  assert.match(inject, /data-model-copy=/);
+  assert.match(inject, /data-model-edit=/);
+  assert.match(inject, /wbs-model-check-all/);
+  assert.match(inject, /wbs-model-edit-eye/);
+  assert.match(inject, /小贴士.*解决 WorkBuddy 不支持多个同名模型的问题/);
+  assert.match(inject, /data-model-tab="official">当前模型/);
+  assert.match(inject, /data-model-tab="mine">备选模型/);
+  assert.doesNotMatch(inject, /id="wbs-model-refresh"/);
+  assert.match(inject, /wbs-model-group-title/);
+  assert.match(inject, /delete-official/);
+  assert.match(inject, /data-model-test=/);
+  assert.match(inject, /MODEL_BACKUP_SVG/);
+  assert.match(inject, /MODEL_COPY_SVG/);
+  assert.doesNotMatch(inject, /不修改时保持原 API Key/);
+  assert.match(inject, /height:650px/);
+  assert.doesNotMatch(inject, /模型备份保存在 WorkDaddy 本地目录/);
 });
