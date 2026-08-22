@@ -129,7 +129,20 @@ test('CDP startup supports a persisted fallback port instead of hardcoding 9222'
 test('Windows launcher tolerates slow WorkBuddy startup beyond the old 20 second limit', () => {
   const launcher = read('win-launcher.js');
   assert.match(launcher, /CDP_STARTUP_TIMEOUT_MS\s*=\s*60000/);
-  assert.match(launcher, /elapsedMs\s*<\s*CDP_STARTUP_TIMEOUT_MS/);
+  assert.match(launcher, /Date\.now\(\)\s*<\s*deadline/);
+  assert.match(launcher, /await sleep\(1000\)/);
+});
+
+test('Windows launcher verifies the real WorkBuddy process tree and launch arguments', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /Get-CimInstance Win32_Process/);
+  assert.match(launcher, /CommandLine/);
+  assert.match(launcher, /同安装目录进程的精确参数/);
+  assert.match(launcher, /按实际 PID 精确结束安装目录中的进程树/);
+  assert.match(launcher, /waitForWorkBuddyCdp\(wb\)/);
+  assert.match(launcher, /启动后进程未携带 CDP 参数，准备重试/);
+  assert.match(launcher, /CDP 超时最终诊断/);
+  assert.match(launcher, /processes: processDiagnostics\(wb\)/);
 });
 
 test('Windows launcher discovers portable WorkBuddy installations', () => {
@@ -137,6 +150,32 @@ test('Windows launcher discovers portable WorkBuddy installations', () => {
   assert.match(launcher, /App Paths/);
   assert.match(launcher, /Software[\\/].*workbuddy/i);
   assert.match(launcher, /WBSWITCH_WORKBUDDY_BIN/);
+});
+
+test('Windows release package includes the troubleshooting prompt as UTF-8', () => {
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  assert.match(build, /安装失败自主解决提示词\.txt/);
+  assert.match(build, /Python zipfile/);
+  assert.match(build, /ZIP_DEFLATED/);
+});
+
+test('daemon lock falls back when the data-directory lock is not writable on Windows', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /DAEMON_LOCK_FALLBACK_FILE/);
+  assert.match(daemon, /os\.tmpdir\(\)/);
+  assert.match(daemon, /\['EACCES', 'EPERM', 'EROFS'\]/);
+  assert.match(daemon, /daemon-lock-fallback/);
+  assert.match(daemon, /daemonLockPath/);
+  assert.match(daemon, /releaseDaemonLock[\s\S]*daemonLockPath/);
+});
+
+test('session ranges use last-modified time and hide non-copyable task sessions', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(daemon, /COALESCE\(last_activity_at, updated_at, created_at\) >=/);
+  assert.match(daemon, /ORDER BY COALESCE\(last_activity_at, updated_at, created_at\) DESC/);
+  assert.match(inject, /sessionsState\.list = \(\(d && d\.sessions\) \|\| \[\]\)\.filter\(function \(s\) \{ return !isTaskSessionRecordUI\(s\.cwd\); \}\)/);
+  assert.match(inject, /fmtHumanTime\(s\.last_activity_at \|\| s\.updated_at \|\| s\.created_at\)/);
 });
 
 test('Windows relaunch restores the WorkBuddy window after starting it', () => {

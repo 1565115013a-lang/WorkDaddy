@@ -80,7 +80,7 @@ const {
   enableModelBackup,
 } = require('./lib.js');
 const { extractCreditSegments, sortCreditSegments } = require('./credit-segments.js');
-const { captureException } = require('./sentry-report.js');
+const { captureException, captureMessage } = require('./sentry-report.js');
 
 const DATA_DIR = defaultDataDir();
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -110,7 +110,8 @@ const DATA_DIR = defaultDataDir();
 //     另：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照；
 //       修复跨平台自动更新并展示按到期时间拆分的积分明细
 // 1.0.7：兼容无全局 WebSocket 的 Node 18/20，使用内置 ws 建立 CDP
-// 1.0.8：去除 launchd 重定向造成的重复日志，并记录 launcher 选择的 Node 运行时
+// 1.0.8：Windows 数据目录锁文件遇到权限/残留 ACL 时，降级到用户临时目录锁，避免 daemon 未捕获退出
+// 历史：去除 launchd 重定向造成的重复日志，并记录 launcher 选择的 Node 运行时
 // 1.0.9：诊断快照中的常见 token 字段脱敏
 // 1.0.10：daemon.log 按 10 MB 滚动保留最近 3 份，避免长期运行无限增长
 // 1.0.11：「登录新账号」新增「无感登录」（OAuth state 轮询采集，流程同 workbuddy-switch），
@@ -128,8 +129,8 @@ const DATA_DIR = defaultDataDir();
 // 1.0.19：官方模型批量删除、模型卡片稳定布局与固定 650px 面板
 // 1.0.20：模型卡片悬浮操作、官方连通测试、完整长度脱敏 API Key
 // 1.0.21：模型页改为当前/备选模型列表风格，去除刷新入口并优化字段排版
-const DAEMON_VERSION = '1.0.7';
-const DAEMON_BUILD_ID = 'release-1.0.7-20260822';
+const DAEMON_VERSION = '1.0.8';
+const DAEMON_BUILD_ID = 'release-1.0.8-20260822';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -806,30 +807,72 @@ function log(...args) {
   }
 }
 
+function isLockPermissionError(error) {
+  return !!error && ['EACCES', 'EPERM', 'EROFS'].includes(error.code);
+}
+
+function reportDaemonLockFallback(error) {
+  const code = error && error.code ? error.code : 'unknown';
+  log(`[lock] 数据目录锁不可用 (${code})，已使用临时目录锁`);
+  captureMessage('daemon 使用临时目录锁（数据目录锁权限不可用）', {
+    level: 'warning',
+    stage: 'daemon-lock-fallback',
+    extra: { lockErrorCode: code, lockFallback: true },
+  }).catch(() => {});
+}
+
 // launchd 应只启动一个 daemon；启动器的 nohup 兜底和 launchd 异步拉起可能短暂重叠，
 // 用原子创建锁文件把这类竞态变成可观测的单实例退出，而不是两个进程同时清理/注入页面。
+// Windows 数据目录锁不可写时，使用同一台机器用户临时目录中的哈希锁继续保证单实例。
 function acquireDaemonLock() {
   const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      daemonLockFd = fs.openSync(DAEMON_LOCK_FILE, 'wx', 0o600);
-      fs.writeFileSync(daemonLockFd, payload, 'utf8');
-      log(`[lock] daemon 单实例锁已获取 (pid=${process.pid})`);
-      return true;
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let owner = null;
-      try { owner = JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8')); } catch (_) {}
-      const ownerPid = Number(owner && owner.pid);
-      let alive = false;
-      if (ownerPid > 0 && ownerPid !== process.pid) {
-        try { process.kill(ownerPid, 0); alive = true; } catch (_) {}
+  const candidates = [DAEMON_LOCK_FILE];
+  if (IS_WIN && DAEMON_LOCK_FALLBACK_FILE !== DAEMON_LOCK_FILE) candidates.push(DAEMON_LOCK_FALLBACK_FILE);
+  let fallbackReason = null;
+
+  for (const lockPath of candidates) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        daemonLockFd = fs.openSync(lockPath, 'wx', 0o600);
+        fs.writeFileSync(daemonLockFd, payload, 'utf8');
+        daemonLockPath = lockPath;
+        if (lockPath !== DAEMON_LOCK_FILE) reportDaemonLockFallback(fallbackReason || { code: 'EEXIST' });
+        log(`[lock] daemon 单实例锁已获取 (pid=${process.pid})`);
+        return true;
+      } catch (e) {
+        if (daemonLockFd !== null) {
+          try { fs.closeSync(daemonLockFd); } catch (_) {}
+          daemonLockFd = null;
+        }
+        if (e.code === 'EEXIST') {
+          let owner = null;
+          try { owner = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch (_) {}
+          const ownerPid = Number(owner && owner.pid);
+          let alive = false;
+          if (ownerPid > 0 && ownerPid !== process.pid) {
+            try { process.kill(ownerPid, 0); alive = true; } catch (_) {}
+          }
+          if (alive) {
+            process.stdout.write(`[${new Date().toISOString()}] [lock] 已有 daemon 运行 (pid=${ownerPid})，当前进程退出\n`);
+            return false;
+          }
+          try {
+            fs.unlinkSync(lockPath);
+          } catch (unlinkError) {
+            if (IS_WIN && lockPath === DAEMON_LOCK_FILE && isLockPermissionError(unlinkError)) {
+              fallbackReason = unlinkError;
+              break;
+            }
+            return false;
+          }
+          continue;
+        }
+        if (IS_WIN && lockPath === DAEMON_LOCK_FILE && isLockPermissionError(e)) {
+          fallbackReason = e;
+          break;
+        }
+        throw e;
       }
-      if (alive) {
-        process.stdout.write(`[${new Date().toISOString()}] [lock] 已有 daemon 运行 (pid=${ownerPid})，当前进程退出\n`);
-        return false;
-      }
-      try { fs.unlinkSync(DAEMON_LOCK_FILE); } catch (_) { return false; }
     }
   }
   return false;
@@ -840,8 +883,8 @@ function releaseDaemonLock() {
   try { fs.closeSync(daemonLockFd); } catch (_) {}
   daemonLockFd = null;
   try {
-    const owner = JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8'));
-    if (Number(owner.pid) === process.pid) fs.unlinkSync(DAEMON_LOCK_FILE);
+    const owner = JSON.parse(fs.readFileSync(daemonLockPath, 'utf8'));
+    if (Number(owner.pid) === process.pid) fs.unlinkSync(daemonLockPath);
   } catch (_) {}
 }
 
@@ -882,7 +925,13 @@ const cdp = {
 
 const DIAGNOSTICS_FILE = path.join(DATA_DIR, 'diagnostics-latest.json');
 const DAEMON_LOCK_FILE = path.join(DATA_DIR, '.daemon.lock');
+// Windows 上旧版可能以不同权限创建锁文件，导致当前用户无法覆盖；临时锁按数据目录哈希隔离。
+const DAEMON_LOCK_FALLBACK_FILE = path.join(
+  os.tmpdir(),
+  'WorkDaddy-daemon-' + crypto.createHash('sha256').update(path.resolve(DATA_DIR)).digest('hex').slice(0, 16) + '.lock'
+);
 let daemonLockFd = null;
+let daemonLockPath = DAEMON_LOCK_FILE;
 // 注入节流：仅避免 connect 与 loadEventFired 在同一瞬间（<1.5s）重复注入导致闪烁；
 // 但每次页面刷新（含 Command+R）都应重新注入最新代码，因此不用“一次加载只注入一次”的布尔去重，
 // 否则 Electron 重载未触发 loadEventFired 时会遗留旧版本组件。
@@ -3843,8 +3892,9 @@ function handleApi(req, res) {
     const rangeMs = sessionRangeMs(range);
     const clauses = ["deleted_at IS NULL"];
     if (uid) clauses.push("user_id = '" + uid.replace(/'/g, "''") + "'");
-    if (rangeMs) clauses.push('created_at >= ' + rangeMs);
-    return sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, project_id FROM sessions WHERE " + clauses.join(' AND ') + " ORDER BY created_at DESC;")
+    if (rangeMs) clauses.push('COALESCE(last_activity_at, updated_at, created_at) >= ' + rangeMs);
+    // 时间筛选和排序按最近活动/修改时间；旧记录缺字段时回退到创建时间。
+    return sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, project_id FROM sessions WHERE " + clauses.join(' AND ') + " ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, created_at DESC;")
       .then((rows) => {
         const rulesByUid = {};
         rows.forEach((row) => {

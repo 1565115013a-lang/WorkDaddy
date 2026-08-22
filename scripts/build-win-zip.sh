@@ -42,6 +42,10 @@ rm -f "$OUT"
 # 3.1) 顶层入口（zip 根）：Install-WorkDaddy.cmd / Start-WorkDaddy.cmd
 cp scripts/Install-WorkDaddy.cmd "$STAGE/Install-WorkDaddy.cmd"
 cp scripts/Start-WorkDaddy.cmd "$STAGE/Start-WorkDaddy.cmd"
+# 3.1a) Windows 故障排查提示词（供用户在安装失败时交给修复 agent）
+if [ -f "$DIR/安装失败自主解决提示词.txt" ]; then
+  cp "$DIR/安装失败自主解决提示词.txt" "$STAGE/安装失败自主解决提示词.txt"
+fi
 # 3.2) scripts\ 本体（含 node_modules/ws、builtin）
 cp -R scripts "$STAGE/scripts"
 # 3.2a) Logo 图标：放入 scripts\（install-win.ps1 从 SrcDir 同名找并复制到安装目录根）
@@ -58,21 +62,45 @@ rm -rf "$STAGE/scripts/win/probe" "$STAGE/scripts/win/probe/"* 2>/dev/null || tr
 rm -f "$STAGE/scripts/Install-WorkDaddy.cmd" "$STAGE/scripts/Start-WorkDaddy.cmd" 2>/dev/null || true
 find "$STAGE" -name '*.log' -delete 2>/dev/null || true
 find "$STAGE" -name '.DS_Store' -delete 2>/dev/null || true
-# 3.3.5) 非 ASCII 文件名守护（必杀项）
-#        Windows 的 .NET Expand-Archive 解压含非 ASCII 条目名的 zip 时，文件名按 OEM 代码页解码成
-#        非法字符，直接抛「路径中具有非法字符」→ Windows 自动更新在解压阶段崩溃，备份/替换/回滚全失效。
-#        发布包严禁混入中文/特殊字符文件名（曾出现过「安装失败自主解决提示词.txt」导致 1.0.6 更新必炸）。
-if find "$STAGE" -not -path '*/node_modules/*' 2>/dev/null | LC_ALL=C grep -q '[^ -~]'; then
-  echo "==> ERROR: 发布包包含非 ASCII 文件路径（.NET Expand-Archive 解压必失败），已终止打包！"
-  find "$STAGE" -not -path '*/node_modules/*' 2>/dev/null | LC_ALL=C grep '[^ -~]' | head -20
+# 3.3.5) 非 ASCII 文件名守护：仅允许根目录的故障排查提示词，其余路径必须保持 ASCII。
+#        macOS 自带 Info-ZIP 会使用 UTF-8 条目写入；安装/更新脚本本身仍全部使用 ASCII 路径。
+NON_ASCII_PATHS="$(find "$STAGE" -not -path '*/node_modules/*' 2>/dev/null | LC_ALL=C grep '[^ -~]' || true)"
+UNEXPECTED_NON_ASCII="$(printf '%s\n' "$NON_ASCII_PATHS" | LC_ALL=C grep -v '安装失败自主解决提示词\.txt$' || true)"
+if [ -n "$UNEXPECTED_NON_ASCII" ]; then
+  echo "==> ERROR: 发布包包含未批准的非 ASCII 文件路径，已终止打包！"
+  printf '%s\n' "$UNEXPECTED_NON_ASCII" | head -20
   rm -rf "$STAGE"
   exit 3
 fi
-echo "==> 非 ASCII 文件名守护通过（全 ASCII 路径）"
-# 3.4) 打包：zip 优先；无 zip 的环境用 Windows 系统自带 bsdtar（生成标准 / 分隔符 zip）。
-#      绝不用 PowerShell Compress-Archive —— 它产出反斜杠分隔符，非标准 zip 会被解压工具把
-#      scripts\daemon.js 当单个文件名，导致解压结构错乱、入口秒退。
-if command -v zip >/dev/null 2>&1; then
+echo "==> 非 ASCII 文件名守护通过（仅包含批准的故障排查提示词）"
+# 3.4) 打包：优先使用 Python zipfile，确保中文提示词写入 UTF-8 文件名标记。
+#      macOS 自带 zip 会把中文文件名按本地代码页写入，Windows/Python 解压后会出现乱码。
+#      没有 Python 且需要中文提示词时直接失败，避免生成名字损坏的发布包。
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$STAGE" "$DIR/$OUT" <<'PY'
+import os
+import sys
+import zipfile
+
+stage, output = sys.argv[1:]
+with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    for root, dirs, files in os.walk(stage):
+        dirs.sort()
+        files.sort()
+        for name in dirs:
+            source = os.path.join(root, name)
+            arcname = os.path.relpath(source, stage).replace(os.sep, '/') + '/'
+            archive.write(source, arcname)
+        for name in files:
+            source = os.path.join(root, name)
+            arcname = os.path.relpath(source, stage).replace(os.sep, '/')
+            archive.write(source, arcname)
+PY
+elif [ -f "$STAGE/安装失败自主解决提示词.txt" ]; then
+  echo "==> ERROR: 包含中文故障排查提示词，但当前环境没有 python3，无法生成 UTF-8 ZIP。"
+  rm -rf "$STAGE"
+  exit 4
+elif command -v zip >/dev/null 2>&1; then
   (cd "$STAGE" && zip -r -q "$DIR/$OUT" .)
 else
   tar -a -cf "$DIR/$OUT" -C "$STAGE" .

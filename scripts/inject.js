@@ -1591,7 +1591,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var url = '/api/sessions?range=' + (sessionsState.range || '7d');
       if (sessionsState.uid !== undefined) url += '&uid=' + encodeURIComponent(sessionsState.uid);
       api(url).then(function (d) {
-        sessionsState.list = (d && d.sessions) || [];
+        // 任务会话不支持复制，也不参与批量操作；从会话页数据源直接隐藏，避免出现不可操作的只读分组。
+        sessionsState.list = ((d && d.sessions) || []).filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
         sessionsState.autoCopy = (d && d.autoCopy) || null;
         sessionsState.selected = {};
         sessionsState.wsExpanded = {};
@@ -1656,7 +1657,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           var title = s.custom_title || s.title || '(无标题)';
           html += '<div class="wbs-sess-row">' +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
-            '<span class="wbs-sess-meta">' + fmtHumanTime(s.created_at) + '</span></span>' +
+            '<span class="wbs-sess-meta">' + fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at) + '</span></span>' +
             '</div>';
         });
         if (taskMore > 0) html += '<button class="wbs-sess-more" type="button" data-ws="__TASKS__">展开 ' + Math.min(taskMore, SESS_WS_STEP) + ' 条（剩余 ' + taskMore + '）</button>';
@@ -1686,7 +1687,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           html += '<div class="wbs-sess-row">' +
             (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
-            '<span class="wbs-sess-meta">' + fmtHumanTime(s.created_at) + '</span></span>' +
+            '<span class="wbs-sess-meta">' + fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at) + '</span></span>' +
             (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
             '</div>';
         });

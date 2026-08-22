@@ -31,6 +31,7 @@ const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const ELEVATED_HELPER_MODE = process.argv.includes('--inject-helper');
 // 便携版/低速磁盘上的 WorkBuddy 首次启动可能超过 20 秒；超时只应在足够长的窗口后报告。
 const CDP_STARTUP_TIMEOUT_MS = 60000;
+const WORKBUDDY_PROCESS_NAMES = new Set(['workbuddy.exe', 'codebuddy.exe', 'workbuddyai.exe']);
 
 function log(...args) {
   const line = `[launcher] ${new Date().toISOString()} ${args.join(' ')}\n`;
@@ -156,12 +157,14 @@ async function isWorkBuddyCdp() {
   return isWorkBuddyCdpAt(CDP_PORT);
 }
 
-async function isWorkBuddyCdpAt(port) {
+async function isWorkBuddyCdpAt(port, binary = null) {
   const version = await httpGet(port, '/json/version');
   if (!version || version.status !== 200) return false;
   try {
     const info = JSON.parse(version.body || '{}');
-    return /workbuddy|codebuddy/i.test([info.Browser, info['User-Agent']].filter(Boolean).join(' '));
+    if (/workbuddy|codebuddy/i.test([info.Browser, info['User-Agent']].filter(Boolean).join(' '))) return true;
+    // 某些 WorkBuddy 版本隐藏 Electron 品牌；端口响应 + 同安装目录进程的精确参数仍可确认归属。
+    return Boolean(binary && workBuddyProcesses(binary).some((p) => processCdpPort(p) === Number(port)));
   } catch (_) { return false; }
 }
 
@@ -191,6 +194,70 @@ function psOut(cmd) {
       encoding: 'utf8', timeout: 10000, windowsHide: true,
     }).stdout || '';
   } catch (_) { return ''; }
+}
+
+// 进程名并不总是可靠：Electron 的单实例宿主可能以 CodeBuddy.exe 或辅助进程名存在。
+// 通过 CIM 同时拿到路径、父 PID 和命令行，只在本地诊断使用；命令行正文绝不写入日志/Sentry。
+function getWorkBuddyProcesses() {
+  const command = [
+    '$names=@("WorkBuddy.exe","CodeBuddy.exe","WorkBuddyAI.exe")',
+    'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue',
+    '| Where-Object { $names -contains $_.Name }',
+    '| Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine',
+    '| ConvertTo-Json -Compress',
+  ].join(' ');
+  const raw = psOut(command).trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((p) => p && Number(p.ProcessId) > 0);
+  } catch (_) {
+    return [];
+  }
+}
+
+function sameWindowsPath(a, b) {
+  if (!a || !b) return false;
+  return String(a).replace(/[\\/]+$/, '').toLowerCase() === String(b).replace(/[\\/]+$/, '').toLowerCase();
+}
+
+function workBuddyProcesses(binary = null) {
+  return getWorkBuddyProcesses().filter((p) => {
+    if (!WORKBUDDY_PROCESS_NAMES.has(String(p.Name || '').toLowerCase())) return false;
+    if (!binary || !p.ExecutablePath) return true;
+    // WorkBuddy 可能把 Electron 主进程拆成同目录下的 CodeBuddy.exe/辅助宿主；按安装目录归组。
+    return sameWindowsPath(p.ExecutablePath, binary) ||
+      sameWindowsPath(path.dirname(p.ExecutablePath), path.dirname(binary));
+  });
+}
+
+function processCdpPort(process) {
+  const commandLine = String(process && process.CommandLine || '');
+  const match = commandLine.match(/(?:^|\s)--remote-debugging-port(?:=|\s+)(\d+)(?:\s|$)/i);
+  return match ? Number(match[1]) : 0;
+}
+
+function processHasCdpArg(process, port = CDP_PORT) {
+  return processCdpPort(process) === Number(port);
+}
+
+function processDiagnostics(binary = null) {
+  return workBuddyProcesses(binary).map((p) => ({
+    pid: Number(p.ProcessId),
+    parentPid: Number(p.ParentProcessId) || null,
+    name: String(p.Name || ''),
+    executable: path.basename(String(p.ExecutablePath || '')),
+    hasCommandLine: Boolean(String(p.CommandLine || '').trim()),
+    hasCdpArg: processCdpPort(p) > 0,
+    cdpPort: processCdpPort(p) || null,
+    hasExpectedCdpArg: processHasCdpArg(p),
+  }));
+}
+
+function logProcessDiagnostics(binary, prefix = 'WorkBuddy 进程诊断') {
+  const rows = processDiagnostics(binary);
+  log(prefix + ': ' + (rows.length ? JSON.stringify(rows) : '无匹配进程'));
+  return rows;
 }
 
 function readDaemonVersion() {
@@ -350,14 +417,19 @@ function stopDaemonByPort() {
 }
 
 // ---------- 2/3. WorkBuddy CDP 处理 ----------
-function workBuddyRunning() {
+function workBuddyRunning(binary = null) {
+  const processes = workBuddyProcesses(binary);
+  if (processes.length) return true;
+  // CIM 失败时保守回退到 tasklist，避免误判为已退出后把启动参数交给旧实例。
   try {
-    const r = spawnSync(
-      'tasklist',
-      ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
-      { encoding: 'utf8', timeout: 5000, windowsHide: true }
+    const filters = Array.from(WORKBUDDY_PROCESS_NAMES).map((name) =>
+      spawnSync('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], {
+        encoding: 'utf8', timeout: 5000, windowsHide: true,
+      })
     );
-    return r.status === 0 && /"WorkBuddy\.exe"/i.test(r.stdout || '');
+    return filters.some((r) => r.status === 0 && WORKBUDDY_PROCESS_NAMES.has(
+      String(r.stdout || '').match(/"([^"]+\.exe)"/i)?.[1]?.toLowerCase() || ''
+    ));
   } catch (_) {
     return true;
   }
@@ -380,21 +452,31 @@ function runTaskkill(args) {
   });
 }
 
-async function waitForWorkBuddyExit(timeoutMs) {
+async function waitForWorkBuddyExit(timeoutMs, binary = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!workBuddyRunning()) return true;
+    if (!workBuddyRunning(binary)) return true;
     await sleep(200);
   }
-  return !workBuddyRunning();
+  return !workBuddyRunning(binary);
 }
 
-async function quitWorkBuddy() {
-  if (!workBuddyRunning()) return true;
-  await runTaskkill(['/IM', 'WorkBuddy.exe']);
-  if (await waitForWorkBuddyExit(1800)) return true;
-  await runTaskkill(['/F', '/T', '/IM', 'WorkBuddy.exe']);
-  if (await waitForWorkBuddyExit(4000)) return true;
+async function quitWorkBuddy(binary) {
+  const initial = workBuddyProcesses(binary);
+  if (!initial.length && !workBuddyRunning(binary)) return true;
+
+  // 按实际 PID 精确结束安装目录中的进程树，避免 /IM 只结束主进程而留下单实例宿主。
+  const pids = new Set(initial.map((p) => String(Number(p.ProcessId))).filter((pid) => pid !== '0'));
+  if (!pids.size) pids.add('0');
+  for (const pid of pids) {
+    if (pid !== '0') await runTaskkill(['/T', '/PID', pid]);
+  }
+  if (await waitForWorkBuddyExit(2500, binary)) return true;
+  for (const pid of pids) {
+    if (pid !== '0') await runTaskkill(['/F', '/T', '/PID', pid]);
+  }
+  if (await waitForWorkBuddyExit(5500, binary)) return true;
+  logProcessDiagnostics(binary, '结束 WorkBuddy 后仍有进程');
   throw new Error('无法确认 WorkBuddy 已退出');
 }
 
@@ -427,22 +509,77 @@ function launchWorkBuddy(wb) {
     );
     if (result.status === 0) {
       log('WorkBuddy 已通过 Explorer ShellExecute 以当前用户权限启动');
-      return true;
+      return { method: 'shell-execute' };
     }
     log('ShellExecute 启动 WorkBuddy 失败，改用 explorer.exe 兜底 (code=' + result.status + ')');
     try {
       const shell = spawn('explorer.exe', [wb, args], { detached: true, stdio: 'ignore', windowsHide: true });
       shell.unref();
-      return true;
+      return { method: 'explorer-fallback' };
     } catch (e) {
       log('explorer.exe 启动 WorkBuddy 失败: ' + e.message);
     }
   }
 
-  const child = spawn(wb, [args], { detached: true, stdio: 'ignore', windowsHide: true });
+  const child = spawn(wb, [args], {
+    cwd: path.dirname(wb), detached: true, stdio: 'ignore', windowsHide: true,
+  });
   child.on('error', (e) => { log('启动 WorkBuddy 失败: ' + e.message); });
   child.unref();
-  return true;
+  return { method: 'node-spawn', pid: child.pid };
+}
+
+async function waitForWorkBuddyCdp(binary) {
+  const deadline = Date.now() + CDP_STARTUP_TIMEOUT_MS;
+  let retryWithoutCdpArg = false;
+  let lastDiagnosticAt = 0;
+  let launchStartedAt = Date.now();
+
+  const start = () => {
+    const launched = launchWorkBuddy(binary);
+    launchStartedAt = Date.now();
+    log('WorkBuddy 启动请求已派发 method=' + launched.method + ' expectedPort=' + CDP_PORT +
+      (launched.pid ? ' pid=' + launched.pid : ''));
+  };
+  start();
+
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    if (await isWorkBuddyCdpAt(CDP_PORT, binary)) return true;
+
+    const elapsed = Date.now() - launchStartedAt;
+    const diagnostics = processDiagnostics(binary);
+    const hasProcessWithoutArg = diagnostics.length > 0 && diagnostics.every((p) => p.hasCommandLine) &&
+      !diagnostics.some((p) => p.hasCdpArg);
+    if (hasProcessWithoutArg && elapsed >= 5000 && !retryWithoutCdpArg) {
+      // 单实例宿主可能接管了第一次启动请求；精确结束该安装目录的进程树后只重试一次。
+      logProcessDiagnostics(binary, '启动后进程未携带 CDP 参数，准备重试');
+      retryWithoutCdpArg = true;
+      await quitWorkBuddy(binary);
+      await sleep(1000);
+      start();
+      continue;
+    }
+    if (Date.now() - lastDiagnosticAt >= 5000) {
+      lastDiagnosticAt = Date.now();
+      log('等待 WorkBuddy CDP: ' + Math.min(Date.now() - (deadline - CDP_STARTUP_TIMEOUT_MS), CDP_STARTUP_TIMEOUT_MS) +
+        'ms/' + CDP_STARTUP_TIMEOUT_MS + 'ms');
+      if (diagnostics.length) logProcessDiagnostics(binary, '等待期间');
+    }
+  }
+
+  // 端口可能在启动后被系统/其他进程抢占；超时前再扫描候选端口一次，避免只盯着旧的 9222。
+  for (const port of cdpPortCandidates()) {
+    if (port === CDP_PORT) continue;
+    if (await isWorkBuddyCdpAt(port, binary)) {
+      CDP_PORT = port;
+      writeCdpPortFile(port);
+      log('超时前发现 WorkBuddy 使用备用 CDP 端口: ' + port);
+      return true;
+    }
+  }
+  logProcessDiagnostics(binary, 'CDP 超时最终诊断');
+  return false;
 }
 
 async function injectNow() {
@@ -508,16 +645,9 @@ async function injectNow() {
   log('重启 WorkBuddy（带 --remote-debugging-port=' + CDP_PORT + '，GUI 使用当前用户权限）: ' + wb);
   console.log('正在以调试模式重启 WorkBuddy（约几秒）...');
 
-  await quitWorkBuddy();
-  await sleep(500);
-  launchWorkBuddy(wb);
-
-  let ok = false;
-  for (let elapsedMs = 0; elapsedMs < CDP_STARTUP_TIMEOUT_MS; elapsedMs += 1000) {
-    await sleep(1000);
-    if (await isWorkBuddyCdp()) { ok = true; break; }
-    if ((elapsedMs + 1000) % 5000 === 0) log('等待 WorkBuddy CDP: ' + (elapsedMs + 1000) + 'ms/' + CDP_STARTUP_TIMEOUT_MS + 'ms');
-  }
+  await quitWorkBuddy(wb);
+  await sleep(1000);
+  const ok = await waitForWorkBuddyCdp(wb);
   if (ok) {
     await sleep(1500);
     await injectNow();
@@ -526,7 +656,10 @@ async function injectNow() {
   } else {
     log('等待 ' + (CDP_STARTUP_TIMEOUT_MS / 1000) + ' 秒未检测到调试端口 ' + CDP_PORT);
     console.log('等待超时：未检测到调试端口 ' + CDP_PORT + '。可手动执行：cd /d ' + path.dirname(wb) + ' && "' + wb + '" --remote-debugging-port=' + CDP_PORT);
-    await captureMessage('等待 ' + (CDP_STARTUP_TIMEOUT_MS / 1000) + ' 秒未检测到 WorkBuddy CDP 端口', { stage: 'windows-launcher-cdp-timeout', extra: { cdpPort: CDP_PORT, workBuddy: wb, timeoutMs: CDP_STARTUP_TIMEOUT_MS } }).catch(() => {});
+    await captureMessage('等待 ' + (CDP_STARTUP_TIMEOUT_MS / 1000) + ' 秒未检测到 WorkBuddy CDP 端口', {
+      stage: 'windows-launcher-cdp-timeout',
+      extra: { cdpPort: CDP_PORT, workBuddy: wb, timeoutMs: CDP_STARTUP_TIMEOUT_MS, processes: processDiagnostics(wb) },
+    }).catch(() => {});
   }
   process.exit(ok ? 0 : 3);
 })().catch((e) => {
