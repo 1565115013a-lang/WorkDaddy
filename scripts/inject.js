@@ -78,6 +78,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var API = '__WBS_API__';
   var PROFILE_ID = '__WBS_PROFILE__';
   var CAPS = __WBS_CAPS__;
+  var WBS_API_TOKEN = '__WBS_API_TOKEN__';
   // 面板品牌名跟随 profile：workbuddy-ai 显示 WorkDaddy AI，其余显示 WorkDaddy
   var WBS_BRAND = PROFILE_ID === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy';
 
@@ -97,7 +98,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var line = '[wbscrash] ' + kind + ': ' + msg + (stack ? '\n' + stack : '');
       try { console.error(line); } catch (_) {}
       try {
-        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
+        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
       } catch (_) {}
     }
     window.addEventListener('error', function (ev) { wbsReportErr('error', ev); });
@@ -233,9 +234,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   }
 
   function api(path, opts) {
-    return fetch(API + path, opts).then(function (r) {
+    opts = opts || {};
+    var request = {};
+    Object.keys(opts).forEach(function (key) { request[key] = opts[key]; });
+    var headers = {};
+    if (opts.headers) {
+      Object.keys(opts.headers).forEach(function (key) { headers[key] = opts.headers[key]; });
+    }
+    headers['X-WorkDaddy-Token'] = WBS_API_TOKEN;
+    request.headers = headers;
+    return fetch(API + path, request).then(function (r) {
       return r.json().then(function (j) {
-        if (!r.ok || j.ok === false) throw new Error(j.error || '请求失败');
+        if (!r.ok || j.ok === false) {
+          var error = new Error(j.error || '请求失败');
+          error.payload = j;
+          throw error;
+        }
         return j;
       });
     });
@@ -1449,7 +1463,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function crumb(msg) {
       try { console.log('[wbscrum]', msg); } catch (e) {}
       try {
-        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg: msg }) }).catch(function () {});
+        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN }, body: JSON.stringify({ msg: msg }) }).catch(function () {});
       } catch (e) {}
     }
     listen(stashBtn, 'click', function () {
@@ -1573,8 +1587,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div class="wbs-acct-stat"><span>总积分</span><strong id="wbs-acct-total">-</strong></div>' +
         '</div>' +
         '<div class="wbs-acct-actions">' +
-        '<button class="wbs-acct-io" type="button" data-act="export" title="把全部账号备份加密导出为文件（密钥 workdaddy），可拷贝到其他电脑导入">' + EXPORT_ICON + '<span>导出</span></button>' +
-        '<button class="wbs-acct-io" type="button" data-act="import" title="从加密导出文件导入账号备份（密钥 workdaddy）">' + IMPORT_ICON + '<span>导入</span></button>' +
+        '<button class="wbs-acct-io" type="button" data-act="export" title="输入密码后导出全部账号备份">' + EXPORT_ICON + '<span>导出</span></button>' +
+        '<button class="wbs-acct-io" type="button" data-act="import" title="从加密导出文件导入账号备份">' + IMPORT_ICON + '<span>导入</span></button>' +
         '</div>' +
         '</div>' +
         '<div class="wbs-acct-list"></div>' +
@@ -1588,40 +1602,95 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       root.querySelector('#wbs-import-file').addEventListener('change', onImportFile);
     }
 
-    // 导出账号：请求 daemon 加密打包，触发浏览器下载
-    function onExportAccounts() {
-      api('/api/accounts/export', { method: 'POST' })
-        .then(function (r) {
-          var blob = new Blob([r.content], { type: 'application/json' });
-          var url = URL.createObjectURL(blob);
-          var a = document.createElement('a');
-          a.href = url;
-          a.download = r.filename || 'WorkDaddy-accounts.json';
-          document.body.appendChild(a);
-          a.click();
-          setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 300);
-          toast('已导出 ' + r.count + ' 个账号（已加密，需用密钥 workdaddy 在其他电脑导入）', false, root);
-        })
-        .catch(function (e) { toast('导出失败: ' + e.message, true, root); });
+    function closeAccountPasswordModal(mask) {
+      if (mask && mask.parentNode) mask.parentNode.removeChild(mask);
     }
 
-    // 导入账号：读所选文件内容 → daemon 解密 → 恢复备份 → 刷新列表
+    function openAccountPasswordModal(mode, onConfirm) {
+      closeAccountPasswordModal(panel && panel.querySelector('#wbs-account-password-modal'));
+      var isExport = mode === 'export';
+      var mask = document.createElement('div');
+      mask.className = 'wbs-panel-modal-mask';
+      mask.id = 'wbs-account-password-modal';
+      mask.innerHTML =
+        '<div class="wbs-password-modal" role="dialog" aria-modal="true" aria-labelledby="wbs-password-title">' +
+        '<div class="wbs-login-modal-title" id="wbs-password-title">' + (isExport ? '导出账号' : '导入账号') + '</div>' +
+        '<label class="wbs-password-field"><span>密码' + (isExport ? '' : '（可留空）') + '</span>' +
+        '<input id="wbs-account-password" type="password" autocomplete="new-password" placeholder="' + (isExport ? '请输入密码' : '新版文件请输入密码') + '"></label>' +
+        '<div class="wbs-password-hint">' + (isExport ? '密码不能为空，请妥善保管。' : '导入密码可留空；旧版导出文件默认使用 workdaddy。') + '</div>' +
+        '<div class="wbs-password-error" id="wbs-password-error" role="alert"></div>' +
+        '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-password-cancel">取消</button>' +
+        '<button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-password-confirm">确定</button></div>' +
+        '</div>';
+      (panel || root).appendChild(mask);
+      var input = mask.querySelector('#wbs-account-password');
+      var error = mask.querySelector('#wbs-password-error');
+      var confirm = mask.querySelector('#wbs-password-confirm');
+      var close = function () { closeAccountPasswordModal(mask); };
+      mask.querySelector('#wbs-password-cancel').addEventListener('click', close);
+      mask.addEventListener('click', function (ev) { if (ev.target === mask) close(); });
+      confirm.addEventListener('click', function () {
+        var value = input.value;
+        if (isExport && !value.trim()) {
+          error.textContent = '密码不能为空';
+          input.focus();
+          return;
+        }
+        confirm.disabled = true;
+        confirm.textContent = '处理中…';
+        close();
+        onConfirm(value);
+      });
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') confirm.click();
+        if (ev.key === 'Escape') close();
+      });
+      setBuildTimeout(function () { input.focus(); }, 0);
+    }
+
+    // 导出账号：密码必填，daemon 使用随机 salt 加密后触发浏览器下载。
+    function onExportAccounts() {
+      openAccountPasswordModal('export', function (password) {
+        api('/api/accounts/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: password }),
+        })
+          .then(function (r) {
+            var blob = new Blob([r.content], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = r.filename || 'WorkDaddy-accounts.json';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 300);
+            toast('已导出 ' + r.count + ' 个账号（已加密）', false, root);
+          })
+          .catch(function (e) { toast('导出失败: ' + e.message, true, root); });
+      });
+    }
+
+    // 导入账号：读文件后输入密码；空密码仅对历史 workdaddy 格式有效。
     function onImportFile(ev) {
       var file = ev.target && ev.target.files && ev.target.files[0];
       ev.target.value = '';
       if (!file) return;
       var reader = new FileReader();
       reader.onload = function () {
-        api('/api/accounts/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: String(reader.result) }),
-        })
-          .then(function (r) {
-            toast('成功导入 ' + r.count + ' 个账号', false, root);
-            refresh();
+        var content = String(reader.result);
+        openAccountPasswordModal('import', function (password) {
+          api('/api/accounts/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: content, password: password }),
           })
-          .catch(function (e) { toast('导入失败: ' + e.message, true, root); });
+            .then(function (r) {
+              toast('成功导入 ' + r.count + ' 个账号', false, root);
+              refresh();
+            })
+            .catch(function (e) { toast('导入失败: ' + e.message, true, root); });
+        });
       };
       reader.onerror = function () { toast('读取文件失败', true, root); };
       reader.readAsText(file);
@@ -2627,8 +2696,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<div class="wbs-update-notes" id="wbs-update-notes"></div>' +
           '<div class="wbs-update-actions">' +
             '<button class="wbs-update-btn" id="wbs-update-btn" type="button">立即更新</button>' +
-            '<span class="wbs-update-progress" id="wbs-update-progress" style="display:none"></span>' +
           '</div>' +
+          '<div class="wbs-update-progress" id="wbs-update-progress" style="display:none" role="status" aria-live="polite"></div>' +
           '<div class="wbs-update-bar" id="wbs-update-bar" style="display:none;height:6px;border-radius:3px;background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 22%,transparent);overflow:hidden;margin-top:8px"><i id="wbs-update-bar-fill" style="display:block;height:100%;width:0;border-radius:3px;background:var(--wb-button-primary-bg,#1f1f1f);transition:width .6s ease"></i></div>' +
         '</div>' +
         '<div class="wbs-pcard wbs-about-hero">' +
@@ -2664,7 +2733,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         el = aboutPane.querySelector('#wbs-about-badge');
         if (el && d.principle) el.textContent = d.principle;
         el = aboutPane.querySelector('#wbs-about-ver');
-        if (el && d.version) el.textContent = 'v' + d.version;
+        // 运行中的 daemon 注入版本是第一事实来源；旧 app 壳里的 package.json 可能滞后。
+        var runtimeVersion = WBS_VERSION && WBS_VERSION.indexOf('__WBS_') !== 0 ? WBS_VERSION : d.version;
+        if (el && runtimeVersion) el.textContent = 'v' + runtimeVersion;
         var repo = aboutPane.querySelector('#wbs-about-repo');
         if (repo && d.repository) repo.href = d.repository;
         var issues = aboutPane.querySelector('#wbs-about-issues');
@@ -2688,7 +2759,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (title) title.textContent = '发现新版本 v' + d.latest;
         var notes = aboutPane.querySelector('#wbs-update-notes');
         if (notes) {
-          notes.textContent = (d.notes || '').split('\n').filter(function (l) { return l.trim() && !/^SHA-?256[:：]/i.test(l); }).slice(0, 6).join('\n') || '有新版本可用，点击立即更新。';
+          var noteLines = (d.notes || '').split('\n').map(function (l) {
+            return l.trim().replace(/^[-*+]\s*/, '').replace(/^#+\s*/, '');
+          }).filter(function (l) {
+            return l && !/^SHA-?256[:：]/i.test(l) && !/^https?:\/\//i.test(l) && !/full changelog/i.test(l);
+          }).slice(0, 3).map(function (l) {
+            return l.length > 48 ? l.slice(0, 47) + '…' : l;
+          });
+          notes.textContent = noteLines.join('\n') || '有新版本可用，点击更新。';
         }
         var btn = aboutPane.querySelector('#wbs-update-btn');
         if (btn) {
@@ -2697,7 +2775,51 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }).catch(function () {});
     }
 
-    // 点击「立即更新」：下载 → 轮询状态 → 安装（daemon 写脚本替换 + 自动重启）
+    function updateLogTimestamp() {
+      var d = new Date();
+      var pad = function (n) { return String(n).padStart(2, '0'); };
+      return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+    }
+    function appendUpdateLog(prog, message) {
+      if (!prog || !message) return;
+      var text = String(message);
+      if (prog._wbsLastLog === text) return;
+      prog._wbsLastLog = text;
+      prog.style.display = '';
+      var line = document.createElement('div');
+      line.className = 'wbs-update-log-line';
+      line.textContent = updateLogTimestamp() + ' ' + text;
+      prog.appendChild(line);
+      while (prog.childNodes.length > 80) prog.removeChild(prog.firstChild);
+      prog.scrollTop = prog.scrollHeight;
+    }
+    function formatDownloadRate(rate) {
+      var n = Number(rate) || 0;
+      if (n < 1024) return Math.round(n) + ' B/s';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB/s';
+      return (n / (1024 * 1024)).toFixed(1) + ' MB/s';
+    }
+    function formatDownloadEta(seconds) {
+      if (seconds === null || typeof seconds === 'undefined' || !isFinite(Number(seconds))) return '剩余时间计算中';
+      var s = Math.max(0, Math.round(Number(seconds)));
+      if (s < 60) return '预计剩余 ' + s + ' 秒';
+      var m = Math.floor(s / 60);
+      var rem = s % 60;
+      return '预计剩余 ' + m + ' 分 ' + rem + ' 秒';
+    }
+    function formatUpdateFailure(value, fallback) {
+      var payload = value && value.payload ? value.payload : (value && typeof value === 'object' ? value : null);
+      var detail = payload && (payload.error || payload.message) || (value && value.message) || fallback || '未知错误';
+      var stage = payload && payload.status;
+      var stageNames = { checking: '检查', downloading: '下载', verifying: '校验', installing: '安装', rebooting: '重启' };
+      var text = '更新失败' + (stage ? '（阶段：' + (stageNames[stage] || stage) + '）' : '') + '：' + detail;
+      if (payload && payload.attemptId) text += '；尝试 ID：' + payload.attemptId;
+      if (payload && payload.applyLog) text += '；安装日志：' + payload.applyLog;
+      if (payload && payload.debugLog) text += '；诊断日志：' + payload.debugLog;
+      return text;
+    }
+
+    // 点击「立即更新」：后台下载 → 轮询状态 → 安装（daemon 写脚本替换 + 自动重启）
     function startUpdate() {
       var btn = aboutPane.querySelector('#wbs-update-btn');
       var prog = aboutPane.querySelector('#wbs-update-progress');
@@ -2705,14 +2827,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!btn || !card) return;
       btn.disabled = true;
       btn.textContent = '更新中…';
-      if (prog) { prog.style.display = ''; prog.textContent = '正在准备更新…'; }
+      if (prog) { prog.innerHTML = ''; prog._wbsLastLog = ''; appendUpdateLog(prog, '正在准备更新…'); }
       api('/api/update-download', { method: 'POST' }).then(function (d) {
         if (!d.ok) throw new Error(d.error || '下载失败');
         return pollUpdateProgress(prog, btn, card);
       }).catch(function (e) {
         if (btn) { btn.disabled = false; btn.textContent = '重试更新'; }
-        if (prog) prog.textContent = (e && e.message) || '更新失败';
-        try { toast('更新失败: ' + ((e && e.message) || e), true, root); } catch (_) {}
+        var failure = formatUpdateFailure(e, '更新失败');
+        if (prog) appendUpdateLog(prog, failure);
+        try { toast(failure, true, root); } catch (_) {}
       });
     }
 
@@ -2722,27 +2845,29 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 重启等待阶段的分阶段预估进度（替换/启动真实耗时不透明，按安装向导惯例分步推进，
     // 让用户看到进度而非一句「30~60 秒」干等；新 daemon 真正就绪后以实际版本收尾）
     var REBOOT_STEPS = [
-      { t: 0,     pct: 12, text: '正在停止旧版服务…' },
-      { t: 3000,  pct: 30, text: '正在写入新版本文件…' },
-      { t: 9000,  pct: 55, text: '正在启动新版本…' },
-      { t: 16000, pct: 80, text: '正在连接新服务…' },
-      { t: 26000, pct: 95, text: '快完成了，请稍候…' },
+      { t: 0,     pct: 12, text: '停止旧服务…' },
+      { t: 3000,  pct: 30, text: '写入新文件…' },
+      { t: 9000,  pct: 55, text: '启动新版本…' },
+      { t: 16000, pct: 80, text: '连接新服务…' },
+      { t: 26000, pct: 95, text: '即将完成…' },
     ];
     function pollUpdateProgress(prog, btn, card) {
       return new Promise(function (resolve, reject) {
         var rounds = 0;
         var rebooting = false;
         var rebootElapsed = 0;
+        var applyStarted = false;
+        var lastStatus = null;
         var bar = card ? card.querySelector('#wbs-update-bar') : null;
         var barFill = bar ? bar.querySelector('#wbs-update-bar-fill') : null;
         function renderRebootUi() {
-          var text = WBS_BRAND + ' 正在重启，更新即将完成，请稍候…';
+          var text = '正在重启…';
           var pct = 95;
           for (var i = 0; i < REBOOT_STEPS.length; i++) {
             if (rebootElapsed >= REBOOT_STEPS[i].t) { text = REBOOT_STEPS[i].text; pct = REBOOT_STEPS[i].pct; }
           }
-          if (rebootElapsed > 45000) { text = '启动较慢，请耐心等待…（也可双击桌面 ' + WBS_BRAND + ' 图标手动启动）'; pct = 99; }
-          if (prog) prog.textContent = text;
+          if (rebootElapsed > 45000) { text = '启动较慢，请稍候…'; pct = 99; }
+          appendUpdateLog(prog, text);
           if (bar) bar.style.display = '';
           if (barFill) barFill.style.width = pct + '%';
         }
@@ -2751,14 +2876,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           api('/api/update-status').then(function (s) {
             if (!prog) return;
             if (!s) throw new Error('status-empty');
+            lastStatus = s;
             if (rebooting) {
+              if (rebootElapsed > 120000) {
+                clearInterval(timer);
+                var timeoutError = new Error('新版本服务在 120 秒内未恢复');
+                timeoutError.payload = lastStatus || {};
+                reject(timeoutError);
+                return;
+              }
               // 重启等待阶段：新 daemon 已就绪且有版本 → 完成
               var newVer = s.version;
               if (newVer && (!WBS_VERSION || WBS_VERSION.indexOf('__WBS_') === 0 || newVer !== WBS_VERSION)) {
                 clearInterval(timer);
                 if (bar) bar.style.display = '';
                 if (barFill) barFill.style.width = '100%';
-                prog.textContent = '✅ 已升级到 v' + newVer + '，更新完成';
+                appendUpdateLog(prog, '已升级到 v' + newVer + '，更新完成');
                 if (btn) btn.textContent = '已完成';
                 resolve(true);
               } else {
@@ -2769,36 +2902,43 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             }
             var st = s.status;
             if (st === 'downloading' || st === 'verifying') {
-              prog.textContent = s.message + (s.progress ? ' ' + s.progress + '%' : '');
+              var transfer = '';
+              if (st === 'downloading') {
+                transfer = ' · ' + formatDownloadRate(s.downloadRate) + ' · ' + formatDownloadEta(s.etaSeconds);
+              }
+              appendUpdateLog(prog, (s.message || '正在下载…') + (s.progress ? ' ' + s.progress + '%' : '') + transfer);
             } else if (st === 'installing') {
-              prog.textContent = '正在安装新版本…';
+              appendUpdateLog(prog, '正在安装新版本…');
               if (btn) btn.textContent = '安装中…';
               fireApply();
             } else if (st === 'error') {
               clearInterval(timer);
-              reject(new Error(s.error || s.message || '更新出错'));
+              var statusError = new Error(formatUpdateFailure(s, '更新出错'));
+              statusError.payload = s;
+              reject(statusError);
             } else if (st === 'idle' && s.downloaded) {
-              prog.textContent = '下载完成，准备安装…';
+              appendUpdateLog(prog, '下载完成，准备安装…');
               fireApply();
             } else if (st === 'idle' && s.hasUpdate) {
-              prog.textContent = s.message || '发现新版本，准备更新…';
+              appendUpdateLog(prog, s.message || '发现新版本，准备更新…');
             }
           }).catch(function (e) {
             // 连接断开（daemon 已退出替换文件）= 正在重启；稍等片刻再进入等待态
-            if (!rebooting && rounds > 2) { enterRebootWait(); return; }
+            if (!rebooting && rounds > 2) { appendUpdateLog(prog, '更新服务正在重启…'); enterRebootWait(); return; }
             if (rebooting) { rebootElapsed += 1000; renderRebootUi(); return; }
-            clearInterval(timer); reject(new Error((e && e.message) || '更新失败'));
+            clearInterval(timer); reject(new Error(formatUpdateFailure(e, '更新失败')));
           });
 
           function fireApply() {
-            if (rebooting) return;
+            if (rebooting || applyStarted) return;
+            applyStarted = true;
             api('/api/update-apply', { method: 'POST' }).then(function (r) {
               if (r && r.ok) { enterRebootWait(); }
-              else { clearInterval(timer); reject(new Error((r && r.error) || '安装失败')); }
+              else { clearInterval(timer); reject(new Error(formatUpdateFailure(r, '安装失败'))); }
             }).catch(function (e2) {
               var msg = String((e2 && e2.message) || e2);
               if (/ECONNREFUSED|Failed to fetch|NetworkError|load failed/i.test(msg)) { enterRebootWait(); }
-              else { clearInterval(timer); reject(new Error((e2 && e2.message) || '安装失败')); }
+              else { clearInterval(timer); reject(new Error(formatUpdateFailure(e2, '安装失败'))); }
             });
           }
 
@@ -4996,11 +5136,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-update-dot{width:8px;height:8px;border-radius:50%;background:#e24b4a;flex-shrink:0}',
     '.wbs-update-title{font-size:13px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-update-notes{font-size:11.5px;line-height:1.6;color:var(--wb-icon-tertiary,#777);white-space:pre-line;max-height:72px;overflow:hidden;margin-bottom:10px}',
-    '.wbs-update-actions{display:flex;align-items:center;gap:10px}',
-    '.wbs-update-btn{font-size:12px;font-weight:600;color:var(--wb-button-primary-fg,#fff);background:var(--wb-button-primary-bg,#1f1f1f);border:none;padding:6px 16px;border-radius:8px;cursor:pointer;transition:opacity .15s}',
+    '.wbs-update-actions{display:flex;align-items:center;gap:10px;min-width:0}',
+    '.wbs-update-btn{font-size:12px;font-weight:600;color:var(--wb-button-primary-fg,#fff);background:var(--wb-button-primary-bg,#1f1f1f);border:none;padding:6px 10px;border-radius:8px;cursor:pointer;transition:opacity .15s;flex:0 0 112px;min-width:112px;box-sizing:border-box;white-space:nowrap}',
     '.wbs-update-btn:hover{opacity:.85}',
     '.wbs-update-btn:disabled{opacity:.5;cursor:default}',
-    '.wbs-update-progress{font-size:11.5px;color:var(--wb-icon-tertiary,#888)}',
+    '.wbs-update-progress{display:block;box-sizing:border-box;margin-top:8px;max-height:126px;overflow-y:auto;padding:7px 8px;border:1px solid rgba(226,75,74,.2);border-radius:8px;background:rgba(226,75,74,.045);font-size:10.5px;color:var(--wb-icon-tertiary,#888);line-height:1.5;overflow-wrap:anywhere;scrollbar-width:thin}',
+    '.wbs-update-log-line{white-space:normal;word-break:break-word;padding:1px 0}',
     /* 官方壁纸网格 */
     '.wbs-wallpapers{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}',
     '.wbs-wp{border-radius:10px;overflow:hidden;cursor:pointer;border:2px solid transparent;transition:all .15s;position:relative}',
@@ -5064,6 +5205,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-panel-modal-mask{position:absolute;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;padding:14px;background:transparent;pointer-events:auto;animation:wbs-modal-in .16s ease}',
     '.wbs-login-modal{width:min(360px,calc(100% - 28px));box-sizing:border-box;padding:16px;border:1px solid var(--wb-border-default,rgba(0,0,0,.12));border-radius:14px;background:var(--wb-bg-popover,#fff);box-shadow:0 10px 40px rgba(0,0,0,.25)}',
     '.wbs-login-modal-title{font-size:15px;font-weight:700;line-height:1.35;color:var(--wb-color-text-primary,#1f1f1f);margin:0 0 14px}',
+    '.wbs-password-modal{width:min(360px,calc(100% - 28px));box-sizing:border-box;padding:16px;border:1px solid var(--wb-border-default,rgba(0,0,0,.12));border-radius:14px;background:var(--wb-bg-popover,#fff);box-shadow:0 10px 40px rgba(0,0,0,.25)}',
+    '.wbs-password-field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--wb-icon-secondary,#666)}',
+    '.wbs-password-field input{box-sizing:border-box;width:100%;min-height:34px;padding:7px 9px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:8px;background:var(--wb-bg-secondary,#fff);color:var(--wb-color-text-primary,#1f1f1f);font:inherit;outline:none}',
+    '.wbs-password-field input:focus{border-color:var(--wb-button-primary-bg,#1f1f1f);box-shadow:0 0 0 2px color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 16%,transparent)}',
+    '.wbs-password-hint{margin-top:7px;color:var(--wb-icon-tertiary,#999);font-size:11px;line-height:1.5}',
+    '.wbs-password-error{min-height:17px;margin-top:4px;color:#d14343;font-size:11px;line-height:1.5}',
     '.wbs-login-body{display:flex;flex-direction:column;gap:9px;margin-bottom:16px}',
     '.wbs-login-option{display:flex;align-items:flex-start;gap:10px;width:100%;box-sizing:border-box;padding:12px 13px;border:1px solid transparent;border-radius:11px;background:var(--wb-bg-popover,#fff);cursor:pointer;text-align:left;transition:border-color .16s,background .16s,box-shadow .16s;font-family:inherit}',
     '.wbs-login-option:hover{border-color:var(--wb-border-strong,#b9b9bd);background:var(--wb-bg-hover,#f5f5f5)}',

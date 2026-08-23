@@ -71,6 +71,13 @@ The injected panel is a compact WorkBuddy-native tool surface, not a marketing p
 - Windows file replacement must account for locks held by running `launcher.cmd`/`cmd.exe`. Do not kill broad process names such as every `Electron` process; match the intended executable/path narrowly.
 - If a launcher or daemon update changes code loaded into a long-running process, use a version/build bump so the launcher cannot reuse stale in-memory code.
 
+## Release Version Consistency
+
+- A release version must be identical in the package filename, macOS `Info.plist` (`CFBundleShortVersionString`/`CFBundleVersion`), and the packaged `scripts/daemon.js` `DAEMON_VERSION`. A package named `1.0.10` that runs daemon code reporting `1.0.6` is invalid.
+- Build scripts must always rewrite the staged daemon version from the release `VERSION`; never rely on the version embedded in the reusable `WorkDaddy.app` shell or on a conditional test-only override.
+- Before publishing or handing off a package, inspect the actual DMG/ZIP contents and record the daemon version, app metadata version, profile branding, and required update scripts. Do not infer package correctness from the filename alone.
+- The updater must reject an artifact whose internal daemon version does not match the GitHub release target, and must leave a local diagnostic trail showing the selected asset, expected version, internal version, and installation attempt ID.
+
 ## Change Workflow
 
 1. Read the surrounding code and existing tests before editing.

@@ -64,9 +64,13 @@ if [ "$PROFILE" = "workbuddy-ai" ]; then
   perl -0pi -e 's/<string>WorkDaddy<\/string>/<string>WorkDaddy AI<\/string>/g' "$PACKAGE_APP/Contents/Info.plist"
 fi
 perl -0pi -e "s/<string>1\\.0\\.8<\\/string>/<string>${VERSION}<\\/string>/g; s/<string>108<\\/string>/<string>${VERSION_CODE}<\\/string>/g" "$PACKAGE_APP/Contents/Info.plist"
-if [ -n "${WORKDADDY_BUILD_VERSION:-}" ]; then
-  perl -0pi -e "s/(const DAEMON_VERSION = ')[^']+(';)/\${1}${VERSION}\${2}/" \
-    "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"
+# 无论源码壳当前版本如何，每次产物都必须让 daemon 版本与安装包版本一致。
+perl -0pi -e "s/(const DAEMON_VERSION = ')[^']+(';)/\${1}${VERSION}\${2}/" \
+  "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"
+# app 壳可能携带滞后的 package.json；同步版本元数据，避免旧值覆盖关于页/诊断信息。
+if [ -f "$PACKAGE_APP/Contents/Resources/scripts/package.json" ]; then
+  perl -0pi -e "s/(\"version\"\s*:\s*\")([^\"]+)(\")/\${1}${VERSION}\${3}/" \
+    "$PACKAGE_APP/Contents/Resources/scripts/package.json"
 fi
 ln -s /Applications "$STAGE/Applications"
 cat > "$STAGE/安装失败自主解决提示词.txt" <<'EOF'

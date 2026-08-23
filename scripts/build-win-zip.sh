@@ -15,7 +15,7 @@ else
   winpath() { printf '%s\n' "$1"; }
 fi
 
-VERSION="$(grep -o "DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)"
+VERSION="${WORKDADDY_BUILD_VERSION:-$(grep -o "DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)}"
 PROFILE="${WORKDADDY_BUILD_PROFILE:-}"
 if [ -z "$PROFILE" ]; then
   for profile in workbuddy-cn workbuddy-ai; do
@@ -76,12 +76,14 @@ cp -R scripts "$STAGE/scripts"
 #          绝不能全局替换 __WBS_DEFAULT_PROFILE__ —— 否则判断条件
 #          $Profile -eq '__WBS_DEFAULT_PROFILE__' 会被替换成 $Profile -eq 'workbuddy-ai'，
 #          让 AI 包默认 profile 自身触发"回退到 workbuddy-cn"，桌面快捷方式名/安装目录全部错乱。
-PROFILE="$PROFILE" python3 - "$(winpath "$STAGE/scripts")" <<'PY'
+PROFILE="$PROFILE" BUILD_VERSION="$VERSION" python3 - "$(winpath "$STAGE/scripts")" <<'PY'
 import os
+import re
 import sys
 
 scripts = sys.argv[1]
 profile = os.environ['PROFILE']
+build_version = os.environ.get('BUILD_VERSION', '')
 
 # win-launcher.js：默认 profile（仅当源码仍是 || 'workbuddy-cn' 时替换）
 wl = os.path.join(scripts, 'win-launcher.js')
@@ -93,6 +95,24 @@ if old in s:
     s = s.replace(old, new, 1)
 with open(wl, 'w', encoding='utf-8', newline='') as f:
     f.write(s)
+
+# 每个产物都强制同步 daemon 版本，避免 app 壳残留旧 daemon（例如 1.0.6）导致
+# 文件名/Info.plist 是新版本但实际运行代码仍报告旧版本。
+daemon = os.path.join(scripts, 'daemon.js')
+with open(daemon, encoding='utf-8') as f:
+    s = f.read()
+s = re.sub(r"(const DAEMON_VERSION = ')[^']+(';)", r"\g<1>" + build_version + r"\g<2>", s, count=1)
+with open(daemon, 'w', encoding='utf-8', newline='') as f:
+    f.write(s)
+
+# 同步可选 package.json 的版本元数据，避免旧壳版本覆盖关于页展示。
+package_json = os.path.join(scripts, 'package.json')
+if build_version and os.path.exists(package_json):
+    with open(package_json, encoding='utf-8') as f:
+        s = f.read()
+    s = re.sub(r'("version"\s*:\s*")[^"]+(")', r'\g<1>' + build_version + r'\g<2>', s, count=1)
+    with open(package_json, 'w', encoding='utf-8', newline='') as f:
+        f.write(s)
 
 # 三个 ps1：只替换 param 默认值（[string]$Profile = '__WBS_DEFAULT_PROFILE__'）。
 # 写回必须用 utf-8-sig（保留 UTF-8 BOM）：源 ps1 带 BOM，Windows PowerShell/ISE 依赖

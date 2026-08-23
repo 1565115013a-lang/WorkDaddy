@@ -136,8 +136,9 @@ const DATA_DIR = defaultDataDir();
 // 1.0.21：模型页改为当前/备选模型列表风格，去除刷新入口并优化字段排版
 // 1.0.9：WorkBuddy / WorkBuddy AI profile 隔离；修复 Windows launcher 的本地端口探测、
 //        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
-const DAEMON_VERSION = '1.0.9';
-const DAEMON_BUILD_ID = 'release-1.0.9-20260823-hotfix7';
+// 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
+const DAEMON_VERSION = '1.0.13';
+const DAEMON_BUILD_ID = 'release-1.0.13-20260823-security4';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -151,9 +152,36 @@ const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
   ? parseInt(process.env.WBSWITCH_CDP_PORT, 10)
   : (PROFILE_CDP_PORT[PROFILE.id] || null);
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
+const API_TOKEN_FILE = path.join(DATA_DIR, '.api-token');
 const WATCH_INTERVAL = 3000; // 文件监听兜底
 const BACKUP_DEBOUNCE = 1500; // CDP 事件触发的备份防抖
 const CDP_RECONNECT_MS = 5000;
+
+// API token 是当前 profile 的本地能力凭证：只注入 WorkBuddy renderer，不写日志、不回传状态接口。
+// 用 wx + 重读避免两个 watchdog 进程启动竞态时各自生成一枚 token。
+function loadApiToken() {
+  const valid = (value) => /^[a-f0-9]{64}$/i.test(String(value || '').trim());
+  try {
+    const current = fs.readFileSync(API_TOKEN_FILE, 'utf8').trim();
+    if (valid(current)) return current;
+  } catch (_) {}
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.writeFileSync(API_TOKEN_FILE, generated + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    try { fs.chmodSync(API_TOKEN_FILE, 0o600); } catch (_) {}
+    return generated;
+  } catch (_) {
+    try {
+      const existing = fs.readFileSync(API_TOKEN_FILE, 'utf8').trim();
+      if (valid(existing)) return existing;
+    } catch (_) {}
+    // 极端情况下数据目录不可写：只在内存中继续运行，启动器会从注入面板路径恢复；不记录 token。
+    return generated;
+  }
+}
+
+const API_TOKEN = loadApiToken();
 
 function validCdpPort(port) {
   return Number.isInteger(port) && port >= 1024 && port <= 65535;
@@ -238,19 +266,58 @@ const UPDATE_REQ_TIMEOUT = 10000; // 网络超时，超时静默失败不阻塞�
 const UPDATE_DIR = path.join(DATA_DIR, 'update'); // 下载/解包目录
 const UPDATE_CHECK_CACHE = path.join(DATA_DIR, 'update-check.json');
 const UPDATE_ATTEMPT_FILE = path.join(UPDATE_DIR, 'last-attempt.json');
+const UPDATE_DEBUG_LOG = path.join(UPDATE_DIR, 'update-debug.log');
 // 更新状态机（面板轮询用）：idle | checking | downloading | verifying | installing | done | error
 const updateState = {
   status: 'idle',
   latest: null,
   hasUpdate: false,
+  assetName: null,
+  dmgSha256: null,
   downloaded: false,
   progress: 0, // 0-100
+  downloadedBytes: 0,
+  totalBytes: 0,
+  downloadRate: 0,
+  etaSeconds: null,
   message: '',
   error: null,
   checkedAt: 0,
   attemptId: null,
 };
 let updateTimer = null;
+let updateDownloadPromise = null;
+
+function updateDebug(stage, details) {
+  const scrub = (value, key = '') => {
+    const lower = String(key).toLowerCase();
+    if (/token|cookie|authorization|secret|password|private.?key|access.?token/.test(lower)) return '[redacted]';
+    if (typeof value === 'string') return value.length > 1200 ? value.slice(0, 1200) + '…' : value;
+    if (Array.isArray(value)) return value.map((item) => scrub(item));
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrub(v, k)]));
+    }
+    return value;
+  };
+  const entry = {
+    at: new Date().toISOString(),
+    stage,
+    profile: PROFILE.id,
+    client: PROFILE.name,
+    daemonVersion: DAEMON_VERSION,
+    buildId: DAEMON_BUILD_ID,
+    ...scrub(details || {}),
+  };
+  try {
+    fs.mkdirSync(UPDATE_DIR, { recursive: true });
+    try {
+      if (fs.statSync(UPDATE_DEBUG_LOG).size > 2 * 1024 * 1024) {
+        fs.renameSync(UPDATE_DEBUG_LOG, UPDATE_DEBUG_LOG + '.1');
+      }
+    } catch (_) {}
+    fs.appendFileSync(UPDATE_DEBUG_LOG, JSON.stringify(entry) + '\n', { encoding: 'utf8', mode: 0o600 });
+  } catch (_) {}
+}
 
 function writeUpdateAttempt(attempt) {
   try {
@@ -303,6 +370,15 @@ function parseSha256(body) {
   return m ? m[1].toLowerCase() : null;
 }
 
+function normalizeAssetSha256(value) {
+  const text = String(value || '').trim().replace(/^sha256:/i, '');
+  return /^[a-fA-F0-9]{64}$/.test(text) ? text.toLowerCase() : null;
+}
+
+function expectedUpdateSha256() {
+  return updateState.dmgSha256 || parseSha256(updateState.notes);
+}
+
 // 检查更新：请求 Releases API，比对版本，结果写缓存（内存 + 文件）
 function checkUpdate(force) {
   if (!force && updateTimer) {
@@ -313,6 +389,7 @@ function checkUpdate(force) {
   }
   updateState.status = 'checking';
   updateState.message = '正在检查更新…';
+  updateDebug('check-start', { force: !!force, current: DAEMON_VERSION, updateApi: UPDATE_API });
   return httpsGet(UPDATE_API)
     .then(({ status, body }) => {
       if (status !== 200) {
@@ -338,11 +415,14 @@ function checkUpdate(force) {
            assets.find((a) => /\.dmg$/i.test(a.name || '') && (PROFILE.id !== 'workbuddy-ai' || !/WorkDaddy-AI-/i.test(a.name || ''))) || null);
       updateState.dmgUrl = asset ? asset.browser_download_url : null;
       updateState.dmgSize = asset ? asset.size : 0;
+      updateState.dmgSha256 = asset ? normalizeAssetSha256(asset.digest) : parseSha256(updateState.notes);
+      updateState.assetName = asset ? asset.name : null;
       updateState.checkedAt = Date.now();
       updateState.status = 'idle';
       updateState.message = updateState.hasUpdate ? '发现新版本 v' + latest : '已是最新版本';
-      try { fs.writeFileSync(UPDATE_CHECK_CACHE, JSON.stringify({ latest, hasUpdate: updateState.hasUpdate, dmgUrl: updateState.dmgUrl, dmgSize: updateState.dmgSize, notes: updateState.notes, checkedAt: updateState.checkedAt })); } catch (_) {}
+      try { fs.writeFileSync(UPDATE_CHECK_CACHE, JSON.stringify({ latest, hasUpdate: updateState.hasUpdate, dmgUrl: updateState.dmgUrl, dmgSize: updateState.dmgSize, dmgSha256: updateState.dmgSha256, assetName: updateState.assetName, notes: updateState.notes, checkedAt: updateState.checkedAt })); } catch (_) {}
       log(`[update] 检查完成: latest=${latest} hasUpdate=${updateState.hasUpdate} (current=${DAEMON_VERSION})`);
+      updateDebug('check-result', { current: DAEMON_VERSION, latest, hasUpdate: updateState.hasUpdate, assetName: updateState.assetName, assetSize: updateState.dmgSize, assetSha256: updateState.dmgSha256 });
       return updateState;
     })
     .catch((e) => {
@@ -350,6 +430,7 @@ function checkUpdate(force) {
       updateState.error = e.message;
       updateState.message = '检查更新失败';
       log(`[update] 检查失败: ${e.message}`);
+      updateDebug('check-error', { error: e.message });
       // 尝试读缓存兜底（上次成功的结果）
       try {
         const c = JSON.parse(fs.readFileSync(UPDATE_CHECK_CACHE, 'utf8'));
@@ -357,6 +438,8 @@ function checkUpdate(force) {
         updateState.hasUpdate = !!c.hasUpdate;
         updateState.dmgUrl = c.dmgUrl;
         updateState.dmgSize = Number(c.dmgSize) || 0;
+        updateState.assetName = c.assetName || null;
+        updateState.dmgSha256 = normalizeAssetSha256(c.dmgSha256) || parseSha256(c.notes);
         updateState.notes = c.notes;
         updateState.checkedAt = c.checkedAt || Date.now();
       } catch (_) {}
@@ -365,22 +448,60 @@ function checkUpdate(force) {
 }
 
 // 下载安装包（macOS .dmg / Windows .zip），流式写文件更新 progress，带 SHA-256 校验
+// 同一 daemon 内只允许一个下载流程，避免并发请求互相删除/覆盖固定目标文件。
 function downloadUpdate() {
-  if (!updateState.dmgUrl) return Promise.reject(new Error('无可用安装包'));
+  if (updateDownloadPromise) return updateDownloadPromise;
+  updateDownloadPromise = Promise.resolve()
+    .then(() => downloadUpdateInternal())
+    .finally(() => { updateDownloadPromise = null; });
+  return updateDownloadPromise;
+}
+
+function downloadUpdateInternal() {
+  if (!updateState.dmgUrl) {
+    updateDebug('download-error', { error: '无可用安装包', latest: updateState.latest, assetName: updateState.assetName });
+    return Promise.reject(new Error('无可用安装包'));
+  }
   fs.mkdirSync(UPDATE_DIR, { recursive: true });
   updateState.downloaded = false;
   updateState.error = null;
+  updateState.downloadedBytes = 0;
+  updateState.totalBytes = Number(updateState.dmgSize) || 0;
+  updateState.downloadRate = 0;
+  updateState.etaSeconds = null;
   const ext = IS_WIN ? '.zip' : '.dmg';
   const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
   const target = path.join(UPDATE_DIR, updatePrefix + updateState.latest + ext);
+  const tempTarget = target + '.part.' + process.pid + '.' + crypto.randomBytes(8).toString('hex');
+  const expectSha = expectedUpdateSha256();
+  updateDebug('download-start', {
+    latest: updateState.latest,
+    assetName: updateState.assetName,
+    target: path.basename(target),
+    tempTarget: path.basename(tempTarget),
+    expectedSha256: expectSha,
+    expectedSize: updateState.dmgSize,
+  });
+  if (!expectSha) {
+    const error = new Error('发布未提供可信的 SHA-256，已停止更新');
+    updateState.status = 'error';
+    updateState.error = error.message;
+    updateState.message = '安装包缺少完整性校验，已停止更新';
+    updateDebug('download-error', { stage: 'preflight', error: error.message, target: path.basename(target) });
+    return Promise.reject(error);
+  }
   if (fs.existsSync(target)) {
-    const expect = parseSha256(updateState.notes);
-    const checked = validateUpdateArtifact(target, expect);
+    const checked = validateUpdateArtifact(target, expectSha);
     if (checked.ok) {
       updateState.downloaded = true;
       updateState.progress = 100;
+      updateState.downloadedBytes = fs.statSync(target).size;
+      updateState.totalBytes = updateState.downloadedBytes;
+      updateState.downloadRate = 0;
+      updateState.etaSeconds = 0;
       updateState.status = 'idle';
       updateState.message = '安装包已就绪';
+      updateDebug('download-cache-hit', { target: path.basename(target), size: updateState.downloadedBytes });
       return Promise.resolve(target);
     }
     log(`[update] 丢弃缓存安装包 ${path.basename(target)}: ${checked.reason}`);
@@ -391,31 +512,53 @@ function downloadUpdate() {
   updateState.message = '正在下载安装包…';
   return new Promise((resolve, reject) => {
     const mod = require('https');
+    const cleanupTemp = () => { try { fs.unlinkSync(tempTarget); } catch (_) {} };
+    let settled = false;
+    const failDownload = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanupTemp();
+      updateState.status = 'error';
+      updateState.error = error && error.message ? error.message : String(error);
+      updateState.message = '下载安装包失败';
+      const failure = error instanceof Error ? error : new Error(String(error));
+      log(`[update] 下载失败 stage=stream target=${path.basename(target)} temp=${path.basename(tempTarget)}: ${failure.message}`);
+      updateDebug('download-error', { stage: 'stream', error: failure.message, target: path.basename(target), tempTarget: path.basename(tempTarget) });
+      reject(failure);
+    };
     mod.get(updateState.dmgUrl, { headers: { 'User-Agent': 'WorkDaddy/' + DAEMON_VERSION } }, (res) => {
-      if (res.statusCode >= 400) return reject(new Error('下载失败 HTTP ' + res.statusCode));
+      updateDebug('download-response', { statusCode: res.statusCode, contentType: res.headers['content-type'] || null, contentLength: res.headers['content-length'] || null, target: path.basename(target) });
+      if (res.statusCode >= 400) return failDownload(new Error('下载失败 HTTP ' + res.statusCode));
       if ((res.statusCode >= 300) && res.headers.location) {
         // 跟随重定向（GitHub 资产会 302 到 objects.githubusercontent.com）
         updateState.dmgUrl = res.headers.location;
-        resolve(downloadUpdate());
+        resolve(downloadUpdateInternal());
         res.resume();
         return;
       }
       const contentType = String(res.headers['content-type'] || '').toLowerCase();
       if (!IS_WIN && /text\/html|application\/json/.test(contentType)) {
         res.resume();
-        const error = new Error(`下载响应不是 DMG (content-type=${contentType})`);
-        updateState.status = 'error';
-        updateState.error = error.message;
-        reject(error);
-        return;
+        return failDownload(new Error(`下载响应不是 DMG (content-type=${contentType})`));
       }
       const total = parseInt(res.headers['content-length'] || '0', 10) || updateState.dmgSize;
       let received = 0;
-      const out = fs.createWriteStream(target);
+      let lastDebugProgress = -1;
+      const startedAt = Date.now();
+      updateState.totalBytes = total || 0;
+      const out = fs.createWriteStream(tempTarget, { flags: 'wx' });
       res.on('data', (c) => {
         received += c.length;
+        updateState.downloadedBytes = received;
+        const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+        updateState.downloadRate = Math.round(received / elapsed);
         if (total) {
           updateState.progress = Math.min(99, Math.round((received / total) * 100));
+          updateState.etaSeconds = updateState.downloadRate > 0 ? Math.max(0, Math.ceil((total - received) / updateState.downloadRate)) : null;
+          if (updateState.progress >= lastDebugProgress + 10) {
+            lastDebugProgress = updateState.progress;
+            updateDebug('download-progress', { progress: updateState.progress, downloadedBytes: received, totalBytes: total, downloadRate: updateState.downloadRate, etaSeconds: updateState.etaSeconds });
+          }
         }
       });
       res.pipe(out);
@@ -423,29 +566,59 @@ function downloadUpdate() {
         updateState.progress = 100;
         updateState.status = 'verifying';
         updateState.message = '校验安装包…';
-        const expect = parseSha256(updateState.notes);
-        const checked = validateUpdateArtifact(target, expect);
+        const checked = validateUpdateArtifact(tempTarget, expectSha);
         if (!checked.ok) {
-          try { fs.unlinkSync(target); } catch (_) {}
+          settled = true;
+          cleanupTemp();
           updateState.status = 'error';
           updateState.error = checked.reason;
           updateState.message = '安装包校验失败，已删除损坏包';
+          log(`[update] 下载失败 stage=verify target=${path.basename(target)} temp=${path.basename(tempTarget)}: ${checked.reason}`);
           return reject(new Error(checked.reason));
         }
+        try {
+          fs.renameSync(tempTarget, target);
+        } catch (error) {
+          return failDownload(new Error('安装包落盘失败: ' + error.message));
+        }
+        settled = true;
         updateState.downloaded = true;
         updateState.status = 'idle';
-        updateState.message = '安装包已就绪' + (expect ? '（校验通过）' : '（格式校验通过）');
+        updateState.downloadedBytes = checked.size || received;
+        updateState.totalBytes = updateState.downloadedBytes;
+        updateState.downloadRate = 0;
+        updateState.etaSeconds = 0;
+        updateState.message = '安装包已就绪（校验通过）';
         log(`[update] 下载完成 ${target} sha256=${checked.digest}`);
+        updateDebug('download-verified', { target: path.basename(target), size: received, sha256: checked.digest });
         resolve(target);
       });
-      out.on('error', (e) => { try { fs.unlinkSync(target); } catch (_) {} reject(e); });
-    }).on('error', (e) => { try { fs.unlinkSync(target); } catch (_) {} reject(e); });
+      out.on('error', failDownload);
+      res.on('error', failDownload);
+    }).on('error', failDownload);
   });
 }
 
 // 计算文件 SHA-256
 function sha256File(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function inspectPackagedApp(appDir) {
+  const result = { appDir, daemonVersion: null, appVersion: null };
+  try {
+    const daemonFile = path.join(appDir, 'Contents', 'Resources', 'scripts', 'daemon.js');
+    const source = fs.readFileSync(daemonFile, 'utf8');
+    const match = source.match(/const DAEMON_VERSION = '([^']+)'/);
+    result.daemonVersion = match ? match[1] : null;
+  } catch (_) {}
+  try {
+    const plistFile = path.join(appDir, 'Contents', 'Info.plist');
+    const source = fs.readFileSync(plistFile, 'utf8');
+    const match = source.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
+    result.appVersion = match ? match[1] : null;
+  } catch (_) {}
+  return result;
 }
 
 // 文件存在或没有 Release notes 摘要都不能证明它是可挂载的 DMG：断流、代理错误页
@@ -692,7 +865,7 @@ function extractAppFromDmg(dmgPath) {
   const appDest = path.join(UPDATE_DIR, appPackageName);
   return new Promise((resolve, reject) => {
     const exec = require('child_process').execFile;
-    const checked = validateUpdateArtifact(dmgPath, parseSha256(updateState.notes));
+    const checked = validateUpdateArtifact(dmgPath, expectedUpdateSha256());
     if (!checked.ok) {
       log(`[update] DMG 预检失败 ${path.basename(dmgPath)}: ${checked.reason}`);
       reject(new Error(`DMG 预检失败: ${checked.reason}`));
@@ -719,6 +892,11 @@ function extractAppFromDmg(dmgPath) {
             if (code !== 0 || !fs.existsSync(path.join(appDest, 'Contents', 'Info.plist'))) {
               return reject(new Error('解包应用失败'));
             }
+            const artifact = inspectPackagedApp(appDest);
+            updateDebug('artifact-inspect', { expectedVersion: updateState.latest, daemonVersion: artifact.daemonVersion, appVersion: artifact.appVersion, source: path.basename(dmgPath) });
+            if (artifact.daemonVersion && updateState.latest && semverCompare(artifact.daemonVersion, updateState.latest) !== 0) {
+              return reject(new Error(`安装包内部 daemon 版本 ${artifact.daemonVersion} 与目标版本 ${updateState.latest} 不一致`));
+            }
             resolve(appDest);
           });
         });
@@ -731,7 +909,10 @@ function extractAppFromDmg(dmgPath) {
 // 安装：macOS 调 apply-update.sh（launchctl 停服 → 备份 → 替换 → relaunch）；
 // Windows 调 apply-update.ps1（杀 watchdog/daemon → 释放文件锁 → 替换目录 → 重启）
 function applyUpdate() {
-  if (!updateState.downloaded) return Promise.reject(new Error('尚未下载完成'));
+  if (!updateState.downloaded) {
+    updateDebug('apply-error', { stage: 'preflight', error: '尚未下载完成', latest: updateState.latest });
+    return Promise.reject(new Error('尚未下载完成'));
+  }
   updateState.status = 'installing';
   updateState.message = '正在安装新版本…';
   updateState.error = null;
@@ -745,9 +926,11 @@ function applyUpdate() {
     startedAt: new Date().toISOString(),
     pid: process.pid,
     dataDir: DATA_DIR,
+    debugLog: UPDATE_DEBUG_LOG,
   };
   updateState.attemptId = attempt.id;
   writeUpdateAttempt(attempt);
+  updateDebug('apply-start', { attemptId: attempt.id, fromVersion: DAEMON_VERSION, targetVersion: updateState.latest, platform: process.platform });
   const applyLog = path.join(UPDATE_DIR, 'apply.log');
   const markAttemptFailure = (error, stage = 'update-script') => {
     attempt.status = stage;
@@ -755,6 +938,7 @@ function applyUpdate() {
     attempt.error = error && error.message ? error.message : String(error);
     writeUpdateAttempt(attempt);
     log('[update] 更新尝试失败 stage=' + stage + ': ' + attempt.error);
+    updateDebug('apply-error', { stage, attemptId: attempt.id, targetVersion: updateState.latest, error: attempt.error });
     captureException(error, { stage, extra: { platform: process.platform, attemptId: attempt.id, targetVersion: updateState.latest } }).catch(() => {});
   };
   const markSpawnFailure = (error) => markAttemptFailure(error, 'spawn-error');
@@ -778,6 +962,7 @@ function applyUpdate() {
     attempt.targetApp = appDir;
     writeUpdateAttempt(attempt);
     log('[update] 执行 apply-update.ps1 attempt=' + attempt.id + ' log=' + applyLog);
+    updateDebug('apply-script-start', { script: 'apply-update.ps1', attemptId: attempt.id, sourcePackage: srcZip, targetApp: appDir, applyLog });
     // 【更新标记】写入 pending.json：watchdog 检测到它在 daemon 退出后【不自动重启 daemon】，
     // 双重保险（配合本函数末尾「先精确停 watchdog 再自我退出」），彻底杜绝 watchdog 在替换窗口期
     // 复活 daemon 抢占 47832 端口的竞态（历史上第一轮更新偶发失败、需点第二次才成功的根因）。
@@ -810,6 +995,7 @@ function applyUpdate() {
       attempt.scriptPid = child.pid;
       writeUpdateAttempt(attempt);
       log('[update] apply-update.ps1 已启动(经 wscript 中介) pid=' + child.pid);
+      updateDebug('apply-script-spawned', { script: 'apply-update.ps1', attemptId: attempt.id, pid: child.pid });
     });
     child.unref();
     // 【竞态加固 · 更新标记】daemon 自我退出后，watchdog 默认会在 3s 后重启新的 daemon 抢占 47832，
@@ -840,21 +1026,31 @@ function applyUpdate() {
         : Promise.reject(new Error('缺少安装包（未找到已下载的 dmg）')));
   return preUnpack.then((p) => {
     if (!fs.existsSync(p)) throw new Error('缺少解包后的新应用');
+    const artifact = inspectPackagedApp(p);
+    updateDebug('artifact-ready', { expectedVersion: updateState.latest, daemonVersion: artifact.daemonVersion, appVersion: artifact.appVersion, source: path.basename(p) });
+    if (artifact.daemonVersion && updateState.latest && semverCompare(artifact.daemonVersion, updateState.latest) !== 0) {
+      throw new Error(`安装包内部 daemon 版本 ${artifact.daemonVersion} 与目标版本 ${updateState.latest} 不一致`);
+    }
     attempt.sourceApp = p;
     attempt.targetApp = appPath;
     writeUpdateAttempt(attempt);
     log('[update] 执行 apply-update.sh attempt=' + attempt.id + ' src=' + p + ' dst=' + appPath + ' log=' + applyLog);
-    const child = spawn('bash', [scriptPath, p, appPath, String(ACTUAL_PORT), applyLog, attempt.id], { detached: true, stdio: 'ignore' });
+    updateDebug('apply-script-start', { script: 'apply-update.sh', attemptId: attempt.id, sourceApp: p, targetApp: appPath, applyLog });
+    const child = spawn('bash', [scriptPath, p, appPath, String(ACTUAL_PORT), applyLog, attempt.id, PROFILE.id], { detached: true, stdio: 'ignore' });
     child.once('error', markSpawnFailure);
     child.once('spawn', () => {
       attempt.status = 'script-started';
       attempt.scriptPid = child.pid;
       writeUpdateAttempt(attempt);
       log('[update] apply-update.sh 已启动 pid=' + child.pid);
+      updateDebug('apply-script-spawned', { script: 'apply-update.sh', attemptId: attempt.id, pid: child.pid });
     });
     child.unref();
     return { ok: true, message: '已启动更新，正在替换文件并自动重启，请稍候…' };
   }).catch((error) => {
+    updateState.status = 'error';
+    updateState.error = error.message;
+    updateState.message = '安装包版本校验失败';
     if (attempt.status === 'starting') markAttemptFailure(error, 'preflight-error');
     throw error;
   });
@@ -1833,8 +2029,11 @@ function injectWidget(reason) {
   // 同步注入当前 daemon 版本号（inject.js 顶部的 __WBS_VERSION__ 占位符会在面板「关于」页直接展示，
   // 这样版本升级后不需要改 inject.js、面板永远显示 daemon 的真实版本）
   script = script.replace(/__WBS_VERSION__/g, DAEMON_VERSION);
+  // 注入本地 API 能力凭证；旧版面板不会携带该 header，但新版 daemon 会在启动时重新注入新版面板。
+  script = script.replace(/__WBS_API_TOKEN__/g, API_TOKEN);
   script = script.replace(/__WBS_PROFILE__/g, PROFILE.id);
   script = script.replace(/__WBS_CAPS__/g, JSON.stringify(PROFILE.capabilities));
+  updateDebug('inject-version', { reason, injectedVersion: DAEMON_VERSION, profile: PROFILE.id });
   // 注入策略：不使用 addScriptToEvaluateOnNewDocument（它会在浏览器里持久化注册，
   // 多次重启会叠加旧版本；旧注册先执行并占住 window.__wbsWidget 守卫，导致新代码被拦截）。
   // 改为：先用 Runtime.evaluate 暴力清理任何历史残留（不依赖旧版本的 destroy，避免清不干净），
@@ -2389,12 +2588,71 @@ function deleteSessionFiles(wbHome, id) {
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, {
+  const headers = {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*',
-  });
+  };
+  // 只回显经过来源校验的 Origin；绝不再使用 *，避免恶意网页读取账号/会话响应。
+  if (res.__wbsCorsOrigin) {
+    headers['Access-Control-Allow-Origin'] = res.__wbsCorsOrigin;
+    headers.Vary = 'Origin';
+  }
+  res.writeHead(code, headers);
   res.end(body);
+}
+
+const PUBLIC_API_PATHS = new Set([
+  '/api/status',
+  '/api/about',
+  '/api/about/',
+  '/api/update-check',
+  '/api/update-status',
+]);
+
+function isAllowedApiOrigin(origin) {
+  if (!origin) return true; // 本地 CLI/启动器请求没有 Origin
+  if (origin === 'null') return true; // Electron file:// renderer
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    const host = String(u.hostname || '').toLowerCase();
+    // WorkBuddy 的 renderer 可能是官方网页来源，也可能是 loopback DevTools 页面。
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' ||
+      host === 'workbuddy.cn' || host.endsWith('.workbuddy.cn') ||
+      host === 'workbuddy.ai' || host.endsWith('.workbuddy.ai') ||
+      host === 'codebuddy.cn' || host.endsWith('.codebuddy.cn') ||
+      host === 'codebuddy.ai' || host.endsWith('.codebuddy.ai');
+  } catch (_) {
+    return false;
+  }
+}
+
+function hasApiToken(req) {
+  const supplied = String(req.headers['x-workdaddy-token'] || '');
+  const expected = Buffer.from(API_TOKEN, 'utf8');
+  const actual = Buffer.from(supplied, 'utf8');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function isApiRequestAuthorized(req, p) {
+  const origin = String(req.headers.origin || '');
+  if (origin && !isAllowedApiOrigin(origin)) return false;
+  if (PUBLIC_API_PATHS.has(p)) return true;
+  // 保留无 Origin 的手动 launcher/curl 注入和错误面包屑兼容；二者不返回账号数据。
+  if (!origin && (p === '/api/inject' || p === '/api/breadcrumb')) return true;
+  return hasApiToken(req);
+}
+
+function isAllowedDevtoolsOrigin(origin, upstreamPort) {
+  if (!origin) return true; // 仅允许无浏览器来源的本地调试客户端
+  try {
+    const u = new URL(origin);
+    const host = String(u.hostname || '').toLowerCase();
+    const port = String(u.port || (u.protocol === 'https:' ? 443 : 80));
+    return (host === '127.0.0.1' || host === 'localhost' || host === '[::1]') && port === String(upstreamPort);
+  } catch (_) {
+    return false;
+  }
 }
 
 function readBody(req) {
@@ -3594,33 +3852,45 @@ async function fetchCredits(accessToken) {
   };
 }
 
-/* ================= 账号导出 / 导入（加密密钥 = workdaddy） =================
- * 目的：跨电脑同步账号备份，避免重新登录导致身份过期。
- * 说明：用户口吻的「RSA 加密」在本场景用对称加密实现（密钥固定为 workdaddy，任何机器均可解开）：
- *   AES-256-GCM + scryptSync(workdaddy) 派生 32 字节密钥。导出文件的 envelope 仅含元信息，
- *   账号内容（含令牌）整体密文，未解密前无法读取。kdf 参数固定，跨机器可还原。
+/* ================= 账号导出 / 导入 =================
+ * v2 导出：用户在面板输入非空密码；随机 salt + AES-256-GCM，密码不落盘、不写日志。
+ * v1 导入：兼容历史固定密码 workdaddy 的导出文件，空密码即走旧格式默认值。
  */
 const EXPORT_PASSPHRASE = 'workdaddy';
 const EXPORT_KDF_SALT = 'WorkDaddy-account-export-v1';
 
-function exportSecretKey() {
-  return crypto.scryptSync(EXPORT_PASSPHRASE, EXPORT_KDF_SALT, 32);
+function exportSecretKey(password, salt) {
+  return crypto.scryptSync(String(password), salt, 32);
 }
 // 密文布局：iv(12) + authTag(16) + ciphertext
-function encryptExport(plain) {
+function encryptExport(plain, password) {
+  const salt = crypto.randomBytes(16);
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', exportSecretKey(), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', exportSecretKey(password, salt), iv);
   const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, enc]).toString('base64');
+  return { data: Buffer.concat([iv, tag, enc]).toString('base64'), salt: salt.toString('base64') };
 }
-function decryptExport(b64) {
+function decryptExport(b64, password, saltB64) {
+  const buf = Buffer.from(String(b64 || ''), 'base64');
+  if (buf.length <= 28) throw new Error('导出数据不完整或已损坏');
+  const salt = Buffer.from(String(saltB64 || ''), 'base64');
+  if (salt.length !== 16) throw new Error('导出文件缺少有效的加密 salt');
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', exportSecretKey(password, salt), iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+}
+
+function decryptLegacyExport(b64, password) {
   const buf = Buffer.from(String(b64 || ''), 'base64');
   if (buf.length <= 28) throw new Error('导出数据不完整或已损坏');
   const iv = buf.subarray(0, 12);
   const tag = buf.subarray(12, 28);
   const data = buf.subarray(28);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', exportSecretKey(), iv);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', exportSecretKey(password || EXPORT_PASSPHRASE, EXPORT_KDF_SALT), iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
 }
@@ -3628,16 +3898,30 @@ function decryptExport(b64) {
 function handleApi(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || HOST}`);
   const p = url.pathname;
+  const origin = String(req.headers.origin || '');
+  res.__wbsCorsOrigin = origin && isAllowedApiOrigin(origin) ? origin : '';
 
   // CORS 预检（注入到 WorkBuddy 页面里的组件需要跨域调用本机 API）
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
+    if (origin && !isAllowedApiOrigin(origin)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('forbidden origin');
+    }
+    const headers = {
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-WorkDaddy-Token',
       'Access-Control-Max-Age': '86400',
-    });
+    };
+    if (res.__wbsCorsOrigin) {
+      headers['Access-Control-Allow-Origin'] = res.__wbsCorsOrigin;
+      headers.Vary = 'Origin';
+    }
+    res.writeHead(204, headers);
     return res.end();
+  }
+
+  if (!isApiRequestAuthorized(req, p)) {
+    return json(res, 401, { ok: false, error: '本地 API 未授权' });
   }
 
   if (req.method === 'POST' && p === '/api/inject') {
@@ -3788,7 +4072,8 @@ function handleApi(req, res) {
   }
 
   if (req.method === 'GET' && p === '/api/status') {
-    return json(res, 200, {
+    const authenticated = hasApiToken(req);
+    const status = {
       ok: true,
       version: DAEMON_VERSION,
       buildId: DAEMON_BUILD_ID,
@@ -3796,7 +4081,6 @@ function handleApi(req, res) {
       cdp: {
         connected: cdp.connected,
         port: cdp.port,
-        targetUrl: cdp.targetUrl,
         error: cdp.error,
       },
       batch: {
@@ -3806,10 +4090,14 @@ function handleApi(req, res) {
         startedAt: batchState.startedAt,
         last: batchState.last,
       },
-      current: currentAccount(),
-      dataDir: DATA_DIR,
-      authFile: AUTH_FILE,
-    });
+    };
+    if (authenticated) {
+      status.cdp.targetUrl = cdp.targetUrl;
+      status.current = currentAccount();
+      status.dataDir = DATA_DIR;
+      status.authFile = AUTH_FILE;
+    }
+    return json(res, 200, status);
   }
 
   // 诊断：保存一份不含 token 的本地快照，便于用户在异常机器上直接提供文件排查。
@@ -3870,39 +4158,47 @@ function handleApi(req, res) {
     });
   }
 
-  // 导出账号：加密打包全部备份，返回可直接下载的文件内容（密钥 workdaddy）
+  // 导出账号：密码必填；v2 使用随机 salt，密码只在本次请求内存在
   if (req.method === 'POST' && p === '/api/accounts/export') {
-    try {
-      const accounts = listAccounts(DATA_DIR);
-      const items = [];
-      for (const a of accounts) {
-        const file = backupPath(DATA_DIR, a.uid);
-        if (!fs.existsSync(file)) continue;
-        try {
-          const raw = fs.readFileSync(file, 'utf8');
-          JSON.parse(raw); // 跳过损坏备份
-          items.push({ uid: a.uid, info: raw });
-        } catch (_) { /* 跳过 */ }
+    return readBody(req).then((body) => {
+      try {
+        const enteredPassword = body && typeof body.password === 'string' ? body.password : '';
+        const password = enteredPassword.trim() ? enteredPassword : '';
+        if (password.length > 1024) return json(res, 400, { ok: false, error: '密码不能超过 1024 个字符' });
+        if (!password.trim()) return json(res, 400, { ok: false, error: '导出密码不能为空' });
+        const accounts = listAccounts(DATA_DIR);
+        const items = [];
+        for (const a of accounts) {
+          const file = backupPath(DATA_DIR, a.uid);
+          if (!fs.existsSync(file)) continue;
+          try {
+            const raw = fs.readFileSync(file, 'utf8');
+            JSON.parse(raw); // 跳过损坏备份
+            items.push({ uid: a.uid, info: raw });
+          } catch (_) { /* 跳过 */ }
+        }
+        if (!items.length) return json(res, 200, { ok: false, error: '没有可导出的账号备份' });
+        const payload = { exportType: 'WorkDaddy-accounts', version: 2, accounts: items };
+        const encrypted = encryptExport(JSON.stringify(payload), password);
+        const envelope = JSON.stringify({
+          wbsExport: 'WorkDaddy',
+          version: 2,
+          createdAt: new Date().toISOString(),
+          kdf: 'aes-256-gcm+scrypt',
+          salt: encrypted.salt,
+          data: encrypted.data,
+        });
+        const filename = 'WorkDaddy-账号导出-' + new Date().toISOString().slice(0, 10) + '.json';
+        log(`[export] 导出 ${items.length} 个账号 -> ${filename}`);
+        return json(res, 200, { ok: true, filename, content: envelope, count: items.length });
+      } catch (e) {
+        log(`[export] 导出失败: ${e.message}`);
+        return json(res, 500, { ok: false, error: e.message });
       }
-      if (!items.length) return json(res, 200, { ok: false, error: '没有可导出的账号备份' });
-      const payload = { exportType: 'WorkDaddy-accounts', version: 1, accounts: items };
-      const envelope = JSON.stringify({
-        wbsExport: 'WorkDaddy',
-        version: 1,
-        createdAt: new Date().toISOString(),
-        kdf: 'aes-256-gcm+scrypt',
-        data: encryptExport(JSON.stringify(payload)),
-      });
-      const filename = 'WorkDaddy-账号导出-' + new Date().toISOString().slice(0, 10) + '.json';
-      log(`[export] 导出 ${items.length} 个账号 -> ${filename}`);
-      return json(res, 200, { ok: true, filename, content: envelope, count: items.length });
-    } catch (e) {
-      log(`[export] 导出失败: ${e.message}`);
-      return json(res, 500, { ok: false, error: e.message });
-    }
+    });
   }
 
-  // 导入账号：从加密文件解密并恢复备份（密钥 workdaddy），按 uid 覆盖写入
+  // 导入账号：v2 必须输入密码；历史 v1 文件密码可留空（默认 workdaddy）
   if (req.method === 'POST' && p === '/api/accounts/import') {
     return readBody(req).then((body) => {
       try {
@@ -3914,7 +4210,18 @@ function handleApi(req, res) {
         let envelope;
         try { envelope = JSON.parse(text); } catch (_) { throw new Error('文件不是有效的导出 JSON'); }
         if (!envelope || envelope.wbsExport !== 'WorkDaddy') throw new Error('不是 WorkDaddy 的账号导出文件');
-        const payload = JSON.parse(decryptExport(envelope.data));
+        const enteredPassword = body && typeof body.password === 'string' ? body.password : '';
+        const password = enteredPassword.trim() ? enteredPassword : '';
+        if (password.length > 1024) throw new Error('密码不能超过 1024 个字符');
+        let payloadText;
+        if (Number(envelope.version) >= 2) {
+          if (!envelope.salt) throw new Error('导出文件缺少有效的加密 salt');
+          if (!password.trim()) throw new Error('导入该文件需要密码');
+          payloadText = decryptExport(envelope.data, password, envelope.salt);
+        } else {
+          payloadText = decryptLegacyExport(envelope.data, password || EXPORT_PASSPHRASE);
+        }
+        const payload = JSON.parse(payloadText);
         const list = Array.isArray(payload && payload.accounts) ? payload.accounts : [];
         if (!list.length) throw new Error('导入文件中没有账号数据');
         ensureDirs(DATA_DIR);
@@ -3922,7 +4229,9 @@ function handleApi(req, res) {
         for (const item of list) {
           const uid = String(item && item.uid || '').trim();
           const info = item && item.info;
-          if (!uid || typeof info !== 'string') continue;
+          // 导出文件属于用户输入；UID 只能是账号文件名的一段，禁止路径分隔符和
+          // 特殊目录名，避免导入请求把认证内容写到 accounts 目录之外。
+          if (!uid || uid.length > 200 || uid === '.' || uid === '..' || /[\\/\0]/.test(uid) || typeof info !== 'string') continue;
           let j;
           try { j = JSON.parse(info); } catch (_) { continue; }
           const acct = j.account || (Array.isArray(j.accounts) && j.accounts[0]);
@@ -4541,7 +4850,8 @@ function handleApi(req, res) {
     let build = { version: DAEMON_VERSION, commit: null, buildAt: null };
     try {
       const pjson = require('./package.json');
-      build.version = pjson.version || DAEMON_VERSION;
+      // package.json 可能随 app 壳滞后于 daemon.js；关于页和升级结果必须展示实际运行代码版本。
+      build.packageVersion = pjson.version || null;
       build.commit = process.env.WBSWITCH_GIT_COMMIT || null;
       build.buildAt = process.env.WBSWITCH_BUILD_AT || null;
     } catch (_) { /* 没有 package.json 时退回到 DAEMON_VERSION */ }
@@ -4559,11 +4869,12 @@ function handleApi(req, res) {
         if (m) appVersion = m[1];
       }
     } catch (_) { /* 解析失败忽略 */ }
+    updateDebug('about-version', { daemonVersion: DAEMON_VERSION, packageVersion: build.packageVersion || null, appVersion, shownVersion: DAEMON_VERSION });
     return json(res, 200, {
       ok: true,
       name: WORKDADDY_INSTALL_NAME,
       tagline: PROFILE.name + ' 的多账号 · 主题 · 增强工具集',
-      version: build.version,
+      version: DAEMON_VERSION,
       appVersion: appVersion,
       license: 'AGPL-3.0',
       repository: 'https://github.com/babygoton/WorkDaddy',
@@ -4587,6 +4898,7 @@ function handleApi(req, res) {
         hasUpdate: st.hasUpdate,
         dmgUrl: st.dmgUrl,
         dmgSize: st.dmgSize,
+        assetName: st.assetName,
         notes: st.notes,
         message: st.message,
         error: st.error || null,
@@ -4595,8 +4907,12 @@ function handleApi(req, res) {
     );
   }
   if (req.method === 'GET' && p === '/api/update-status') {
-    return json(res, 200, {
+    const status = {
       ok: true,
+      // 前端在 daemon 重启后通过版本变化结束等待；缺少该字段会永久停留在“重启中”。
+      version: DAEMON_VERSION,
+      daemonVersion: DAEMON_VERSION,
+      buildId: DAEMON_BUILD_ID,
       status: updateState.status,
       progress: updateState.progress,
       message: updateState.message,
@@ -4604,24 +4920,46 @@ function handleApi(req, res) {
       latest: updateState.latest,
       hasUpdate: updateState.hasUpdate,
       downloaded: updateState.downloaded,
+      downloadedBytes: updateState.downloadedBytes,
+      totalBytes: updateState.totalBytes,
+      downloadRate: updateState.downloadRate,
+      etaSeconds: updateState.etaSeconds,
       attemptId: updateState.attemptId,
-      applyLog: path.join(UPDATE_DIR, 'apply.log'),
-    });
+    };
+    if (hasApiToken(req)) {
+      status.applyLog = path.join(UPDATE_DIR, 'apply.log');
+      status.debugLog = UPDATE_DEBUG_LOG;
+    }
+    return json(res, 200, status);
   }
   if (req.method === 'POST' && p === '/api/update-download') {
     updateState.error = null;
-    return downloadUpdate()
-      .then((file) => json(res, 200, { ok: true, file, size: fs.existsSync(file) ? fs.statSync(file).size : 0 }))
-      .catch((e) => {
-        updateState.error = e.message;
-        updateState.message = '下载失败';
-        return json(res, 200, { ok: false, error: e.message });
-      });
+    downloadUpdate().then(() => {
+      log('[update] 后台下载任务完成');
+    }).catch((e) => {
+      updateState.error = e.message;
+      updateState.message = '下载失败';
+    });
+    return json(res, 202, {
+      ok: true,
+      started: true,
+      status: updateState.status,
+      progress: updateState.progress,
+      downloadedBytes: updateState.downloadedBytes,
+      totalBytes: updateState.totalBytes,
+    });
   }
   if (req.method === 'POST' && p === '/api/update-apply') {
     return applyUpdate()
-      .then((r) => json(res, 200, { ...r, attemptId: updateState.attemptId, applyLog: path.join(UPDATE_DIR, 'apply.log') }))
-      .catch((e) => json(res, 200, { ok: false, error: e.message }));
+      .then((r) => json(res, 200, { ...r, attemptId: updateState.attemptId, applyLog: path.join(UPDATE_DIR, 'apply.log'), debugLog: UPDATE_DEBUG_LOG }))
+      .catch((e) => json(res, 200, {
+        ok: false,
+        error: e.message,
+        status: updateState.status,
+        attemptId: updateState.attemptId,
+        applyLog: path.join(UPDATE_DIR, 'apply.log'),
+        debugLog: UPDATE_DEBUG_LOG,
+      }));
   }
 
   // 暂存卡死诊断：注入脚本上报的面包屑/错误栈，仅写 daemon 日志（崩溃排查用）
@@ -5003,8 +5341,8 @@ function startServer() {
     res.end('not found');
   });
 
-  // DevTools WebSocket 代理：/devtools-proxy/<targetId> —— 浏览器前端连 daemon（不校验 Origin），
-  // daemon 用无 Origin 的 WebSocket 连当前 CDP 端口转发（Electron CDP 拒绝带 Origin 的连接）
+  // DevTools WebSocket 代理：只接受当前 CDP DevTools 页面来源，拒绝任意网页借代理控制 renderer。
+  // daemon 到 Electron CDP 的上游连接仍去掉 Origin（Electron CDP 会拒绝带 Origin 的连接）。
   if (wsLib) {
     const { WebSocketServer } = wsLib;
     const wss = new WebSocketServer({ noServer: true });
@@ -5013,10 +5351,15 @@ function startServer() {
       try { pathname = new URL(req.url, 'http://x').pathname; } catch (_) { socket.destroy(); return; }
       const m = /^\/devtools-proxy\/([A-Za-z0-9]+)$/.exec(pathname);
       if (!m) { socket.destroy(); return; }
+      // 与 /api/devtools-url 使用同一套回退顺序：CDP 尚未完成内存连接时，
+      // 仍允许已持久化端口上的官方 DevTools 页面建立代理连接。
+      const upstreamPort = cdp.port || readCdpPortFile() || CDP_PORT_HINT || 9222;
+      if (!upstreamPort || !isAllowedDevtoolsOrigin(String(req.headers.origin || ''), upstreamPort)) {
+        socket.destroy();
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (front) => {
         if (!WebSocketCtor) { try { front.close(); } catch (_) {} return; }
-        const upstreamPort = cdp.port;
-        if (!upstreamPort) { try { front.close(); } catch (_) {} return; }
         const back = new WebSocketCtor('ws://127.0.0.1:' + upstreamPort + '/devtools/page/' + m[1]);
         let backReady = false;
         let keepAlive = null;
@@ -5119,6 +5462,7 @@ refreshAskModeIfEnabled();
 log('WorkBuddy 多账号切换器启动 (CDP 模式)');
 log(`登录信息文件: ${AUTH_FILE}`);
 log(`备份目录: ${DATA_DIR}`);
+updateDebug('daemon-start', { authFile: AUTH_FILE, dataDir: DATA_DIR, appPath: IS_WIN ? WORKDADDY_DIR_WIN : macWorkDaddyAppPath(), apiPort: UI_PORT_BASE });
 
 restoreSleepMode();
 startServer();

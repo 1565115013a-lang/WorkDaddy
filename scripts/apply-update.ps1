@@ -164,6 +164,17 @@ try {
   foreach ($required in @('scripts\daemon.js', 'scripts\launcher.cmd', 'scripts\win-launcher.js')) {
     if (-not (Test-Path (Join-Path $srcRoot $required) -PathType Leaf)) { throw "更新包缺少 $required" }
   }
+  $sourceDaemonText = Get-Content -LiteralPath (Join-Path $srcRoot 'scripts\daemon.js') -Raw
+  $sourceDaemonMatch = [regex]::Match($sourceDaemonText, "const DAEMON_VERSION = '([^']+)'")
+  $sourceDaemonVersion = if ($sourceDaemonMatch.Success) { $sourceDaemonMatch.Groups[1].Value } else { '' }
+  $packageName = [IO.Path]::GetFileNameWithoutExtension($SrcZip)
+  $packageVersionMatch = [regex]::Match($packageName, '([0-9]+\.[0-9]+\.[0-9]+)')
+  $packageVersion = if ($packageVersionMatch.Success) { $packageVersionMatch.Groups[1].Value } else { '' }
+  Write-ApplyLog "artifact inspect package=$packageName packageVersion=$packageVersion daemonVersion=$sourceDaemonVersion"
+  if ([string]::IsNullOrWhiteSpace($sourceDaemonVersion)) { throw '更新包 daemon.js 缺少 DAEMON_VERSION' }
+  if (-not [string]::IsNullOrWhiteSpace($packageVersion) -and $sourceDaemonVersion -ne $packageVersion) {
+    throw "更新包内部 daemon 版本 $sourceDaemonVersion 与文件目标版本 $packageVersion 不一致"
+  }
 
   New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
   & robocopy $srcRoot $AppDir /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
@@ -188,6 +199,11 @@ try {
     Start-Sleep -Seconds 1
   }
   if (-not $ready) { throw '新版 daemon 在 60 秒内未就绪' }
+  $runningVersion = [string]$status.version
+  Write-ApplyLog "running daemon version=$runningVersion expected=$packageVersion"
+  if (-not [string]::IsNullOrWhiteSpace($packageVersion) -and $runningVersion -ne $packageVersion) {
+    throw "新版 daemon 实际版本 $runningVersion 与目标版本 $packageVersion 不一致"
+  }
 
   if (Test-Path -LiteralPath $oldDir) {
     Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction SilentlyContinue

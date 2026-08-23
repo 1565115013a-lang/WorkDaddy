@@ -17,6 +17,34 @@ test('Windows updater launches the installed scripts launcher', () => {
   assert.match(script, /Invoke-RestMethod[\s\S]*\/api\/status/);
 });
 
+test('update status exposes the running daemon version so reboot polling can finish', () => {
+  const daemon = read('daemon.js');
+  const statusStart = daemon.indexOf("p === '/api/update-status'");
+  const statusEnd = daemon.indexOf("p === '/api/update-download'", statusStart);
+  assert.ok(statusStart >= 0 && statusEnd > statusStart);
+  const statusBlock = daemon.slice(statusStart, statusEnd);
+  assert.match(statusBlock, /version:\s*DAEMON_VERSION/);
+});
+
+test('update download starts asynchronously and reports transfer telemetry', () => {
+  const daemon = read('daemon.js');
+  const routeStart = daemon.indexOf("p === '/api/update-download'");
+  const routeEnd = daemon.indexOf("p === '/api/update-apply'", routeStart);
+  const statusStart = daemon.indexOf("p === '/api/update-status'");
+  const statusEnd = daemon.indexOf("p === '/api/update-download'", statusStart);
+  const statusBlock = daemon.slice(statusStart, statusEnd);
+  assert.ok(routeStart >= 0 && routeEnd > routeStart);
+  const route = daemon.slice(routeStart, routeEnd);
+  assert.match(route, /downloadUpdate\(\)\.then/);
+  assert.match(route, /return json\(res, 202/);
+  assert.match(daemon, /downloadRate/);
+  assert.match(daemon, /etaSeconds/);
+  assert.match(daemon, /downloadedBytes/);
+  assert.match(daemon, /totalBytes/);
+  assert.match(statusBlock, /downloadRate/);
+  assert.match(statusBlock, /etaSeconds/);
+});
+
 test('Windows updater stops the watchdog before waiting for the API port', () => {
   const script = read('apply-update.ps1');
   const stop = script.indexOf('function Stop-WatchdogAndPort');
@@ -42,11 +70,14 @@ test('Windows install and update release a locked launcher before replacing it',
 
 test('macOS updater stops the daemon before waiting for the API port', () => {
   const script = read('apply-update.sh');
-  const stop = script.indexOf('pkill -f');
+  const stop = script.indexOf('stop_daemons');
   const wait = script.indexOf('for i in $(seq 1 30)');
   assert.notEqual(stop, -1);
   assert.notEqual(wait, -1);
   assert.ok(stop < wait, 'daemon shutdown must precede the port wait');
+  assert.match(script, /PROFILE="\$\{6:-workbuddy-cn\}"/);
+  assert.match(script, /lsof -nP -ti tcp:/);
+  assert.match(script, /kill -TERM/);
 });
 
 test('updaters fail loudly and leave a durable attempt trail', () => {
@@ -173,6 +204,8 @@ test('release scripts package only WorkDaddy and WorkDaddy AI', () => {
   assert.match(win, /WorkDaddy AI\.lnk|PACKAGE_NAME="WorkDaddy AI"/);
   assert.match(win, /OUT="release\/windows\/WorkDaddy/);
   assert.match(mac, /PACKAGE_APP_NAME="WorkDaddy AI"/);
+  assert.match(mac, /Contents\/Resources\/scripts\/daemon\.js/);
+  assert.match(win, /BUILD_VERSION="\$VERSION"/);
   assert.match(installer, /\$lnkPath\s*=\s*Join-Path\s+\$desktopDir\s+\(\$productName\s+\+\s+'\.lnk'\)/);
 });
 
@@ -323,6 +356,109 @@ test('installers disable login auto-start and clean prior registrations', () => 
 test('daemon and Windows launcher logs identify the active WorkBuddy client', () => {
   assert.match(read('daemon.js'), /\[client=\$\{PROFILE\.name\}\] \[profile=\$\{PROFILE\.id\}\]/);
   assert.match(read('win-launcher.js'), /\[client=\$\{PROFILE\.name\}\] \[profile=\$\{PROFILE\.id\}\]/);
+});
+
+test('update card keeps the action button stable beside short progress text', () => {
+  const script = read('inject.js');
+  assert.match(script, /\.wbs-update-actions\{[^}]*min-width:0/);
+  assert.match(script, /\.wbs-update-btn\{[^}]*flex:0 0 112px/);
+  assert.match(script, /启动较慢，请稍候…/);
+  assert.doesNotMatch(script, /也可双击桌面 .* 图标手动启动/);
+});
+
+test('about page reports the running daemon version instead of stale package metadata', () => {
+  const daemon = read('daemon.js');
+  const aboutStart = daemon.indexOf("p === '/api/about'");
+  const updateStart = daemon.indexOf("p === '/api/update-check'", aboutStart);
+  assert.ok(aboutStart >= 0 && updateStart > aboutStart);
+  const about = daemon.slice(aboutStart, updateStart);
+  assert.match(about, /version:\s*DAEMON_VERSION/);
+  assert.match(about, /packageVersion/);
+  assert.doesNotMatch(about, /build\.version = pjson\.version/);
+});
+
+test('update failures preserve stage, attempt id, and apply log details for feedback', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(daemon, /attemptId: updateState\.attemptId/);
+  assert.match(daemon, /applyLog: path\.join\(UPDATE_DIR, 'apply\.log'\)/);
+  assert.match(inject, /formatUpdateFailure/);
+  assert.match(inject, /尝试 ID/);
+  assert.match(inject, /日志：/);
+  assert.match(inject, /rgba\(226,75,74,\.045\)/);
+});
+
+test('update diagnostics persist a redacted local debug log through every major stage', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(daemon, /UPDATE_DEBUG_LOG/);
+  assert.match(daemon, /function updateDebug/);
+  for (const stage of ['daemon-start', 'check-start', 'check-result', 'download-start', 'download-progress', 'download-verified', 'apply-start', 'apply-script-start']) {
+    assert.match(daemon, new RegExp("updateDebug\\('" + stage + "'"));
+  }
+  assert.match(daemon, /debugLog: UPDATE_DEBUG_LOG/);
+  assert.match(daemon, /token\|cookie\|authorization/);
+  assert.match(inject, /var runtimeVersion = WBS_VERSION/);
+});
+
+test('updaters reject an artifact whose internal daemon version disagrees with its release version', () => {
+  const daemon = read('daemon.js');
+  const win = read('apply-update.ps1');
+  assert.match(daemon, /inspectPackagedApp/);
+  assert.match(daemon, /安装包内部 daemon 版本/);
+  assert.match(daemon, /artifact-inspect/);
+  assert.match(win, /artifact inspect package=/);
+  assert.match(win, /更新包内部 daemon 版本/);
+  assert.match(win, /新版 daemon 实际版本/);
+});
+
+test('sensitive local API routes require an injected token and do not expose wildcard CORS', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(daemon, /API_TOKEN_FILE/);
+  assert.match(daemon, /X-WorkDaddy-Token/);
+  assert.match(daemon, /isApiRequestAuthorized/);
+  assert.match(daemon, /devtools-proxy.*Origin|Origin.*devtools-proxy/);
+  assert.doesNotMatch(daemon, /'Access-Control-Allow-Origin': '\*'/);
+  assert.match(inject, /__WBS_API_TOKEN__/);
+  assert.match(inject, /X-WorkDaddy-Token/);
+});
+
+test('DevTools proxy uses the same persisted CDP port fallback as its URL endpoint', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /const upstreamPort = cdp\.port \|\| readCdpPortFile\(\) \|\| CDP_PORT_HINT \|\| 9222/);
+  assert.match(daemon, /devtoolsPort = cdp\.port \|\| readCdpPortFile\(\) \|\| CDP_PORT_HINT \|\| 9222/);
+  assert.match(daemon, /uid\.length > 200.*\[\\\\\/\\0\]/);
+});
+
+test('automatic updates use the GitHub asset digest and fail closed without one', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /normalizeAssetSha256\(asset\.digest\)/);
+  assert.match(daemon, /dmgSha256/);
+  assert.match(daemon, /发布未提供可信的 SHA-256，已停止更新/);
+  assert.match(daemon, /validateUpdateArtifact\(target, expectSha\)/);
+});
+
+test('update downloads use a unique partial file before atomically promoting the package', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /const tempTarget = target \+ '\.part\.'/);
+  assert.match(daemon, /createWriteStream\(tempTarget/);
+  assert.match(daemon, /validateUpdateArtifact\(tempTarget, expectSha\)/);
+  assert.match(daemon, /renameSync\(tempTarget, target\)/);
+  assert.match(daemon, /updateDownloadPromise/);
+  assert.match(daemon, /try \{ digest = sha256File\(file\); \} catch \(e\) \{[\s\S]*安装包 SHA-256 读取失败/);
+});
+
+test('account export asks for a non-empty password and import supports an optional password', () => {
+  const daemon = read('daemon.js');
+  const inject = read('inject.js');
+  assert.match(daemon, /password.*不能为空|导出密码不能为空/);
+  assert.match(daemon, /randomBytes\(16\)/);
+  assert.match(daemon, /version:\s*2/);
+  assert.match(daemon, /EXPORT_PASSPHRASE/);
+  assert.match(inject, /导出账号.*密码/);
+  assert.match(inject, /导入密码可留空/);
+  assert.match(inject, /type="password"/);
 });
 
 test('zero credits omit the empty-state label', () => {
