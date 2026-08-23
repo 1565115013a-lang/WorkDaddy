@@ -16,6 +16,10 @@ else
 fi
 
 VERSION="${WORKDADDY_BUILD_VERSION:-$(grep -o "DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "错误：发布版本必须是 x.y.z，实际为 ${VERSION}" >&2
+  exit 2
+fi
 PROFILE="${WORKDADDY_BUILD_PROFILE:-}"
 if [ -z "$PROFILE" ]; then
   for profile in workbuddy-cn workbuddy-ai; do
@@ -102,8 +106,27 @@ daemon = os.path.join(scripts, 'daemon.js')
 with open(daemon, encoding='utf-8') as f:
     s = f.read()
 s = re.sub(r"(const DAEMON_VERSION = ')[^']+(';)", r"\g<1>" + build_version + r"\g<2>", s, count=1)
+
+# Build ID 也必须跟随发布版本。保留日期/功能后缀用于区分同版本构建，
+# 只替换 release- 后面的 x.y.z，避免旧源码残留例如 release-1.0.13。
+build_id = re.search(r"const DAEMON_BUILD_ID = '([^']+)'", s)
+if not build_id:
+    raise SystemExit('daemon.js 缺少 DAEMON_BUILD_ID')
+current_build_id = build_id.group(1)
+if current_build_id.startswith('release-'):
+    suffix = current_build_id[len('release-'):]
+    suffix = re.sub(r'^\d+\.\d+\.\d+(?=-|$)', build_version, suffix, count=1)
+    next_build_id = 'release-' + suffix
+else:
+    raise SystemExit('DAEMON_BUILD_ID 格式必须为 release-x.y.z-...')
+s = re.sub(r"(const DAEMON_BUILD_ID = ')[^']+(';)", r"\g<1>" + next_build_id + r"\g<2>", s, count=1)
 with open(daemon, 'w', encoding='utf-8', newline='') as f:
     f.write(s)
+
+if not re.search(r"const DAEMON_VERSION = '" + re.escape(build_version) + r"';", s):
+    raise SystemExit('staged daemon.js DAEMON_VERSION 与包版本不一致')
+if not re.search(r"const DAEMON_BUILD_ID = 'release-" + re.escape(build_version) + r"(?:-|');", s):
+    raise SystemExit('staged daemon.js DAEMON_BUILD_ID 与包版本不一致')
 
 # 同步可选 package.json 的版本元数据，避免旧壳版本覆盖关于页展示。
 package_json = os.path.join(scripts, 'package.json')

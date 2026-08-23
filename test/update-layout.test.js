@@ -209,6 +209,21 @@ test('release scripts package only WorkDaddy and WorkDaddy AI', () => {
   assert.match(installer, /\$lnkPath\s*=\s*Join-Path\s+\$desktopDir\s+\(\$productName\s+\+\s+'\.lnk'\)/);
 });
 
+test('release scripts synchronize daemon version and build id', () => {
+  const daemon = read('daemon.js');
+  const win = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  const mac = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
+  const version = daemon.match(/const DAEMON_VERSION = '([^']+)'/);
+  const buildId = daemon.match(/const DAEMON_BUILD_ID = '([^']+)'/);
+  assert.ok(version && buildId);
+  assert.ok(buildId[1].startsWith(`release-${version[1]}-`), 'source Build ID must use the source daemon version');
+  assert.match(win, /DAEMON_BUILD_ID/);
+  assert.match(win, /release-.*DAEMON_BUILD_ID|DAEMON_BUILD_ID.*release-/s);
+  assert.match(win, /staged daemon\.js DAEMON_BUILD_ID/);
+  assert.match(mac, /const DAEMON_BUILD_ID = 'release-/);
+  assert.match(mac, /产物 daemon\.js 的版本或 Build ID/);
+});
+
 test('Windows launcher verifies the real WorkBuddy process tree and launch arguments', () => {
   const launcher = read('win-launcher.js');
   assert.match(launcher, /Get-CimInstance Win32_Process/);

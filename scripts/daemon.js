@@ -134,11 +134,14 @@ const DATA_DIR = defaultDataDir();
 // 1.0.19：官方模型批量删除、模型卡片稳定布局与固定 650px 面板
 // 1.0.20：模型卡片悬浮操作、官方连通测试、完整长度脱敏 API Key
 // 1.0.21：模型页改为当前/备选模型列表风格，去除刷新入口并优化字段排版
+// 1.0.15：新增「免打扰」模块（增强页）：基于 WorkBuddy 官方 sandbox 配置通道的 5 个开关，
+//        写入 ~/.workbuddy/settings.json 的 sandbox 域（excludedCommands/extraAllowWrite/
+//        批量删除阈值/删除保护）+ 弹窗自动点允许兜底（含审计）。
 // 1.0.9：WorkBuddy / WorkBuddy AI profile 隔离；修复 Windows launcher 的本地端口探测、
 //        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
 // 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
-const DAEMON_VERSION = '1.0.13';
-const DAEMON_BUILD_ID = 'release-1.0.13-20260823-security4';
+const DAEMON_VERSION = '1.0.15';
+const DAEMON_BUILD_ID = 'release-1.0.15-20260823-no-disturb';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -2766,6 +2769,130 @@ function refreshAskModeIfEnabled() {
   }
 }
 
+/* ================= 免打扰模块（No-Disturb）：基于 WorkBuddy 官方 sandbox 配置通道 ================= */
+// 原理（逆向 app.asar 内 cli/dist/codebuddy.js）：
+//  - CLI 的沙箱入口 shouldSandbox() 读 settings.json 的 sandbox 键：命中 excludedCommands 直接本地执行，
+//    根本走不到 systemToolPolicy / 越界审批 → 「常用命令行免确认」「系统级工具放行」由它实现。
+//  - extraAllowWrite 在 loadConfig 时并入 filesystem.allowWrite → 「沙箱外写文件免确认」由它实现。
+//  - 批量删除保护（safeDelete bulk guard）：sandbox.safeDeleteBulkThreshold / dataSecurity.batchDeleteApprovalThreshold
+//    阈值拉满 + 强制 safeDeleteRuntimeEnabled（删除进废纸篓）= 「大批量删除免确认」。
+//  - 开关状态记录在 settings.wbs.noDisturb（WorkDaddy 自有命名空间，与 CLI 配置互不干扰）。
+const WBS_SYSTEM_LEVEL_TOOLS = ['wsl', 'wsl.exe', 'wslconfig', 'wslconfig.exe', 'wmic', 'wmic.exe', 'sc', 'sc.exe', 'reg', 'reg.exe', 'schtasks', 'schtasks.exe'];
+const WBS_COMMON_EXCLUDED_CMDS = ['npm', 'pnpm', 'yarn', 'npx', 'node', 'python3', 'python', 'git', 'curl', 'wget', 'brew'];
+const WBS_EXTRA_ALLOW_WRITE = ['/tmp', '/var/tmp', '~/Downloads', '~/Desktop', '~/Documents', '~/Pictures', '~/Movies', '~/Music'];
+const WBS_NO_DISTURB_NS = 'noDisturb';
+const WBS_SWITCH_NAMES = ['outsideWrite', 'commands', 'bulkDelete', 'systemTools', 'autoApprove'];
+
+function readNoDisturbState() {
+  const settings = readWorkbuddySettings();
+  const ns = settings.wbs && settings.wbs[WBS_NO_DISTURB_NS];
+  const state = (ns && ns.state && typeof ns.state === 'object') ? ns.state : {};
+  const switches = {};
+  for (const name of WBS_SWITCH_NAMES) switches[name] = !!state[name];
+  return switches;
+}
+
+function removeListItems(arr, items) {
+  if (!Array.isArray(arr)) return arr;
+  const drop = new Set(items);
+  return arr.filter(function (x) { return !drop.has(x); });
+}
+
+function ensureSandboxObj(settings) {
+  if (!settings.sandbox || typeof settings.sandbox !== 'object') settings.sandbox = {};
+  return settings.sandbox;
+}
+
+/**
+ * 把「开启/关闭」应用到 settings 的 sandbox 域。
+ * ns.added 记录「本次由免打扰新增的数组项」→ 关闭时只回滚新增项，绝不删除用户原有配置。
+ */
+function applyNoDisturbSwitch(settings, ns, name, enabled) {
+  const sb = ensureSandboxObj(settings);
+  // 开启：合并清单 + 首次记录新增项（幂等开启不得覆盖已有记录）；
+  // 关闭：仅回滚「本次新增」，绝不删除用户原有项。
+  const recordAndMerge = function (key, items) {
+    const cur = Array.isArray(sb[key]) ? sb[key] : [];
+    const newAdded = items.filter(function (x) { return !cur.includes(x); });
+    if (!Array.isArray(ns.added[name]) || !ns.added[name].length) ns.added[name] = newAdded;
+    return Array.from(new Set(cur.concat(items)));
+  };
+  const rollback = function (key, items) {
+    const cur = Array.isArray(sb[key]) ? sb[key] : [];
+    const added = ns.added[name];
+    // 有新增记录 → 只移除新增项；历史配置无记录时退化为整清单移除
+    const drop = new Set(added && added.length ? added : items);
+    return cur.filter(function (x) { return !drop.has(x); });
+  };
+  if (name === 'outsideWrite') {
+    if (enabled) {
+      sb.extraAllowWrite = recordAndMerge('extraAllowWrite', WBS_EXTRA_ALLOW_WRITE);
+    } else {
+      sb.extraAllowWrite = rollback('extraAllowWrite', WBS_EXTRA_ALLOW_WRITE);
+      delete ns.added[name];
+    }
+  } else if (name === 'commands') {
+    if (enabled) {
+      sb.excludedCommands = recordAndMerge('excludedCommands', WBS_COMMON_EXCLUDED_CMDS);
+    } else {
+      sb.excludedCommands = rollback('excludedCommands', WBS_COMMON_EXCLUDED_CMDS);
+      delete ns.added[name];
+    }
+  } else if (name === 'systemTools') {
+    if (enabled) {
+      sb.excludedCommands = recordAndMerge('excludedCommands', WBS_SYSTEM_LEVEL_TOOLS);
+    } else {
+      sb.excludedCommands = rollback('excludedCommands', WBS_SYSTEM_LEVEL_TOOLS);
+      delete ns.added[name];
+    }
+  } else if (name === 'bulkDelete') {
+    if (enabled) {
+      // 批量阈值拉满（双写保证 CLI 或数据安全策略任一通道生效）
+      sb.safeDeleteBulkThreshold = 99999;
+      if (!sb.dataSecurity || typeof sb.dataSecurity !== 'object') sb.dataSecurity = {};
+      sb.dataSecurity.batchDeleteApprovalThreshold = 99999;
+      // 安全底线：删除必须先进废纸篓/回收站，强制开启删除保护
+      sb.safeDeleteRuntimeEnabled = true;
+      if (!sb.fileBackup || typeof sb.fileBackup !== 'object') sb.fileBackup = {};
+      sb.fileBackup.enabled = true;
+    } else {
+      // 移除免打扰写入的字段，回到 CLI/UI 默认（safeDeleteRuntimeEnabled CLI 默认 true，删除保护保留）
+      delete sb.safeDeleteBulkThreshold;
+      if (sb.dataSecurity && typeof sb.dataSecurity === 'object') delete sb.dataSecurity.batchDeleteApprovalThreshold;
+    }
+  }
+  // autoApprove 不写 CLI 配置，仅记录状态（前端据此启动兜底自动点允许）
+}
+
+/** 读-改-写（整文件原子替换），并维护 wbs.noDisturb.state */
+function setNoDisturbSwitch(name, enabled) {
+  if (WBS_SWITCH_NAMES.indexOf(name) === -1) throw new Error('未知开关: ' + name);
+  const settings = readWorkbuddySettings();
+  if (!settings.wbs || typeof settings.wbs !== 'object') settings.wbs = {};
+  if (!settings.wbs[WBS_NO_DISTURB_NS] || typeof settings.wbs[WBS_NO_DISTURB_NS] !== 'object') settings.wbs[WBS_NO_DISTURB_NS] = {};
+  const ns = settings.wbs[WBS_NO_DISTURB_NS];
+  if (!ns.state || typeof ns.state !== 'object') ns.state = {};
+  if (!ns.added || typeof ns.added !== 'object') ns.added = {};
+  applyNoDisturbSwitch(settings, ns, name, enabled);
+  ns.state[name] = !!enabled;
+  writeWorkbuddySettings(settings);
+  log('[no-disturb] 开关「' + name + '」已' + (enabled ? '开启' : '关闭'));
+  return readNoDisturbState();
+}
+
+function noDisturbAudit(entry) {
+  try {
+    const file = path.join(PROFILE.dataRoot, 'audit-log', 'no-disturb.jsonl');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const line = JSON.stringify(Object.assign({ ts: new Date().toISOString() }, entry || {}));
+    fs.appendFileSync(file, line + '\n', 'utf8');
+    return true;
+  } catch (e) {
+    log('[no-disturb] 审计写入失败: ' + e.message);
+    return false;
+  }
+}
+
 function currentAccount() {
   if (!PROFILE.capabilities.accounts || !AUTH_FILE) return null;
   try {
@@ -3944,6 +4071,35 @@ function handleApi(req, res) {
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }
+    });
+  }
+
+  // 免打扰模块：GET /api/no-disturb（读全部开关状态）
+  if (req.method === 'GET' && p === '/api/no-disturb') {
+    return json(res, 200, { ok: true, switches: readNoDisturbState() });
+  }
+
+  // 免打扰模块：POST /api/no-disturb-set { name, enabled }
+  if (req.method === 'POST' && p === '/api/no-disturb-set') {
+    return readBody(req).then((body) => {
+      try {
+        const switches = setNoDisturbSwitch(String(body.name || ''), !!body.enabled);
+        return json(res, 200, { ok: true, switches });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+
+  // 免打扰模块：POST /api/no-disturb-audit（弹窗自动点允许的审计记录）
+  if (req.method === 'POST' && p === '/api/no-disturb-audit') {
+    return readBody(req).then((body) => {
+      const ok = noDisturbAudit({
+        action: body.action === 'approve' ? 'auto-approve' : String(body.action || 'unknown'),
+        matched: typeof body.matched === 'string' ? body.matched.slice(0, 200) : '',
+        url: typeof body.url === 'string' ? body.url.slice(0, 300) : '',
+      });
+      return json(res, 200, { ok });
     });
   }
 

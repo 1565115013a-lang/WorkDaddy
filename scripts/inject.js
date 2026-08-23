@@ -44,8 +44,32 @@ function createBuildLifecycle() {
   };
 }
 
+// Keep the decision logic independent from DOM selectors so it can be regression-tested.
+// `suspected` is intentionally conservative: it asks for human review instead of sending
+// another prompt automatically when a provider stops without an explicit error.
+function classifySessionHealth(snapshot) {
+  var s = snapshot || {};
+  if (s.blocked) return { status: 'blocked', confidence: 'high', reason: 'decision-prompt' };
+  if (s.error || s.networkFailure) return { status: 'error', confidence: 'high', reason: s.networkFailure ? 'network-failure' : 'error-ui' };
+  if (!s.observed) return { status: 'idle', confidence: 'none', reason: 'not-observed' };
+  if (s.busy) return { status: 'running', confidence: 'high', reason: 'generation-active' };
+  if (s.manualStop) return { status: 'stopped', confidence: 'high', reason: 'manual-stop' };
+  if (Number(s.idleForMs || 0) < 2500) return { status: 'settling', confidence: 'low', reason: 'settling' };
+  if (s.completionMarker) return { status: 'completed', confidence: 'high', reason: 'completion-marker' };
+  if (s.hasAssistant && s.assistantChanged !== false && s.hasCompletionActions && Number(s.assistantTextLength || 0) > 0) {
+    return { status: 'completed', confidence: 'medium', reason: 'assistant-actions' };
+  }
+  if ((!s.hasAssistant || Number(s.assistantTextLength || 0) === 0) && Number(s.idleForMs || 0) >= 8000) {
+    return { status: 'suspected', confidence: 'medium', reason: 'empty-assistant' };
+  }
+  if (s.looksTruncated || Number(s.idleForMs || 0) >= 8000) {
+    return { status: 'suspected', confidence: 'low', reason: s.looksTruncated ? 'truncated-assistant' : 'idle-without-completion' };
+  }
+  return { status: 'settling', confidence: 'low', reason: 'no-completion-evidence' };
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { createBuildLifecycle: createBuildLifecycle };
+  module.exports = { createBuildLifecycle: createBuildLifecycle, classifySessionHealth: classifySessionHealth };
 }
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 (function () {
@@ -463,6 +487,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var sleepSyncTimer = null;
     var avatarTimer = null;
     var debugTimer = null;
+    var sessionHealthTimer = null;
+    var sessionHealth = {
+      sessionId: null,
+      observed: false,
+      generationAt: 0,
+      lastBusyAt: 0,
+      baselineAssistantNode: null,
+      baselineAssistantTextLength: 0,
+      lastStatus: 'idle',
+      result: { status: 'idle', confidence: 'none', reason: 'not-observed' },
+    };
 
     function removeTimer(list, id) {
       var index = list.indexOf(id);
@@ -504,6 +539,166 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         t.classList.add('out');
         setBuildTimeout(function () { t.remove(); }, 300);
       }, 4200);
+    }
+
+    function isVisibleHealthNode(node) {
+      if (!node || !node.isConnected || (node.closest && node.closest('.wbs-root'))) return false;
+      var r = node.getBoundingClientRect && node.getBoundingClientRect();
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+      var cs = getComputedStyle(node);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+    }
+
+    function findBlockingPrompt() {
+      var selectors = [
+        '[role="dialog"]', '[class*="_dialog_"]', '[class*="_modal_"]', '[class*="_permission_"]',
+        '[class*="_confirm_"]', '[class*="_decision_"]', '[class*="_approval_"]', '[class*="_question_"]', '[class*="_ask_"]',
+        '[class*="permission-dialog"]', '[class*="confirm-dialog"]', '[class*="decision-dialog"]',
+      ];
+      var nodes = [];
+      for (var i = 0; i < selectors.length; i++) {
+        var found = document.querySelectorAll(selectors[i]);
+        for (var j = 0; j < found.length; j++) if (nodes.indexOf(found[j]) < 0) nodes.push(found[j]);
+      }
+      for (var k = nodes.length - 1; k >= 0; k--) {
+        var node = nodes[k];
+        if (!isVisibleHealthNode(node)) continue;
+        var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 1800) continue;
+        var buttons = Array.prototype.map.call(node.querySelectorAll('button,[role="button"]'), function (b) {
+          return String(b.innerText || b.getAttribute('aria-label') || b.getAttribute('title') || '').trim();
+        }).join(' ');
+        var asks = /(确认|允许|授权|批准|执行|需要.*选择|是否继续|allow|approve|confirm|permission|continue)/i.test(text);
+        var actions = /(允许|确认|批准|拒绝|取消|继续|是|否|allow|approve|deny|cancel|continue)/i.test(buttons);
+        if (asks && actions) return { node: node, text: text.slice(0, 160) };
+      }
+      return null;
+    }
+
+    function findSessionError() {
+      var selectors = [
+        '[role="alert"]', '[class*="errorBanner"]', '[class*="_errorBanner_"]', '[class*="_retryBtn_"]', '[class*="_error_"]', '[class*="_failed_"]',
+        '[class*="error-message"]', '[class*="errorMessage"]',
+      ];
+      var nodes = [];
+      for (var i = 0; i < selectors.length; i++) {
+        var found = document.querySelectorAll(selectors[i]);
+        for (var j = 0; j < found.length; j++) if (nodes.indexOf(found[j]) < 0) nodes.push(found[j]);
+      }
+      for (var k = nodes.length - 1; k >= 0; k--) {
+        var node = nodes[k];
+        if (!isVisibleHealthNode(node)) continue;
+        var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!text || !/(错误|失败|重试|超时|限流|429|5\d\d|error|failed|retry|timeout|rate limit)/i.test(text)) continue;
+        return { node: node, text: text.slice(0, 160) };
+      }
+      return null;
+    }
+
+    function readAssistantHealth() {
+      var selectors = [
+        '[data-message-role="assistant"]', '[data-role="assistant"]', '[class*="assistantMessage"]',
+        '[class*="_assistantMessage_"]', '[class*="assistant-message"]', '[class*="_assistant_"] .cb-markdown',
+        '.cb-markdown[data-md-theme="answer"]', '.cb-markdown',
+      ];
+      var nodes = [];
+      for (var i = 0; i < selectors.length; i++) {
+        var found = document.querySelectorAll(selectors[i]);
+        for (var j = 0; j < found.length; j++) if (nodes.indexOf(found[j]) < 0 && isVisibleHealthNode(found[j])) nodes.push(found[j]);
+      }
+      if (!nodes.length) return { node: null, previousNode: null, hasAssistant: false, assistantTextLength: 0, hasCompletionActions: false, completionMarker: false, looksTruncated: false, streaming: false };
+      var node = nodes[nodes.length - 1];
+      var previousNode = nodes.length > 1 ? nodes[nodes.length - 2] : null;
+      var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      var cls = String(node.className || '');
+      var streaming = /(streaming|loading|generating|typing)/i.test(cls);
+      var actionRoot = node;
+      for (var up = 0; up < 5 && actionRoot.parentElement; up++) {
+        actionRoot = actionRoot.parentElement;
+        var actionText = Array.prototype.map.call(actionRoot.querySelectorAll('button,[role="button"], [class*="action"], [class*="toolbar"]'), function (b) {
+          return String(b.innerText || b.getAttribute('aria-label') || b.getAttribute('title') || '').trim();
+        }).join(' ');
+        if (/(复制|重试|重新生成|继续|copy|retry|regenerate|continue)/i.test(actionText)) {
+          return { node: node, previousNode: previousNode, hasAssistant: true, assistantTextLength: text.length, hasCompletionActions: true, completionMarker: /<!--\s*WBS_DONE\s*-->|\bWBS_DONE\b/i.test(text), looksTruncated: false, streaming: streaming };
+        }
+      }
+      var looksTruncated = /(\.\.\.|…|正在$|等待$|调用$|执行$|结果如下[:：]?$|[,，:：]$)/.test(text);
+      return { node: node, previousNode: previousNode, hasAssistant: true, assistantTextLength: text.length, hasCompletionActions: false, completionMarker: /<!--\s*WBS_DONE\s*-->|\bWBS_DONE\b/i.test(text), looksTruncated: looksTruncated, streaming: streaming };
+    }
+
+    function setSessionHealthResult(result) {
+      sessionHealth.result = result;
+      var statusEl = root && root.querySelector ? root.querySelector('#wbs-health-status') : null;
+      var dot = root && root.querySelector ? root.querySelector('.wbs-fab-health-dot') : null;
+      var labels = { blocked: '等待确认', error: '会话错误', suspected: '疑似未完成', running: '运行中', completed: '已完成', stopped: '已停止', settling: '整理中', idle: '' };
+      var label = labels[result.status] !== undefined ? labels[result.status] : result.status;
+      if (statusEl) {
+        statusEl.textContent = label;
+        statusEl.className = 'wbs-health-status ' + result.status;
+        statusEl.title = result.status === 'suspected' ? '回复已停止，但没有发现明确完成证据' : (result.reason || '');
+      }
+      if (dot) {
+        dot.className = 'wbs-fab-health-dot ' + result.status;
+        dot.title = label || '会话状态';
+        dot.style.display = result.status === 'idle' || result.status === 'completed' ? 'none' : '';
+      }
+      if (result.status !== sessionHealth.lastStatus && (result.status === 'blocked' || result.status === 'error' || result.status === 'suspected')) {
+        var msg = result.status === 'blocked' ? '会话正在等待决策确认' : result.status === 'error' ? '会话出现模型或网络错误' : '会话疑似异常停止，请检查结尾内容';
+        toast(msg, result.status === 'error', root);
+      }
+      sessionHealth.lastStatus = result.status;
+    }
+
+    function scanSessionHealth() {
+      if (!alive) return;
+      var sid = getConversationId();
+      if (sid !== sessionHealth.sessionId) {
+        sessionHealth.sessionId = sid;
+        sessionHealth.observed = false;
+        sessionHealth.manualStop = false;
+        sessionHealth.generationAt = 0;
+        sessionHealth.lastBusyAt = 0;
+        sessionHealth.baselineAssistantNode = null;
+        sessionHealth.baselineAssistantTextLength = 0;
+        sessionHealth.lastStatus = 'idle';
+      }
+      var blocked = findBlockingPrompt();
+      var error = findSessionError();
+      var busy = isAiBusy();
+      var assistant = readAssistantHealth();
+      if ((blocked || error) && !sessionHealth.observed) {
+        sessionHealth.observed = true;
+        sessionHealth.generationAt = Date.now() - 3000;
+        sessionHealth.lastBusyAt = Date.now() - 3000;
+        sessionHealth.baselineAssistantNode = assistant.node;
+        sessionHealth.baselineAssistantTextLength = assistant.assistantTextLength;
+      }
+      if (busy && !sessionHealth.observed) {
+        sessionHealth.observed = true;
+        sessionHealth.generationAt = Date.now();
+        sessionHealth.baselineAssistantNode = assistant.streaming ? assistant.previousNode : assistant.node;
+        sessionHealth.baselineAssistantTextLength = assistant.streaming && assistant.previousNode ? Number(assistant.previousNode.textContent || '').length : assistant.assistantTextLength;
+      }
+      if (busy) sessionHealth.lastBusyAt = Date.now();
+      var assistantChanged = !sessionHealth.baselineAssistantNode
+        ? (assistant.hasAssistant && assistant.assistantTextLength > 0)
+        : (assistant.node !== sessionHealth.baselineAssistantNode || assistant.assistantTextLength > sessionHealth.baselineAssistantTextLength);
+      var idleForMs = sessionHealth.lastBusyAt ? Date.now() - sessionHealth.lastBusyAt : Date.now() - sessionHealth.generationAt;
+      var result = classifySessionHealth({
+        observed: sessionHealth.observed,
+        blocked: !!blocked,
+        error: !!error,
+        busy: busy,
+        idleForMs: idleForMs,
+        hasAssistant: assistant.hasAssistant,
+        assistantChanged: assistantChanged,
+        assistantTextLength: assistant.assistantTextLength,
+        hasCompletionActions: assistant.hasCompletionActions,
+        completionMarker: assistant.completionMarker,
+        looksTruncated: assistant.looksTruncated,
+        manualStop: !!sessionHealth.manualStop,
+      });
+      setSessionHealthResult(result);
     }
 
     registerDisposer(function () {
@@ -592,6 +787,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     root.innerHTML = [
       '<div class="wbs-fab" title="' + WBS_BRAND + '">',
       '<span class="wbs-fab-sleep-dot" title="防休眠未开启"></span>',
+      '<span class="wbs-fab-health-dot" title="会话状态" style="display:none"></span>',
       '<div class="click">',
       '<span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>',
       '<button class="button up" type="button" aria-label="Codex 助手">',
@@ -610,6 +806,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<div class="wbs-head">',
       '<div class="wbs-head-left">',
       '<div class="wbs-title" id="wbs-title" title="连续点击 5 次呼出元素检查">' + WBS_BRAND + '</div>',
+      '<span class="wbs-health-status" id="wbs-health-status" aria-live="polite"></span>',
       '<a class="wbs-ghbtn" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" title="GitHub 仓库">',
       '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>',
       '</a>',
@@ -622,6 +819,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<button class="wbs-tab" type="button" data-tab="sessions"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>会话</span></button>',
       '<button class="wbs-tab" type="button" data-tab="models"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg><span>模型</span></button>',
       '<button class="wbs-tab" type="button" data-tab="enhance"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span>增强</span></button>',
+      '<button class="wbs-tab" type="button" data-tab="pc"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg><span>电脑</span></button>',
       '<button class="wbs-tab" type="button" data-tab="about"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg><span>关于</span></button>',
       '</div>',
       '<div class="wbs-body">',
@@ -630,6 +828,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<div class="wbs-pane" data-pane="sessions"></div>',
       '<div class="wbs-pane" data-pane="models"></div>',
       '<div class="wbs-pane" data-pane="enhance"></div>',
+      '<div class="wbs-pane" data-pane="pc"></div>',
       '<div class="wbs-pane" data-pane="about"></div>',
       '</div>',
       '</div>',
@@ -1517,6 +1716,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var sessionsPane = root.querySelector('[data-pane="sessions"]');
     var modelsPane = root.querySelector('[data-pane="models"]');
     var enhancePane = root.querySelector('[data-pane="enhance"]');
+    var pcPane = root.querySelector('[data-pane="pc"]');
     var aboutPane = root.querySelector('[data-pane="about"]');
     var logoutBtn = root.querySelector('[data-act="logout"]');
     var creditTooltip = null;
@@ -1706,6 +1906,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (name === 'sessions' && sessionsPane && !sessionsPane.dataset.built) buildSessionsPane();
       if (name === 'models' && modelsPane && !modelsPane.dataset.built) buildModelsPane();
       if (name === 'enhance' && enhancePane && !enhancePane.dataset.built) buildEnhancePane();
+      if (name === 'pc' && pcPane && !pcPane.dataset.built) buildPcPane();
       if (name === 'about' && aboutPane && !aboutPane.dataset.built) buildAboutPane();
     }
     var tabBtns = root.querySelectorAll('.wbs-tab');
@@ -2653,23 +2854,46 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!enhancePane) return;
       enhancePane.dataset.built = '1';
       enhancePane.innerHTML =
-        '<div class="wbs-pcard">' +
+        '<div class="wbs-pcard" id="wbs-no-disturb-card">' +
+        '<div class="wbs-pcard-title wbs-nd-head">' +
+        '<span>免打扰</span>' +
+        '<span class="wbs-pcard-sub" id="wbs-nd-count"></span>' +
+        '<span class="wbs-nd-all-wrap" title="一键批量开启/关闭全部免打扰开关">' +
+        '<label class="wbs-switch wbs-nd-all-switch"><input type="checkbox" id="wbs-nd-all"><span class="wbs-switch-slider"></span></label>' +
+        '<span class="wbs-nd-all-label">全部开</span>' +
+        '</span>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">沙箱外写文件免确认</span>' +
+        '<span class="wbs-nd-hint">工作区外文件直接读写</span>' +
+        '<label class="wbs-switch" title="开启后 AI 可直接读写工作区外的文件（包括文稿、下载目录、配置），不再逐一确认"><input type="checkbox" id="wbs-nd-outside"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">常用命令行免确认</span>' +
+        '<span class="wbs-nd-hint">常用命令直接执行</span>' +
+        '<label class="wbs-switch" title="开启后 npm、git、curl、python3 等常用命令直接本地执行，不再先进沙箱"><input type="checkbox" id="wbs-nd-commands"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">大批量删除免确认</span>' +
+        '<span class="wbs-nd-hint">批量删除直接进回收站</span>' +
+        '<label class="wbs-switch" title="开启后批量删除不再弹确认；为防误删，所有删除强制先进废纸篓/回收站"><input type="checkbox" id="wbs-nd-bulk"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">系统级工具放行</span>' +
+        '<span class="wbs-nd-hint">系统管理命令直接执行</span>' +
+        '<label class="wbs-switch" title="开启后 wsl、reg、sc、schtasks 等系统管理工具直接运行，不再确认"><input type="checkbox" id="wbs-nd-systools"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">弹窗自动点允许</span>' +
+        '<span class="wbs-nd-hint">确认弹窗自动允许</span>' +
+        '<label class="wbs-switch" title="开启后仍有确认弹窗时自动替你点「允许」，所有自动批准记录在审计日志"><input type="checkbox" id="wbs-nd-auto"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '</div>' +
+        '<div class="wbs-pcard" id="wbs-ask-card" style="display:none">' +
         '<div class="wbs-pcard-title">决策弹窗</div>' +
         '<div class="wbs-ask-row">' +
         '<label class="wbs-ask-label" for="wbs-ask-switch">用弹窗提问<span class="wbs-ask-hint">需要我决策时弹窗确认（全局生效）</span></label>' +
         '<label class="wbs-switch" title="开启后 WorkBuddy 需要你决策时会用弹窗提问（写入全局自定义指令，所有会话生效）"><input type="checkbox" id="wbs-ask-switch"><span class="wbs-switch-slider"></span></label>' +
-        '</div>' +
-        '</div>' +
-        '<div class="wbs-pcard" id="wbs-sleep-card">' +
-        '<div class="wbs-pcard-title">电脑休眠</div>' +
-        '<div class="wbs-sleep-modes" id="wbs-sleep-modes">' +
-        '<label class="wbs-sleep-mode"><input type="radio" name="wbs-sleep-mode" value="allow"><span class="wbs-sleep-mode-name">允许电脑休眠</span><span class="wbs-sleep-mode-hint">系统默认，空闲后正常休眠</span></label>' +
-        '<label class="wbs-sleep-mode"><input type="radio" name="wbs-sleep-mode" value="keep"><span class="wbs-sleep-mode-name">持续禁止休眠</span><span class="wbs-sleep-mode-hint">保持唤醒，防黑屏锁屏</span></label>' +
-        '<label class="wbs-sleep-mode"><input type="radio" name="wbs-sleep-mode" value="until-done"><span class="wbs-sleep-mode-name">所有任务结束后允许休眠</span><span class="wbs-sleep-mode-hint">AI 忙碌时保持唤醒，结束自动恢复</span></label>' +
-        '</div>' +
-        '<div class="wbs-ask-row" id="wbs-display-sleep-row" style="display:none">' +
-        '<label class="wbs-ask-label" for="wbs-display-switch">允许显示器休眠<span class="wbs-ask-hint">禁止休眠时，是否允许显示器单独黑屏</span></label>' +
-        '<label class="wbs-switch" title="开启后仅阻止系统睡眠，显示器可黑屏省电"><input type="checkbox" id="wbs-display-switch"><span class="wbs-switch-slider"></span></label>' +
         '</div>' +
         '</div>' +
         '<div class="wbs-pcard" id="wbs-devtools-card" style="display:none">' +
@@ -2681,6 +2905,47 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div class="wbs-enh-tip">连续点击面板标题「' + WBS_BRAND + '」5 次可隐藏/呼出本模块</div>' +
         '</div>';
       wireEnhancePane();
+    }
+
+    // 电脑 pane：休眠设置（从增强页迁出，单独 Tab)
+    function buildPcPane() {
+      if (!pcPane) return;
+      pcPane.dataset.built = '1';
+      pcPane.innerHTML =
+        '<div class="wbs-pcard">' +
+        '<div class="wbs-pcard-title">电脑休眠</div>' +
+        '<div class="wbs-sleep-modes" id="wbs-sleep-modes">' +
+        '<label class="wbs-sleep-mode"><input type="radio" name="wbs-sleep-mode" value="allow"><span class="wbs-sleep-mode-name">允许电脑休眠</span><span class="wbs-sleep-mode-hint">系统默认，空闲后正常休眠</span></label>' +
+        '<label class="wbs-sleep-mode"><input type="radio" name="wbs-sleep-mode" value="keep"><span class="wbs-sleep-mode-name">持续禁止休眠</span><span class="wbs-sleep-mode-hint">保持唤醒，防黑屏锁屏</span></label>' +
+        '<label class="wbs-sleep-mode"><input type="radio" name="wbs-sleep-mode" value="until-done"><span class="wbs-sleep-mode-name">所有任务结束后允许休眠</span><span class="wbs-sleep-mode-hint">AI 忙碌时保持唤醒，结束自动恢复</span></label>' +
+        '</div>' +
+        '<div class="wbs-ask-row" id="wbs-display-sleep-row" style="display:none">' +
+        '<label class="wbs-ask-label" for="wbs-display-switch">允许显示器休眠<span class="wbs-ask-hint">禁止休眠时，是否允许显示器单独黑屏</span></label>' +
+        '<label class="wbs-switch" title="开启后仅阻止系统睡眠，显示器可黑屏省电"><input type="checkbox" id="wbs-display-switch"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '</div>';
+      wirePcPane();
+    }
+
+    function wirePcPane() {
+      var sleepModeRadios = pcPane && pcPane.querySelectorAll('input[name="wbs-sleep-mode"]');
+      if (sleepModeRadios) {
+        sleepModeRadios.forEach(function (r) {
+          r.addEventListener('change', function () {
+            if (!this.checked) return;
+            postSleepMode(this.value, displaySleepSwitch ? displaySleepSwitch.checked : false);
+          });
+        });
+      }
+      displaySleepSwitch = pcPane && pcPane.querySelector('#wbs-display-switch');
+      if (displaySleepSwitch) {
+        displaySleepSwitch.addEventListener('change', function () {
+          var cur = getSleepMode();
+          if (cur === 'allow') return; // allow 模式下无意义（该行已隐藏）
+          postSleepMode(cur, this.checked);
+        });
+      }
+      syncSleepState();
     }
 
     // 关于 pane：项目信息卡（名字/标语/原理徽章/介绍）+ 支持项目入口 + 版本
@@ -3130,23 +3395,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         });
       }
       syncAskSwitch();
-      // 休眠模式选择（radio）与显示器开关
-      var sleepModeRadios = enhancePane.querySelectorAll('input[name="wbs-sleep-mode"]');
-      sleepModeRadios.forEach(function (r) {
-        r.addEventListener('change', function () {
-          if (!this.checked) return;
-          postSleepMode(this.value, displaySleepSwitch ? displaySleepSwitch.checked : false);
-        });
-      });
-      displaySleepSwitch = enhancePane.querySelector('#wbs-display-switch');
-      if (displaySleepSwitch) {
-        displaySleepSwitch.addEventListener('change', function () {
-          var cur = getSleepMode();
-          if (cur === 'allow') return; // allow 模式下无意义（该行已隐藏）
-          postSleepMode(cur, this.checked);
-        });
-      }
-      syncSleepState();
+      wireNoDisturbPane();
       // DevTools 按钮
       var devtoolsBtn = enhancePane.querySelector('#wbs-theme-devtools');
       if (devtoolsBtn) {
@@ -4010,12 +4259,275 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         })
         .catch(function () {});
     }
-    var sleepSwitch = null; // 休眠模式 radio 容器（增强 pane，wireEnhancePane 赋值）
-    var displaySleepSwitch = null; // 允许显示器休眠开关（增强 pane）
+    var displaySleepSwitch = null; // 允许显示器休眠开关（电脑 pane，wirePcPane 赋值）
     var sleepMode = 'allow'; // 当前休眠模式（内存缓存，syncSleepState 更新）
     var sleepUntilDoneCheck = null; // until-done 模式下的空闲检测定时器
+
+    /* ===== 免打扰模块（No-Disturb）===== */
+    var ndAutoObserver = null; // 弹窗自动点允许的 MutationObserver
+    var ndScanTimer = null;
+    var ndEnabledCount = 0;
+    // 开关定义：id/配置名/确认弹窗文案（开启时弹窗，红字确认）
+    var ND_DEFS = [
+      {
+        id: 'wbs-nd-outside', name: 'outsideWrite',
+        confirmTitle: '开启「外写文件免确认」？',
+        confirmBody: '开启后，AI 可直接读写工作区外的任意文件，不再逐次询问。<b>风险：误改文件时不会提醒。</b>',
+        confirmAction: '开启',
+      },
+      {
+        id: 'wbs-nd-commands', name: 'commands',
+        confirmTitle: '开启「常用命令行免确认」？',
+        confirmBody: '开启后，npm、git、curl、python3 等命令可直接在本机执行，不再经过沙箱或逐次确认。<b>风险：命令执行不再受沙箱保护。</b>',
+        confirmAction: '开启',
+      },
+      {
+        id: 'wbs-nd-bulk', name: 'bulkDelete',
+        confirmTitle: '开启「大批量删除免确认」？',
+        confirmBody: '开启后，AI 批量删除文件时不再询问，文件会直接进入废纸篓/回收站，可恢复。<b>彻底删除仍需你明确操作。</b>',
+        confirmAction: '开启，移入回收站',
+      },
+      {
+        id: 'wbs-nd-systools', name: 'systemTools',
+        confirmTitle: '开启「系统级工具放行」？',
+        confirmBody: '开启后，wsl、reg、sc、schtasks 等系统命令可直接执行，不再经过确认或沙箱。<b>风险：可直接修改系统配置，风险最高。</b>',
+        confirmAction: '开启',
+      },
+      {
+        id: 'wbs-nd-auto', name: 'autoApprove',
+        confirmTitle: '开启「弹窗自动点允许」？',
+        confirmBody: '开启后，插件会自动点击出现的「允许」按钮，避免任务中断。<b>风险：所有确认将失去人工把关。</b>',
+        confirmAction: '开启',
+      },
+    ];
+
+    function ndEl() {
+      return enhancePane && enhancePane.querySelector('#wbs-nd-count');
+    }
+    function ndRefreshCount() {
+      var el = ndEl();
+      if (el) el.textContent = '已开启 ' + ndEnabledCount + ' / ' + ND_DEFS.length;
+    }
+    function ndSwitchEl(id) {
+      return enhancePane && enhancePane.querySelector('#' + id);
+    }
+
+    /** 免打扰开关绑定（wireEnhancePane 调用） */
+    function wireNoDisturbPane() {
+      for (var i = 0; i < ND_DEFS.length; i++) {
+        (function (def) {
+          var sw = ndSwitchEl(def.id);
+          if (!sw) return;
+          sw.addEventListener('change', function () {
+            var enabled = this.checked;
+            if (!enabled) {
+              setNoDisturb(def.name, false);
+              return;
+            }
+            // 开启前弹确认（红字确认键）
+            showNoDisturbConfirm(def, function () { setNoDisturb(def.name, true); }, function () {
+              sw.checked = false;
+            });
+          });
+        })(ND_DEFS[i]);
+      }
+      // 批量开关：一键全开（需二次确认）/ 全关
+      var allSw = enhancePane && enhancePane.querySelector('#wbs-nd-all');
+      if (allSw) {
+        allSw.addEventListener('change', function () {
+          var enabled = this.checked;
+          if (!enabled) {
+            bulkNoDisturb(false);
+            return;
+          }
+          showNoDisturbConfirm({
+            confirmTitle: '开启「全部免打扰」？',
+            confirmBody: '将一次性开启下面所有开关：外写文件免确认、常用命令免确认、大批量删除免确认、系统级工具放行、弹窗自动点允许。开启后 AI 执行将不再打扰，所有删除仍先进废纸篓可恢复。<b>仅在你信任当前工作和本机时使用。</b>',
+            confirmAction: '全部开启',
+          }, function () { bulkNoDisturb(true); }, function () {
+            allSw.checked = false;
+          });
+        });
+      }
+      syncNoDisturb();
+    }
+
+    /** 批量开/关：串行逐个应用（开需要已弹过确认；关直接执行） */
+    function bulkNoDisturb(enabled) {
+      var chain = Promise.resolve();
+      var pending = [];
+      for (var i = 0; i < ND_DEFS.length; i++) pending.push(ND_DEFS[i]);
+      var failed = false;
+      pending.forEach(function (def) {
+        chain = chain.then(function () {
+          if (failed) return;
+          return api('/api/no-disturb-set', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: def.name, enabled: enabled }),
+          }).then(function (d) {
+            if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认');
+          }).catch(function (e) {
+            failed = true;
+            throw e;
+          });
+        });
+      });
+      chain
+        .then(function () {
+          toast(enabled ? '已全部开启免打扰' : '已全部关闭免打扰', false, root);
+          syncNoDisturb();
+        })
+        .catch(function (e) {
+          toast('批量设置失败: ' + (e.message || e), true, root);
+          syncNoDisturb();
+          var allSw = enhancePane && enhancePane.querySelector('#wbs-nd-all');
+          if (allSw) allSw.checked = false;
+        });
+    }
+
+    /** 统一开关设置入口：POST daemon → 回写 UI 状态 → 联动 autoApprove observer */
+    function setNoDisturb(name, enabled) {
+      api('/api/no-disturb-set', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: name, enabled: enabled }),
+      })
+        .then(function (d) {
+          if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认');
+          applyNoDisturbState(d.switches || {});
+          toast(enabled ? '已开启：' + ndTitle(name) : '已关闭：' + ndTitle(name), false, root);
+        })
+        .catch(function (e) {
+          toast('设置失败: ' + (e.message || e), true, root);
+          syncNoDisturb();
+        });
+    }
+    function ndTitle(name) {
+      for (var i = 0; i < ND_DEFS.length; i++) if (ND_DEFS[i].name === name) return ND_DEFS[i].confirmTitle.replace(/[「」？]/g, '');
+      return name;
+    }
+
+    /** 开启确认弹窗：动态 modal，红字确认按钮（复用 .wbs-modal-* 体系）；
+     *  挂载到面板容器（.wbs-panel）内并 absolute 覆盖，弹窗居中于面板而不是整个 WorkBuddy 窗口 */
+    function showNoDisturbConfirm(def, onOk, onCancel) {
+      var mask = document.createElement('div');
+      mask.className = 'wbs-modal-mask wbs-modal-mask-panel';
+      mask.style.display = 'flex';
+      mask.innerHTML =
+        '<div class="wbs-modal">' +
+        '<div class="wbs-modal-title">' + def.confirmTitle + '</div>' +
+        '<div class="wbs-modal-body" style="white-space:pre-line">' + def.confirmBody + '</div>' +
+        '<div class="wbs-modal-actions">' +
+        '<button class="wbs-modal-btn" type="button" data-nd-act="cancel">再想想</button>' +
+        '<button class="wbs-modal-btn wbs-modal-danger" type="button" data-nd-act="ok">' + def.confirmAction + '</button>' +
+        '</div></div>';
+      function cleanup() {
+        mask.removeEventListener('click', onClick);
+        if (mask.parentNode) mask.parentNode.removeChild(mask);
+      }
+      function onClick(e) {
+        if (e.target === mask) { cleanup(); onCancel && onCancel(); return; }
+        var act = e.target.getAttribute && e.target.getAttribute('data-nd-act');
+        if (act === 'cancel') { cleanup(); onCancel && onCancel(); }
+        else if (act === 'ok') { cleanup(); onOk && onOk(); }
+      }
+      mask.addEventListener('click', onClick);
+      // 面板容器：弹窗只覆盖面板区域（面板中间），不盖住 WorkBuddy 窗口
+      var panel = root && root.querySelector('.wbs-panel');
+      (panel || root || document.body).appendChild(mask);
+    }
+
+    /** 从 daemon 拉开关状态并同步 UI（含自动点允许 observer 启停） */
+    function syncNoDisturb() {
+      api('/api/no-disturb')
+        .then(function (d) {
+          if (d && d.ok && d.switches) applyNoDisturbState(d.switches);
+        })
+        .catch(function () {});
+    }
+    function applyNoDisturbState(switches) {
+      if (!switches || typeof switches !== 'object') return;
+      var n = 0;
+      for (var i = 0; i < ND_DEFS.length; i++) {
+        var def = ND_DEFS[i];
+        var sw = ndSwitchEl(def.id);
+        var on = !!switches[def.name];
+        if (sw) sw.checked = on;
+        if (on) n++;
+      }
+      ndEnabledCount = n;
+      ndRefreshCount();
+      // 批量总开关：全部开启时才为 true
+      var allSw = enhancePane && enhancePane.querySelector('#wbs-nd-all');
+      if (allSw) allSw.checked = n === ND_DEFS.length;
+      if (switches.autoApprove) startNoDisturbAutoApprove();
+      else stopNoDisturbAutoApprove();
+    }
+
+    /* —— 弹窗自动点允许（兜底，默认关）—— */
+    function startNoDisturbAutoApprove() {
+      if (ndAutoObserver) return;
+      var doc = (window && window.document) || document;
+      if (!doc || !doc.body) return;
+      ndAutoObserver = new MutationObserver(function () { scheduleNdScan(); });
+      ndAutoObserver.observe(doc.body, { childList: true, subtree: true });
+      scheduleNdScan();
+    }
+    function stopNoDisturbAutoApprove() {
+      if (ndAutoObserver) { ndAutoObserver.disconnect(); ndAutoObserver = null; }
+      if (ndScanTimer) { clearTimeout(ndScanTimer); ndScanTimer = null; }
+    }
+    function scheduleNdScan() {
+      if (ndScanTimer) clearTimeout(ndScanTimer);
+      ndScanTimer = setTimeout(scanNoDisturbApproval, 120);
+    }
+    function ndVisible(el) {
+      return !!(el && el.getClientRects && el.getClientRects().length && el.offsetParent !== null);
+    }
+    // 仅在确认类弹窗容器内自动点：标题/正文含这些关键词才动手，宁可漏点也不错点
+    var ND_CONFIRM_PATTERN = /批量删除|沙箱|越界|系统级工具|系统工具|权限|允许访问|将运行|需要你确认|需要你的确认|确认允许|sandbox|approval/i;
+    function scanNoDisturbApproval() {
+      var doc = (window && window.document) || document;
+      if (!doc) return;
+      var btns = doc.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.getAttribute('data-nd-auto')) continue; // 已处理过
+        if (!ndVisible(b)) continue;
+        var t = (b.textContent || '').trim();
+        var kind = null;
+        if (t.indexOf('始终允许') > -1) kind = 'session';
+        else if (t === '允许' || t === 'Allow' || t === 'Yes' || t === '同意' || t === '确认允许') kind = 'once';
+        else if (t.indexOf('Yes') === 0 && t.length < 24) kind = 'once';
+        if (!kind) continue;
+        // 向上找确认容器（至多 8 层），验证语境
+        var box = b;
+        var hit = false;
+        for (var c = 0; c < 8 && box; c++) {
+          box = box.parentElement;
+          if (!box) break;
+          var txt = box.textContent || '';
+          if (txt.length > 500) txt = txt.slice(0, 500);
+          if (ND_CONFIRM_PATTERN.test(txt)) { hit = true; break; }
+        }
+        if (!hit) continue;
+        b.setAttribute('data-nd-auto', '1');
+        toNdAudit(kind, t);
+        if (b.click) b.click();
+        return; // 每轮只确认一个，避免连环误触
+      }
+    }
+    function toNdAudit(kind, matched) {
+      api('/api/no-disturb-audit', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'approve', matched: kind + ':' + matched }), // eslint-disable-line no-unused-vars
+      }).catch(function () {});
+    }
+
     function getSleepMode() {
-      var r = enhancePane && enhancePane.querySelector('input[name="wbs-sleep-mode"]:checked');
+      var r = pcPane && pcPane.querySelector('input[name="wbs-sleep-mode"]:checked');
       return r ? r.value : sleepMode;
     }
     // POST 休眠设置（模式 + 显示器开关）
@@ -4084,11 +4596,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           if (d && d.mode) {
             sleepMode = d.mode;
             var preventing = d.preventing === true || d.mode === 'keep' || d.mode === 'until-done';
-            if (enhancePane) {
-              var r = enhancePane.querySelector('input[name="wbs-sleep-mode"][value="' + d.mode + '"]');
+            if (pcPane) {
+              var r = pcPane.querySelector('input[name="wbs-sleep-mode"][value="' + d.mode + '"]');
               if (r) r.checked = true;
               if (displaySleepSwitch) displaySleepSwitch.checked = !!d.displaySleep;
-              var drow = enhancePane.querySelector('#wbs-display-sleep-row');
+              var drow = pcPane.querySelector('#wbs-display-sleep-row');
               if (drow) drow.style.display = preventing ? '' : 'none';
             }
             var dot = root.querySelector('.wbs-fab-sleep-dot');
@@ -4601,6 +5113,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       get stashCount() { return document.querySelectorAll('.wbs-stash-inline').length; },
       get sendInfo() { var s = findSendButton(); if (!s) return null; var r = s.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), cls: (s.className || '').toString(), dis: !!s.disabled, ariaDis: s.getAttribute('aria-disabled') || '' }; },
       get composerInfo() { var e = findComposer(); if (!e) return null; return { tag: e.tagName, cls: (e.className || '').toString().slice(0, 80), textLen: (e.innerText || e.textContent || '').length }; },
+      get sessionHealth() { return { sessionId: sessionHealth.sessionId, observed: sessionHealth.observed, result: sessionHealth.result }; },
     };
     var debugPanel = document.createElement('div');
     debugPanel.id = 'wbs-debug-panel';
@@ -4632,10 +5145,55 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     listen(window, 'keydown', onDebugKey);
     debugTimer = setBuildInterval(updateDebugPanel, 500);
     setBuildTimeout(updateDebugPanel, 250);
+    function markHealthGeneration() {
+      sessionHealth.observed = true;
+      sessionHealth.manualStop = false;
+      sessionHealth.generationAt = Date.now();
+      sessionHealth.lastBusyAt = Date.now();
+      var baseline = readAssistantHealth();
+      sessionHealth.baselineAssistantNode = baseline.node;
+      sessionHealth.baselineAssistantTextLength = baseline.assistantTextLength;
+    }
+    function isHealthStopControl(button) {
+      if (!button || !button.getAttribute) return false;
+      var text = [button.innerText, button.getAttribute('aria-label'), button.getAttribute('title'), button.className].join(' ');
+      return /(停止生成|停止|stop|cancel generation)/i.test(text);
+    }
+    function isHealthSendControl(button) {
+      if (!button || !button.getAttribute || (button.closest && button.closest('.wbs-root'))) return false;
+      var official = findSendButton();
+      if (official && official === button) return true;
+      var text = [button.innerText, button.getAttribute('aria-label'), button.getAttribute('title'), button.className].join(' ');
+      return /(发送|send|提交)/i.test(text) && !/(重试|retry)/i.test(text);
+    }
+    listen(document, 'click', function (e) {
+      var button = e.target && e.target.closest ? e.target.closest('button,[role="button"]') : null;
+      if (!button) return;
+      if (isHealthStopControl(button) && sessionHealth.observed) {
+        sessionHealth.manualStop = true;
+        return;
+      }
+      if (isHealthSendControl(button)) markHealthGeneration();
+    }, true);
+    listen(document, 'keydown', function (e) {
+      if (!e || e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+      var composer = findComposer();
+      if (composer && e.target && (e.target === composer || (e.target.closest && e.target.closest('[contenteditable="true"]') === composer))) {
+        markHealthGeneration();
+      }
+    }, true);
+    // The one-second poll is intentional here: observing the whole WorkBuddy body made
+    // conversation-heavy pages pay for every React class mutation.
+    // —— 会话健康检测已禁用（用户反馈误报「会话疑似异常停止」，见 2026-08-24 记录）：
+    //     保留代码与元素，需要时恢复下面两行即可。
+    // sessionHealthTimer = setBuildInterval(scanSessionHealth, 1000);
+    // setBuildTimeout(scanSessionHealth, 250);
     // 初始同步防休眠状态（悬浮角标）
     syncSleepState();
     // 定期同步（30s）：daemon 重启或外部状态变化后角标保持一致
     sleepSyncTimer = setBuildInterval(syncSleepState, 30000);
+    // 免打扰：启动即同步开关状态（若「弹窗自动点允许」已开启则挂上观察者，无需打开增强页）
+    setBuildTimeout(syncNoDisturb, 1200);
     // 更新顶部红色角标：build 完成、send/editor/stash 状态（200ms 后写，等 syncStash 节流跑完）
     try {
       var badgeTimer = setBuildTimeout(function () {
@@ -4655,6 +5213,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (sendObserver) { try { sendObserver.disconnect(); } catch (e) {} sendObserver = null; }
       if (rowObserver) { try { rowObserver.disconnect(); } catch (e) {} rowObserver = null; }
       if (bodyObserver) { try { bodyObserver.disconnect(); } catch (e) {} bodyObserver = null; }
+      sessionHealthTimer = null;
     });
     registerDisposer(function () {
       stopInspect();
@@ -4726,6 +5285,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     /* 机器人悬浮按钮（bitter-dragon-16 移植）：静态版 0.5 倍 · 无头顶尖角 · 眼睛双眨 */
     '.wbs-fab{position:fixed;right:22px;bottom:22px;z-index:2147483647;transform:scale(0.5);transform-origin:bottom right;cursor:pointer}',
     '.wbs-fab-sleep-dot{position:absolute;top:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:rgba(126,128,138,.55);border:2px solid #141416;box-shadow:0 1px 3px rgba(0,0,0,.5);transition:background .25s,box-shadow .25s;z-index:3}',
+    '.wbs-fab-health-dot{position:absolute;top:-5px;left:-5px;width:14px;height:14px;border-radius:50%;background:#8b8f98;border:2px solid #141416;box-shadow:0 1px 3px rgba(0,0,0,.5);z-index:3}',
+    '.wbs-fab-health-dot.running{background:#4da3ff}.wbs-fab-health-dot.blocked{background:#ffb03a}.wbs-fab-health-dot.error{background:#ef6262}.wbs-fab-health-dot.suspected{background:#f08a3c}.wbs-fab-health-dot.stopped{background:#9ca3af}',
+    '.wbs-health-status{display:none;align-items:center;min-height:18px;padding:2px 7px;border-radius:999px;font-size:10px;line-height:14px;white-space:nowrap;color:var(--wb-color-text-secondary,#666);background:var(--wb-bg-tertiary,#f2f2f2)}',
+    '.wbs-health-status.running,.wbs-health-status.blocked,.wbs-health-status.error,.wbs-health-status.suspected,.wbs-health-status.stopped{display:inline-flex}',
+    '.wbs-health-status.running{color:#2369a8;background:rgba(77,163,255,.14)}.wbs-health-status.blocked{color:#9a5b00;background:rgba(255,176,58,.18)}.wbs-health-status.error{color:#a52828;background:rgba(239,98,98,.16)}.wbs-health-status.suspected{color:#9a4d0a;background:rgba(240,138,60,.17)}.wbs-health-status.stopped{color:var(--wb-color-text-secondary,#666)}',
+    'html.cb-dark .wbs-health-status.running,html[data-theme="dark"] .wbs-health-status.running{color:#b9dcff;background:rgba(77,163,255,.22)}html.cb-dark .wbs-health-status.blocked,html[data-theme="dark"] .wbs-health-status.blocked{color:#ffd58d;background:rgba(255,176,58,.24)}html.cb-dark .wbs-health-status.error,html[data-theme="dark"] .wbs-health-status.error{color:#ffb3b3;background:rgba(239,98,98,.25)}html.cb-dark .wbs-health-status.suspected,html[data-theme="dark"] .wbs-health-status.suspected{color:#ffc18d;background:rgba(240,138,60,.24)}',
     '.wbs-fab-sleep-dot.on{background:#2ee59d;border-color:#0e3d2a;box-shadow:0 0 8px 1px rgba(46,229,157,.8);animation:wbs-sleep-pulse 2.2s ease-in-out infinite}',
     '.wbs-fab-sleep-dot.on.until-done{background:#ffb03a;border-color:#5c3a08;box-shadow:0 0 8px 1px rgba(255,176,58,.85);animation:wbs-sleep-pulse-amber 2.2s ease-in-out infinite}',
     '@keyframes wbs-sleep-pulse{0%,100%{box-shadow:0 0 5px 1px rgba(46,229,157,.6)}50%{box-shadow:0 0 13px 4px rgba(46,229,157,.95)}}',
@@ -4762,7 +5327,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-fab:hover{transform:scale(0.5)}',
     '.wbs-fab:active{transform:scale(0.5) translate(2px,2px)}',
     /* 面板：毛玻璃主题（半透明 + 模糊，背景图透出） */
-    '.wbs-panel{position:absolute;right:0;bottom:0;width:460px;height:650px;max-height:650px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
+    '.wbs-panel{position:absolute;right:0;bottom:0;width:520px;max-width:94vw;height:650px;max-height:650px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
     '.wbs-panel.show{display:flex}',
     '.wbs-head{display:flex;align-items:center;justify-content:space-between;padding:16px 18px 12px;border-bottom:1px solid var(--wb-border-subtle,#f0f0f0);background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 30%,transparent)}',
     '.wbs-head-left{display:flex;align-items:center;gap:9px;min-width:0}',
@@ -4939,13 +5504,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-tab-ico{font-size:14px;line-height:1}',
     '.wbs-tab:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-tab.active{background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);box-shadow:0 2px 10px color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 30%,transparent)}',
-    '.wbs-pane{display:none;padding:2px 2px 6px;animation:wbs-pane-in .2s ease}',
+    '.wbs-pane{display:none;padding:2px 2px 6px}',
     '.wbs-pane.active{display:flex;flex-direction:column;height:100%;min-height:0}',
-    '@keyframes wbs-pane-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}',
     /* 分组卡片（主题/增强 tab） */
     '.wbs-pcard{background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 18%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:14px;padding:10px 12px;margin-bottom:8px;backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2)}',
     '.wbs-pcard-title{display:flex;align-items:baseline;gap:8px;font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:8px}',
     '.wbs-pcard-sub{font-size:11px;color:var(--wb-icon-tertiary,#999);font-weight:400}',
+    /* 免打扰：标题行右置批量开关 + 三列 grid 对齐（标题/小标题/开关，所有小标题左对齐） */
+    '.wbs-nd-head{display:flex;align-items:center;gap:6px}',
+    '.wbs-nd-head #wbs-nd-count{margin-left:2px}',
+    '.wbs-nd-head .wbs-nd-all-wrap{margin-left:auto;display:flex;align-items:center;gap:5px;cursor:pointer}',
+    '.wbs-nd-all-label{font-size:11px;color:var(--wb-color-text-secondary,#444)}',
+    '.wbs-nd-row{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--wb-border-subtle,#f0f0f0)}',
+    '.wbs-nd-row:first-of-type{border-top:none}',
+    '.wbs-nd-title{font-size:12px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f);white-space:nowrap}',
+    '.wbs-nd-hint{font-size:11px;color:var(--wb-icon-tertiary,#999);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     /* 会话页：筛选 + 批量 + 列表 + 迁移/删除弹窗 */
     '.wbs-sess-filters{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}',
     '.wbs-sess-filter-row{display:flex;align-items:center;gap:8px}',
@@ -5085,7 +5658,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-del{flex-shrink:0;padding:7px 12px;border:1px solid #ff6b6b;border-radius:9px;background:color-mix(in srgb,#ff6b6b 10%,transparent);color:#ff6b6b;font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
     '.wbs-sess-del:hover{background:#ff6b6b;color:#fff}',
     '.wbs-modal-mask{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center}',
-    '.wbs-modal{width:300px;max-width:88vw;background:var(--wb-bg-popover,#fff);border-radius:14px;padding:16px;box-shadow:0 10px 40px rgba(0,0,0,.25)}',
+    /* 免打扰确认弹窗：挂载在面板容器内，仅覆盖面板区域（弹窗居中于面板，不盖住 WorkBuddy 窗口） */
+    '.wbs-modal-mask.wbs-modal-mask-panel{position:absolute;inset:0;z-index:2147483645;border-radius:18px}',
+    '.wbs-modal{width:300px;max-width:88vw;background:var(--wb-bg-popover,#fff);border-radius:14px;padding:16px;box-shadow:0 10px 40px rgba(0,0,0,.25);color:var(--wb-color-text-primary,#1f1f1f)}',
+    /* 弹窗文字主题适配：body 继承 .wbs-root 硬编码深色字，暗色下必须显式覆盖为浅色 */
+    'html.cb-dark .wbs-modal,html.cb-dark .wbs-modal-title,html.cb-dark .wbs-modal-body,html[data-theme="dark"] .wbs-modal,html[data-theme="dark"] .wbs-modal-title,html[data-theme="dark"] .wbs-modal-body{color:#e6e6e9}',
+    'html.cb-dark .wbs-modal-btn,html[data-theme="dark"] .wbs-modal-btn{color:#d5d5d9;border-color:rgba(232,232,234,0.16);background:rgba(255,255,255,0.05)}',
+    'html.cb-dark .wbs-modal-btn:hover,html[data-theme="dark"] .wbs-modal-btn:hover{background:rgba(255,255,255,0.12)}',
+    /* 高危红色确认按钮在暗色下保持红色风格（略提亮更醒目） */
+    'html.cb-dark .wbs-modal-btn.wbs-modal-danger,html[data-theme="dark"] .wbs-modal-btn.wbs-modal-danger{color:#fff;background:#e03d3d;border-color:#e03d3d}',
+    'html.cb-dark .wbs-modal-btn.wbs-modal-danger:hover,html[data-theme="dark"] .wbs-modal-btn.wbs-modal-danger:hover{background:#f04a4a}',
+    'html.cb-dark .wbs-modal-mask,html[data-theme="dark"] .wbs-modal-mask{background:rgba(0,0,0,.55)}',
     '.wbs-modal-title{font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:10px}',
     '.wbs-modal-body{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;margin-bottom:12px}',
     '.wbs-modal-action{display:block;width:100%;text-align:left;padding:8px 10px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
@@ -5104,6 +5687,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-modal-btn:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);border-color:var(--wb-border-strong,#bbb)}',
     '.wbs-modal-btn.wbs-modal-ok{color:#fff;background:#141416;border-color:#141416}',
     '.wbs-modal-btn.wbs-modal-ok:hover{background:#2a2a2e;color:#fff}',
+    /* 免打扰确认弹窗：红字确认按钮（高危操作，用红色警示） */
+    '.wbs-modal-btn.wbs-modal-danger{color:#fff;background:#c62828;border-color:#c62828}',
+    '.wbs-modal-btn.wbs-modal-danger:hover{background:#b71c1c}',
     '.wbs-modal-actions .wbs-theme-devtools{background:var(--wb-bg-popover,#fff)}',
     /* 电脑休眠三模式选择 */
     '.wbs-sleep-modes{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}',

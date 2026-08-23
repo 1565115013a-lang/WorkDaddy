@@ -16,6 +16,10 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
 VERSION="${WORKDADDY_BUILD_VERSION:-$(grep -o "DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "错误：发布版本必须是 x.y.z，实际为 ${VERSION}" >&2
+  exit 2
+fi
 APP="WorkDaddy.app"
 PROFILE="${WORKDADDY_BUILD_PROFILE:-}"
 if [ -z "$PROFILE" ]; then
@@ -67,6 +71,14 @@ perl -0pi -e "s/<string>1\\.0\\.8<\\/string>/<string>${VERSION}<\\/string>/g; s/
 # 无论源码壳当前版本如何，每次产物都必须让 daemon 版本与安装包版本一致。
 perl -0pi -e "s/(const DAEMON_VERSION = ')[^']+(';)/\${1}${VERSION}\${2}/" \
   "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"
+# 壳内可能残留旧的 release-x.y.z；只替换 Build ID 的版本段，保留日期/功能后缀。
+perl -0pi -e "s/(const DAEMON_BUILD_ID = 'release-)[0-9]+\\.[0-9]+\\.[0-9]+/\${1}${VERSION}/" \
+  "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"
+if ! grep -q "const DAEMON_VERSION = '${VERSION}';" "$PACKAGE_APP/Contents/Resources/scripts/daemon.js" \
+  || ! grep -q "const DAEMON_BUILD_ID = 'release-${VERSION}-" "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"; then
+  echo "错误：产物 daemon.js 的版本或 Build ID 与 ${VERSION} 不一致" >&2
+  exit 1
+fi
 # app 壳可能携带滞后的 package.json；同步版本元数据，避免旧值覆盖关于页/诊断信息。
 if [ -f "$PACKAGE_APP/Contents/Resources/scripts/package.json" ]; then
   perl -0pi -e "s/(\"version\"\s*:\s*\")([^\"]+)(\")/\${1}${VERSION}\${3}/" \
