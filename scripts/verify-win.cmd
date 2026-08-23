@@ -75,9 +75,9 @@ for %%F in (install-win.ps1) do (
   )
 )
 
-rem ---- 5) 自启注册表与安装目录回写测试（读态 + 安装目录可写性探测）----
+rem ---- 5) 自启清理状态与安装目录回写测试（读态 + 安装目录可写性探测）----
 echo.
-echo [5/6] 检查安装目标可写 + 自启状态...
+echo [5/6] 检查安装目标可写 + 旧自启状态...
 set "APPDIR=%LOCALAPPDATA%\Programs\WorkDaddy"
 if exist "%APPDIR%\scripts\daemon.js" (
   echo   已安装版本: "%APPDIR%" 存在

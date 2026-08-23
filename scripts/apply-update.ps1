@@ -3,14 +3,20 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$SrcZip,
-  [string]$AppDir = (Join-Path $env:LOCALAPPDATA 'Programs\WorkDaddy'),
+  [string]$AppDir = '',
   [string]$Port = '47832',
   [string]$LogPath = '',
-  [string]$AttemptId = 'unknown'
+  [string]$AttemptId = 'unknown',
+  [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
 $ErrorActionPreference = 'Stop'
-$DataDir = Join-Path $env:APPDATA 'WorkDaddy'
+if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
+if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
+$productName = if ($Profile -eq 'workbuddy-ai') { 'WorkDaddy AI' } else { 'WorkDaddy' }
+if ([string]::IsNullOrWhiteSpace($AppDir)) { $AppDir = Join-Path $env:LOCALAPPDATA (Join-Path 'Programs' $productName) }
+$dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
+$DataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
 $LogDir = Join-Path $DataDir 'update'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $LogDir 'apply.log' }

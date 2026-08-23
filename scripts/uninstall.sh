@@ -16,6 +16,13 @@ else
 fi
 
 echo "==> 停止并移除 launchd 守护进程"
+for old_profile in workbuddy-cn workbuddy-ai codebuddy-cn codebuddy-intl; do
+  old_label="com.workbuddy.workdaddy.${old_profile}"
+  old_plist="$HOME/Library/LaunchAgents/${old_label}.plist"
+  launchctl bootout "gui/$(id -u)" "$old_plist" 2>/dev/null || true
+  launchctl remove "$old_label" 2>/dev/null || true
+  rm -f "$old_plist"
+done
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 rm -f "$PLIST"
 launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST" 2>/dev/null || true

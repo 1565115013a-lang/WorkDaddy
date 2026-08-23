@@ -78,10 +78,15 @@ const {
   editModelBackup,
   deleteModelBackups,
   enableModelBackup,
+  importModels,
+  checkinDisplayValue,
 } = require('./lib.js');
 const { extractCreditSegments, sortCreditSegments } = require('./credit-segments.js');
 const { captureException, captureMessage } = require('./sentry-report.js');
+const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
+const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
 
+const PROFILE = getProfile();
 const DATA_DIR = defaultDataDir();
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
 // 0.6.6：品牌 HelloBuddy→WorkDaddy 期间版本号未递增，旧 HelloBuddy daemon 会被 launcher 误判为"同版本"而不重启，导致旧代码继续注入；递增后强制升级
@@ -129,18 +134,22 @@ const DATA_DIR = defaultDataDir();
 // 1.0.19：官方模型批量删除、模型卡片稳定布局与固定 650px 面板
 // 1.0.20：模型卡片悬浮操作、官方连通测试、完整长度脱敏 API Key
 // 1.0.21：模型页改为当前/备选模型列表风格，去除刷新入口并优化字段排版
-const DAEMON_VERSION = '1.0.8';
-const DAEMON_BUILD_ID = 'release-1.0.8-20260822';
+// 1.0.9：WorkBuddy / WorkBuddy AI profile 隔离；修复 Windows launcher 的本地端口探测、
+//        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
+const DAEMON_VERSION = '1.0.9';
+const DAEMON_BUILD_ID = 'release-1.0.9-20260823-hotfix7';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
+const WORKDADDY_INSTALL_NAME = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy';
 const WORKDADDY_DIR_WIN = process.env.WBSWITCH_APP_DIR ||
-  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'WorkDaddy');
+  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', WORKDADDY_INSTALL_NAME);
 const UI_PORT_BASE = parseInt(process.env.WBSWITCH_PORT || '47832', 10);
 let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（被占用时 +1）
+const PROFILE_CDP_PORT = { 'workbuddy-cn': 9222, 'workbuddy-ai': 9223, 'codebuddy-cn': 9224, 'codebuddy-intl': 9225 };
 const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
   ? parseInt(process.env.WBSWITCH_CDP_PORT, 10)
-  : null;
+  : (PROFILE_CDP_PORT[PROFILE.id] || null);
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const WATCH_INTERVAL = 3000; // 文件监听兜底
 const BACKUP_DEBOUNCE = 1500; // CDP 事件触发的备份防抖
@@ -258,7 +267,7 @@ function macWorkDaddyAppPath() {
   if (process.env.WBSWITCH_APP_PATH) return path.resolve(process.env.WBSWITCH_APP_PATH);
   const bundledInfo = path.resolve(__dirname, '../../..', 'Contents', 'Info.plist');
   if (fs.existsSync(bundledInfo)) return path.resolve(__dirname, '../../..');
-  return '/Applications/WorkDaddy.app';
+  return `/Applications/${WORKDADDY_INSTALL_NAME}.app`;
 }
 
 // 简单 semver 比较：a > b → 1，a < b → -1，相等 → 0（忽略预发布后缀）
@@ -318,10 +327,15 @@ function checkUpdate(force) {
       // 资产按平台选取：macOS 找 .dmg；Windows 优先官方便携包（-win64.zip），再回退任意 .zip，
       // 绝不选 Setup.exe（IExpress 自解压包，当 .zip 下载后 Expand-Archive 会失败 → 更新中断）
       const assets = rel.assets || [];
+      const profileAsset = PROFILE.id === 'workbuddy-ai'
+        ? /WorkDaddy-AI-.*(?:-win64)?\.(?:zip|dmg)$/i
+        : /WorkDaddy-(?!AI-).*?(?:-win64)?\.(?:zip|dmg)$/i;
       const asset = IS_WIN
-        ? (assets.find((a) => /-win64\.zip$/i.test(a.name || '')) ||
+        ? (assets.find((a) => profileAsset.test(a.name || '') && /\.zip$/i.test(a.name || '')) ||
+           assets.find((a) => /-win64\.zip$/i.test(a.name || '') && (PROFILE.id !== 'workbuddy-ai' || !/WorkDaddy-AI-/i.test(a.name || ''))) ||
            assets.find((a) => /\.zip$/i.test(a.name || '')) || null)
-        : (assets.find((a) => /\.dmg$/i.test(a.name || '')) || null);
+        : (assets.find((a) => profileAsset.test(a.name || '') && /\.dmg$/i.test(a.name || '')) ||
+           assets.find((a) => /\.dmg$/i.test(a.name || '') && (PROFILE.id !== 'workbuddy-ai' || !/WorkDaddy-AI-/i.test(a.name || ''))) || null);
       updateState.dmgUrl = asset ? asset.browser_download_url : null;
       updateState.dmgSize = asset ? asset.size : 0;
       updateState.checkedAt = Date.now();
@@ -342,6 +356,7 @@ function checkUpdate(force) {
         updateState.latest = c.latest;
         updateState.hasUpdate = !!c.hasUpdate;
         updateState.dmgUrl = c.dmgUrl;
+        updateState.dmgSize = Number(c.dmgSize) || 0;
         updateState.notes = c.notes;
         updateState.checkedAt = c.checkedAt || Date.now();
       } catch (_) {}
@@ -353,20 +368,23 @@ function checkUpdate(force) {
 function downloadUpdate() {
   if (!updateState.dmgUrl) return Promise.reject(new Error('无可用安装包'));
   fs.mkdirSync(UPDATE_DIR, { recursive: true });
+  updateState.downloaded = false;
+  updateState.error = null;
   const ext = IS_WIN ? '.zip' : '.dmg';
-  const target = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + ext);
+  const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
+  const target = path.join(UPDATE_DIR, updatePrefix + updateState.latest + ext);
   if (fs.existsSync(target)) {
-    // 已有同版本文件：直接校验后复用
-    const digest = sha256File(target);
     const expect = parseSha256(updateState.notes);
-    if (!expect || digest === expect) {
+    const checked = validateUpdateArtifact(target, expect);
+    if (checked.ok) {
       updateState.downloaded = true;
       updateState.progress = 100;
       updateState.status = 'idle';
       updateState.message = '安装包已就绪';
       return Promise.resolve(target);
     }
-    fs.unlinkSync(target); // 校验失败删掉重下
+    log(`[update] 丢弃缓存安装包 ${path.basename(target)}: ${checked.reason}`);
+    try { fs.unlinkSync(target); } catch (_) {}
   }
   updateState.status = 'downloading';
   updateState.progress = 0;
@@ -380,6 +398,15 @@ function downloadUpdate() {
         updateState.dmgUrl = res.headers.location;
         resolve(downloadUpdate());
         res.resume();
+        return;
+      }
+      const contentType = String(res.headers['content-type'] || '').toLowerCase();
+      if (!IS_WIN && /text\/html|application\/json/.test(contentType)) {
+        res.resume();
+        const error = new Error(`下载响应不是 DMG (content-type=${contentType})`);
+        updateState.status = 'error';
+        updateState.error = error.message;
+        reject(error);
         return;
       }
       const total = parseInt(res.headers['content-length'] || '0', 10) || updateState.dmgSize;
@@ -396,19 +423,19 @@ function downloadUpdate() {
         updateState.progress = 100;
         updateState.status = 'verifying';
         updateState.message = '校验安装包…';
-        const digest = sha256File(target);
         const expect = parseSha256(updateState.notes);
-        if (expect && digest !== expect) {
-          fs.unlinkSync(target);
+        const checked = validateUpdateArtifact(target, expect);
+        if (!checked.ok) {
+          try { fs.unlinkSync(target); } catch (_) {}
           updateState.status = 'error';
-          updateState.error = 'SHA-256 校验失败';
-          updateState.message = '校验失败，已删除损坏包';
-          return reject(new Error('SHA-256 mismatch: ' + digest + ' != ' + expect));
+          updateState.error = checked.reason;
+          updateState.message = '安装包校验失败，已删除损坏包';
+          return reject(new Error(checked.reason));
         }
         updateState.downloaded = true;
         updateState.status = 'idle';
-        updateState.message = '安装包已就绪' + (expect ? '（校验通过）' : '（未校验）');
-        log(`[update] 下载完成 ${target} sha256=${digest}`);
+        updateState.message = '安装包已就绪' + (expect ? '（校验通过）' : '（格式校验通过）');
+        log(`[update] 下载完成 ${target} sha256=${checked.digest}`);
         resolve(target);
       });
       out.on('error', (e) => { try { fs.unlinkSync(target); } catch (_) {} reject(e); });
@@ -421,6 +448,44 @@ function sha256File(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
+// 文件存在或没有 Release notes 摘要都不能证明它是可挂载的 DMG：断流、代理错误页
+// 和旧版残留文件都可能留下普通文件。hdiutil imageinfo 是 macOS UDIF 的确定性预检。
+function validateUpdateArtifact(file, expectSha = null) {
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch (e) {
+    return { ok: false, reason: '安装包文件不可读: ' + e.message };
+  }
+  if (!stat.isFile() || stat.size <= 0) return { ok: false, reason: '安装包为空或不是普通文件' };
+  if (updateState.dmgSize > 0 && stat.size !== updateState.dmgSize) {
+    return { ok: false, reason: `安装包大小不匹配 (${stat.size} != ${updateState.dmgSize})` };
+  }
+  if (!IS_WIN) {
+    let probe;
+    try {
+      probe = spawnSync('hdiutil', ['imageinfo', file], {
+        encoding: 'utf8', timeout: 20000, windowsHide: true,
+      });
+    } catch (e) {
+      return { ok: false, reason: 'DMG 预检执行失败: ' + e.message };
+    }
+    if (probe.error || probe.status !== 0) {
+      const detail = String(probe.stderr || probe.stdout || probe.error?.message || '未知 hdiutil 错误')
+        .replace(/\s+/g, ' ').trim().slice(0, 240);
+      return { ok: false, reason: '下载内容不是有效 DMG: ' + detail };
+    }
+  }
+  let digest;
+  try { digest = sha256File(file); } catch (e) {
+    return { ok: false, reason: '安装包 SHA-256 读取失败: ' + e.message };
+  }
+  if (expectSha && digest !== expectSha) {
+    return { ok: false, reason: `SHA-256 校验失败 (${digest} != ${expectSha})` };
+  }
+  return { ok: true, digest };
+}
+
 // ---------------------------------------------------------------------------
 // 无感登录（OAuth state 轮询采集，流程与 workbuddy-switch 一致）：
 //   1. POST /v2/plugin/auth/state?platform=workbuddy 申请 state + 授权链接
@@ -429,7 +494,10 @@ function sha256File(file) {
 //   4. GET /v2/plugin/login/account?state=... 拉账号信息，拼成官方认证文件结构入库
 // ---------------------------------------------------------------------------
 
-const WB_API_ENDPOINT = 'https://www.codebuddy.cn';
+// 各客户端 API host 与 auth.domain 一致：国内版 www.workbuddy.cn / codebuddy.cn，
+// 国际版（WorkBuddy AI / CodeBuddy 国际版）为 www.workbuddy.ai / www.codebuddy.ai。
+// 签到、积分查询、无感登录必须打到自己对应域名的接口，不能复用国内 host。
+const WB_API_ENDPOINT = PROFILE.apiHost || 'https://www.workbuddy.cn';
 const WB_API_PREFIX = '/v2/plugin';
 const OAUTH_TIMEOUT_SECONDS = 600;
 const OAUTH_RESULT_RETENTION_SECONDS = 300;
@@ -620,17 +688,28 @@ async function oauthPollOnce(loginId) {
 // 从 dmg 中解出 WorkDaddy.app 到 UPDATE_DIR（挂载→拷贝→卸载），返回 app 目录
 function extractAppFromDmg(dmgPath) {
   const mountPoint = '/Volumes/WorkDaddy-update';
-  const appDest = path.join(UPDATE_DIR, 'WorkDaddy.app');
+  const appPackageName = WORKDADDY_INSTALL_NAME + '.app';
+  const appDest = path.join(UPDATE_DIR, appPackageName);
   return new Promise((resolve, reject) => {
     const exec = require('child_process').execFile;
+    const checked = validateUpdateArtifact(dmgPath, parseSha256(updateState.notes));
+    if (!checked.ok) {
+      log(`[update] DMG 预检失败 ${path.basename(dmgPath)}: ${checked.reason}`);
+      reject(new Error(`DMG 预检失败: ${checked.reason}`));
+      return;
+    }
     // 先清理可能残留的挂载点（上次更新失败/中断会遗留，direct attach -mountpoint 会报 Resource busy），
     // 再用只读 + 免校验挂载（只取包内容，不做写操作）
     exec('hdiutil', ['detach', mountPoint, '-force'], () => {
       exec('hdiutil', ['attach', '-nobrowse', '-readonly', '-noverify', '-mountpoint', mountPoint, dmgPath], (err) => {
-        if (err) return reject(new Error('挂载 dmg 失败: ' + err.message));
-        const src = path.join(mountPoint, 'WorkDaddy.app');
+        if (err) {
+          const detail = String(err.stderr || err.message || '未知 hdiutil 错误').replace(/\s+/g, ' ').trim().slice(0, 300);
+          log(`[update] hdiutil attach 失败 ${path.basename(dmgPath)}: ${detail}`);
+          return reject(new Error('挂载 dmg 失败: ' + detail));
+        }
+        const src = path.join(mountPoint, WORKDADDY_INSTALL_NAME + '.app');
         if (!fs.existsSync(src)) {
-          exec('hdiutil', ['detach', mountPoint, '-force'], () => reject(new Error('dmg 中未找到 WorkDaddy.app')));
+          exec('hdiutil', ['detach', mountPoint, '-force'], () => reject(new Error(`dmg 中未找到 ${WORKDADDY_INSTALL_NAME}.app`)));
           return;
         }
         fs.rmSync(appDest, { recursive: true, force: true });
@@ -683,7 +762,8 @@ function applyUpdate() {
     // Windows 安装位置由 install.ps1 铺好（%LOCALAPPDATA%\Programs\WorkDaddy）
     const scriptPath = path.join(__dirname, 'apply-update.ps1');
     const appDir = WORKDADDY_DIR_WIN;
-    const srcZip = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.zip');
+    const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
+    const srcZip = path.join(UPDATE_DIR, updatePrefix + updateState.latest + '.zip');
     if (!fs.existsSync(scriptPath)) {
       const error = new Error('缺少 apply-update.ps1');
       markAttemptFailure(error, 'preflight-error');
@@ -721,7 +801,7 @@ function applyUpdate() {
     const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
     const child = spawn(
       wscript,
-      ['//nologo', applyVbs, scriptPath, srcZip, appDir, String(ACTUAL_PORT), applyLog, attempt.id],
+      ['//nologo', applyVbs, scriptPath, srcZip, appDir, String(ACTUAL_PORT), applyLog, attempt.id, PROFILE.id],
       { detached: true, stdio: 'ignore', windowsHide: true }
     );
     child.once('error', markSpawnFailure);
@@ -744,14 +824,15 @@ function applyUpdate() {
   }
   const scriptPath = path.join(__dirname, 'apply-update.sh');
   const appPath = macWorkDaddyAppPath();
-  const srcApp = path.join(UPDATE_DIR, 'WorkDaddy.app');
+  const srcApp = path.join(UPDATE_DIR, WORKDADDY_INSTALL_NAME + '.app');
   if (!fs.existsSync(scriptPath)) {
     const error = new Error('缺少 apply-update.sh');
     markAttemptFailure(error, 'preflight-error');
     return Promise.reject(error);
   }
   // 解出新应用：下载阶段只落了 .dmg，这里才把 WorkDaddy.app 从 dmg 解到 UPDATE_DIR（幂等：已解出则复用）
-  const dmgPath = path.join(UPDATE_DIR, 'WorkDaddy-' + updateState.latest + '.dmg');
+  const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
+  const dmgPath = path.join(UPDATE_DIR, updatePrefix + updateState.latest + '.dmg');
   const preUnpack = fs.existsSync(srcApp)
     ? Promise.resolve(srcApp)
     : (fs.existsSync(dmgPath)
@@ -797,7 +878,7 @@ function rotateLogsIfNeeded() {
 }
 
 function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
+  const line = `[${new Date().toISOString()}] [client=${PROFILE.name}] [profile=${PROFILE.id}] ${args.join(' ')}\n`;
   // launchd/nohup 已把 stdout 重定向到同一个文件；只写一次，避免每条日志重复。
   try {
     rotateLogsIfNeeded();
@@ -904,7 +985,7 @@ function scheduleBackup(reason) {
 }
 
 // 兜底：登录文件本身变化（每次打开/刷新 WorkBuddy 都会重写该文件）
-fs.watchFile(AUTH_FILE, { interval: WATCH_INTERVAL }, (cur, prev) => {
+if (AUTH_FILE) fs.watchFile(AUTH_FILE, { interval: WATCH_INTERVAL }, (cur, prev) => {
   // 文件被移走（如"假退出登录"）时不应触发备份；仅当文件存在且 mtime 变化才备份
   if (!fs.existsSync(AUTH_FILE)) return;
   if (cur.mtimeMs !== prev.mtimeMs) scheduleBackup('file-change');
@@ -917,6 +998,7 @@ const cdp = {
   connected: false,
   port: null,
   targetUrl: null,
+  targetTitle: null,
   error: null,
   id: 0,
   pending: new Map(),
@@ -939,7 +1021,11 @@ let lastInjectTs = 0;
 let injectRetryTimer = null; // 被节流跳过的自动注入的兜底补种定时器
 
 async function findCdpEndpoint() {
-  const ports = cdpPortCandidates();
+  // profile 已由启动器绑定时不能扫描其他产品的端口；CodeBuddy Agents/Editor
+  // 共用 Browser 标识，跨 profile 扫描会把注入发到另一端。
+  const ports = process.env.WBSWITCH_PROFILE
+    ? [CDP_PORT_HINT, readCdpPortFile()].filter((p, i, a) => validCdpPort(p) && a.indexOf(p) === i)
+    : cdpPortCandidates();
   for (const p of ports) {
     try {
       const [versionRes, listRes] = await Promise.all([
@@ -949,7 +1035,8 @@ async function findCdpEndpoint() {
       const version = await versionRes.json();
       const list = await listRes.json();
       const targets = Array.isArray(list) ? list : [];
-      const belongsToWorkBuddy = /workbuddy|codebuddy/i.test([version.Browser, version['User-Agent']].filter(Boolean).join(' '));
+      const browserInfo = [version.Browser, version['User-Agent']].filter(Boolean).join(' ');
+      const belongsToWorkBuddy = /workbuddy|codebuddy/i.test(browserInfo);
       if (belongsToWorkBuddy && targets.some(isWorkBuddyCdpTarget)) {
         if (readCdpPortFile() !== p) writeCdpPortFile(p);
         return p;
@@ -965,12 +1052,9 @@ async function findCdpEndpoint() {
 }
 
 function isWorkBuddyCdpTarget(target) {
-  if (!target || target.type !== 'page') return false;
-  const url = String(target.url || '');
-  const title = String(target.title || '');
-  return /(?:^|\/)WorkBuddy\.app(?:\/|$)/i.test(url) ||
-    /https?:\/\/(?:[^/]+\.)?(?:workbuddy|codebuddy)\.cn(?:\/|$)/i.test(url) ||
-    /^WorkBuddy(?:\s|$)/i.test(title);
+  // 严格归属判定（见 cdp-targets.js）：页面明确属于其他客户端 → 一律拒绝，
+  // 未绑定 profile 的旧 daemon 不会再靠标题 "WorkBuddy" 误连兄弟客户端页面。
+  return isTargetForProfile(target, PROFILE);
 }
 
 async function getPageTarget(port) {
@@ -988,6 +1072,12 @@ async function cleanupForeignInjectedTargets(targets) {
 }
 
 async function cleanupForeignInjectedTarget(target) {
+  // 四客户端同族页面可能携带其他 profile daemon 注入的合法组件（如未绑定 CN daemon
+  // 扫描到 WorkBuddy AI 页面），必须跳过，不能当作"历史误注入"清理。
+  if (looksLikeWbFamilyTarget(target)) {
+    log(`[cdp] 跳过同族页面清理: ${(target.title || target.url || 'unknown').slice(0, 80)}`);
+    return;
+  }
   await new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -1085,6 +1175,7 @@ async function connectCdp() {
       cdp.connected = true;
       cdp.error = null;
       cdp.targetUrl = target.url || '';
+      cdp.targetTitle = target.title || '';
       log(`[cdp] 已连接 WorkBuddy (port=${cdp.port}, target=${cdp.targetUrl})`);
       // 打开感兴趣的能力域
       cdpSend('Page.enable').catch(() => {});
@@ -1192,8 +1283,9 @@ async function reloadWorkBuddyPage() {
   await cdpSend('Page.reload', { ignoreCache: false });
 }
 
-const WORKBUDDY_APP = IS_WIN ? '' : '/Applications/WorkBuddy.app';
+const WORKBUDDY_APP = IS_WIN ? '' : PROFILE.appPath;
 const WORKBUDDY_BINARY = IS_WIN ? '' : `${WORKBUDDY_APP}/Contents/MacOS/Electron`;
+const WORKBUDDY_APP_NAME = path.basename(WORKBUDDY_APP).replace(/\.app$/i, '');
 
 // Windows：解析 WorkBuddy 可执行文件真实路径（安装盘可自定义，必须动态查）
 // 优先级：WBSWITCH_WORKBUDDY_BIN > 运行进程 Path > 注册表卸载项 > 常见路径
@@ -1346,7 +1438,7 @@ async function quitWorkBuddy() {
   }
 
   // 先尝试正常退出（给 Electron 一次处理机会），再强制 kill 并验证。
-  await runCommand('osascript', ['-e', 'tell application "WorkBuddy" to quit']);
+  await runCommand('osascript', ['-e', `tell application "${WORKBUDDY_APP_NAME}" to quit`]);
   if (await waitForWorkBuddyExit(2500)) return true;
   await runCommand('pkill', ['-f', WORKBUDDY_APP]);
   if (await waitForWorkBuddyExit(2500)) return true;
@@ -1358,12 +1450,14 @@ async function quitWorkBuddy() {
 /** 探测 WorkDaddy.app 位置（macOS 专用：退出登录后打开它，由其 launcher 以 CDP 模式重启 WorkBuddy 并注入组件） */
 function findWorkDaddyApp() {
   if (IS_WIN) return null;
+  const appPackageName = WORKDADDY_INSTALL_NAME + '.app';
   const cands = [
-    '/Applications/WorkDaddy.app',
-    path.join(os.homedir(), 'Applications', 'WorkDaddy.app'),
-    path.join(os.homedir(), 'Desktop', 'WorkDaddy.app'),
+    path.join('/Applications', appPackageName),
+    path.join(os.homedir(), 'Applications', appPackageName),
+    path.join(os.homedir(), 'Desktop', appPackageName),
+    path.join(__dirname, '..', appPackageName),
     path.join(__dirname, '..', 'WorkDaddy.app'),
-    path.join(__dirname, '..', '..', 'workbuddy-switch', 'WorkDaddy.app'),
+    path.join(__dirname, '..', '..', 'workbuddy-switch', appPackageName),
   ];
   for (const c of cands) {
     try {
@@ -1546,11 +1640,23 @@ async function waitPageLoaded(timeoutMs = 6000) {
  */
 /* ================= 积分自动领取（直接调接口，带每日缓存） ================= */
 
-const CHECKIN_ENDPOINTS = [
-  'https://www.workbuddy.cn/billing/meter/daily-checkin',
-  'https://www.workbuddy.cn/v2/billing/meter/daily-checkin',
-  'https://www.codebuddy.cn/v2/billing/meter/daily-checkin',
-];
+// 签到接口按 profile 归属域名生成：国际版（WorkBuddy AI）命中 www.workbuddy.ai，
+// 国内版保留多域名兜底（workbuddy.cn / codebuddy.cn 账号体系互通）。
+function profileCheckinEndpoints() {
+  const host = PROFILE.apiHost || 'https://www.workbuddy.cn';
+  const eps = [
+    `${host}/billing/meter/daily-checkin`,
+    `${host}/v2/billing/meter/daily-checkin`,
+  ];
+  if (PROFILE.region === 'cn') {
+    eps.push(
+      'https://www.codebuddy.cn/billing/meter/daily-checkin',
+      'https://www.codebuddy.cn/v2/billing/meter/daily-checkin'
+    );
+  }
+  return Array.from(new Set(eps));
+}
+const CHECKIN_ENDPOINTS = profileCheckinEndpoints();
 const CHECKIN_CACHE_FILE = path.join(DATA_DIR, 'checkin-cache.json');
 const CHECKIN_REQUEST_TIMEOUT_MS = 12000;
 const CHECKIN_QUEUE_DELAY_MS = 250;
@@ -1587,6 +1693,7 @@ function saveCheckinCache(cache) {
  * 成功 / 已签（code=10001）均视为当日已完成。
  */
 async function dailyCheckin(accessToken) {
+  const origin = PROFILE.apiHost || 'https://www.workbuddy.cn';
   let lastErr = null;
   for (const url of CHECKIN_ENDPOINTS) {
     const controller = new AbortController();
@@ -1598,8 +1705,8 @@ async function dailyCheckin(accessToken) {
           accept: 'application/json, text/plain, */*',
           'content-type': 'application/json',
           'x-client-platform': 'web',
-          origin: 'https://www.workbuddy.cn',
-          referer: 'https://www.workbuddy.cn/profile/plans-usage',
+          origin: origin,
+          referer: origin + '/profile/plans-usage',
           authorization: 'Bearer ' + accessToken,
           'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
         },
@@ -1654,6 +1761,7 @@ async function claimDailyForUid(uid) {
 
 /** 对所有账号执行每日签到（自动跳过今日已成功过的，带并发保护） */
 async function claimDailyForAll() {
+  if (!PROFILE.capabilities.accounts) return { skipped: true, reason: 'profile-no-account-files' };
   if (claimInFlight) return { skipped: true, reason: 'in-flight', checkin: checkinSnapshot() };
   claimInFlight = true;
   try {
@@ -1687,6 +1795,15 @@ function injectWidget(reason) {
   if (!cdp.connected) {
     return Promise.reject(new Error('CDP 未连接，无法注入组件'));
   }
+  // 防御闸：绝不向其他客户端的页面注入。四客户端支持后，未绑定 profile 的旧 daemon
+  // 可能扫到兄弟客户端页面；其余环节（归属判定/清理跳过）已拦截，这里作为最后一道保险。
+  if (cdp.targetUrl) {
+    const cls = classifyTarget(cdp.targetUrl, cdp.targetTitle || '');
+    if (cls && cls !== PROFILE.id) {
+      log(`[cdp] 目标页面属于 ${cls}（当前 profile=${PROFILE.id}），拒绝注入`);
+      return Promise.reject(new Error(`目标页面 ${cls} 不属于当前 profile ${PROFILE.id}`));
+    }
+  }
   // 节流：仅抑制 connect 与 page-load 在 <1s 内连发的重复注入（避免闪烁）。
   // 关键：manual（launcher/用户显式 /api/inject）恒不等候、必须无条件注入——
   // 否则 WorkBuddy 重启后仅有的注入机会会被节流吞掉（多台机器 FAB 缺失的根因：
@@ -1716,6 +1833,8 @@ function injectWidget(reason) {
   // 同步注入当前 daemon 版本号（inject.js 顶部的 __WBS_VERSION__ 占位符会在面板「关于」页直接展示，
   // 这样版本升级后不需要改 inject.js、面板永远显示 daemon 的真实版本）
   script = script.replace(/__WBS_VERSION__/g, DAEMON_VERSION);
+  script = script.replace(/__WBS_PROFILE__/g, PROFILE.id);
+  script = script.replace(/__WBS_CAPS__/g, JSON.stringify(PROFILE.capabilities));
   // 注入策略：不使用 addScriptToEvaluateOnNewDocument（它会在浏览器里持久化注册，
   // 多次重启会叠加旧版本；旧注册先执行并占住 window.__wbsWidget 守卫，导致新代码被拦截）。
   // 改为：先用 Runtime.evaluate 暴力清理任何历史残留（不依赖旧版本的 destroy，避免清不干净），
@@ -1835,7 +1954,7 @@ async function writeDiagnosticsSnapshot(reason) {
 
 
 // ===== SESSIONS_API_MARK：会话管理（读 WorkBuddy workbuddy.db）=====
-const SESSIONS_DB = path.join(os.homedir(), '.workbuddy', 'workbuddy.db');
+const SESSIONS_DB = PROFILE.sessionDb;
 // Windows：无系统 sqlite3 CLI，优先用 Node 内置 node:sqlite（需 --experimental-sqlite 启动，launcher/install 已统一加）
 let NodeSqlite = null;
 if (IS_WIN) { try { NodeSqlite = require('node:sqlite'); } catch (_) { NodeSqlite = null; } }
@@ -1845,6 +1964,9 @@ function sqliteIsWrite(sql) {
   return /^\s*(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|VACUUM|REINDEX|ANALYZE|BEGIN|COMMIT|ROLLBACK|ATTACH|DETACH)\b/i.test(String(sql || ''));
 }
 function sqliteRun(sql) {
+  if (PROFILE.kind === 'codebuddy') {
+    return Promise.reject(new Error(`${PROFILE.name} 会话库暂只支持读取`));
+  }
   if (IS_WIN && NodeSqlite) {
     return new Promise((resolve, reject) => {
       let db = null;
@@ -1883,7 +2005,57 @@ function sqliteRun(sql) {
     p.stdin.end(sql);
   });
 }
+function codeBuddySessionRows() {
+  if (NodeSqlite) {
+    try {
+      const db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: true });
+      const items = db.prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'session:%'").all();
+      db.close();
+      return Promise.resolve(items.map((item) => ({ key: item.key, value: item.value })));
+    } catch (e) {
+      return Promise.reject(new Error('CodeBuddy 会话库读取失败: ' + e.message));
+    }
+  }
+  return new Promise((resolve, reject) => {
+    const p = spawn('sqlite3', ['-json', SESSIONS_DB, 'SELECT key, value FROM ItemTable WHERE key LIKE \'session:%\';'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', (e) => reject(new Error('sqlite3 不可用: ' + e.message)));
+    p.on('close', (code) => {
+      if (code !== 0) return reject(new Error('CodeBuddy 会话库读取失败: ' + err.slice(0, 200)));
+      let items = [];
+      try { items = JSON.parse(out || '[]'); } catch (e) { return reject(new Error('CodeBuddy 会话记录解析失败: ' + e.message)); }
+      resolve(items.map((item) => {
+        let value = {};
+        try { value = typeof item.value === 'string' ? JSON.parse(item.value) : (item.value || {}); } catch (_) {}
+        const id = String(value.conversationId || String(item.key || '').replace(/^session:/, ''));
+        return {
+          id, cwd: value.cwd || '', user_id: value.userId || '', title: value.title || '', custom_title: value.title || '',
+          status: value.status || '', created_at: value.createdAt || null, updated_at: value.updatedAt || null,
+          last_activity_at: value.updatedAt || null, is_playground: value.isPlayground ? 1 : 0,
+          deleted_at: null, source_mode: value.mode || 'agents', mode: value.mode || 'agents', model: value.model || '',
+        };
+      }));
+    });
+  });
+}
 async function sqliteQuery(sql) {
+  if (PROFILE.kind === 'codebuddy') {
+    const rows = await codeBuddySessionRows();
+    const textSql = String(sql || '');
+    const uidMatch = textSql.match(/user_id\s*=\s*'([^']*)'/i);
+    const idMatch = textSql.match(/id\s+IN\s*\(([^)]*)\)/i);
+    let filtered = rows;
+    if (uidMatch) filtered = filtered.filter((r) => String(r.user_id) === uidMatch[1]);
+    if (idMatch) {
+      const ids = new Set(Array.from(idMatch[1].matchAll(/'([^']*)'/g)).map((m) => m[1]));
+      filtered = filtered.filter((r) => ids.has(String(r.id)));
+    }
+    if (/SELECT\s+DISTINCT\s+cwd/i.test(textSql)) return Array.from(new Set(filtered.map((r) => r.cwd).filter(Boolean))).map((cwd) => ({ cwd }));
+    if (/SELECT\s+user_id/i.test(textSql) && /LIMIT\s+1/i.test(textSql)) return filtered.slice(0, 1).map((r) => ({ user_id: r.user_id }));
+    return filtered;
+  }
   const out = await sqliteRun(sql);
   if (!out.trim()) return [];
   const lines = out.trim().split('\n');
@@ -1995,7 +2167,7 @@ async function insertCopiedSession(src, targetUid, newId) {
 async function copySessionRecord(src, targetUid, options = {}) {
   const sourceUid = String(options.sourceUid || src.user_id || '').trim();
   const auto = !!options.auto;
-  const wbHome = path.join(os.homedir(), '.workbuddy');
+  const wbHome = PROFILE.dataRoot;
   let lineageId = options.lineageId || null;
   const sourceLineage = sourceUid ? getAutoCopySession(DATA_DIR, sourceUid, src.id) : { lineageId: null, enabled: false };
   if (!lineageId && sourceLineage.enabled) lineageId = sourceLineage.lineageId;
@@ -2261,7 +2433,7 @@ const ASK_MODE_RULE = [
 ].join('\n');
 
 function workbuddySettingsPath() {
-  return path.join(os.homedir(), '.workbuddy', 'settings.json');
+  return path.join(PROFILE.dataRoot, 'settings.json');
 }
 
 function readWorkbuddySettings() {
@@ -2325,6 +2497,7 @@ function setAskMode(enabled) {
 
 /** 启动时调用：如已启用决策弹窗，把旧的 ASK_MODE_RULE 替换为最新版本（用 ASK_MODE_TAG_START/END 精确识别） */
 function refreshAskModeIfEnabled() {
+  if (PROFILE.kind !== 'workbuddy') return;
   try {
     const state = getAskModeState();
     if (!state.enabled) return;
@@ -2336,6 +2509,7 @@ function refreshAskModeIfEnabled() {
 }
 
 function currentAccount() {
+  if (!PROFILE.capabilities.accounts || !AUTH_FILE) return null;
   try {
     const c = readAuthFile();
     const a = (c.raw && c.raw.auth) || {};
@@ -2532,6 +2706,7 @@ function builtinAssetsDir() {
  * 不覆盖用户已有的自定义/删减内容（已存在的文件不动）。
  */
 function initBuiltinAssets() {
+  if (!PROFILE.capabilities.theme) return;
   try {
     const src = builtinAssetsDir();
     if (!src) {
@@ -2801,6 +2976,7 @@ function getTheme(id) {
 
 /** 恢复已保存的主题（CDP 连接/页面刷新后调用）：读取 current-theme.json 重新应用，保证深浅色在重启/刷新后仍生效 */
 async function restoreSavedTheme() {
+  if (!PROFILE.capabilities.theme) return;
   if (!cdp.connected) return;
   let id = 'default';
   try {
@@ -2863,6 +3039,7 @@ function themeExtrasCss() {
 }
 
 async function applyThemeByCdp(id) {
+  if (!PROFILE.capabilities.theme) throw new Error(`${PROFILE.name} 暂不支持主题功能`);
   if (!cdp.connected) throw new Error('CDP 未连接');
   const theme = getTheme(id);
   const colors = (theme && theme.colors) || {};
@@ -3267,14 +3444,16 @@ function formatLocalDateTime(d) {
  * 接口返回 Account 数组，累加每个 Account 的 CapacityRemainPrecise。
  */
 async function fetchResource(accessToken, body, source) {
-  const r = await fetch('https://www.workbuddy.cn/billing/meter/get-user-resource', {
+  // 积分查询与签到同源：按 profile 归属域名请求（国际版为 www.workbuddy.ai）
+  const apiHost = PROFILE.apiHost || 'https://www.workbuddy.cn';
+  const r = await fetch(`${apiHost}/billing/meter/get-user-resource`, {
     method: 'POST',
     headers: {
       accept: 'application/json, text/plain, */*',
       'content-type': 'application/json',
       'x-client-platform': 'web',
-      origin: 'https://www.workbuddy.cn',
-      referer: 'https://www.workbuddy.cn/profile/plans-usage',
+      origin: apiHost,
+      referer: `${apiHost}/profile/plans-usage`,
       authorization: `Bearer ${accessToken}`,
       'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
     },
@@ -3613,6 +3792,7 @@ function handleApi(req, res) {
       ok: true,
       version: DAEMON_VERSION,
       buildId: DAEMON_BUILD_ID,
+      profile: { id: PROFILE.id, name: PROFILE.name, kind: PROFILE.kind, mode: PROFILE.mode, capabilities: PROFILE.capabilities },
       cdp: {
         connected: cdp.connected,
         port: cdp.port,
@@ -3649,10 +3829,11 @@ function handleApi(req, res) {
     const accounts = listAccounts(DATA_DIR);
     const cache = loadCheckinCache();
     const today = todayStr();
+    const checkinPending = !!claimInFlight;
     const enriched = accounts.map((a) => {
       const c = cache[a.uid];
       return Object.assign({}, a, {
-        checkin: c && c.date === today ? { ok: c.ok, already: c.already, code: c.code, message: c.message } : null,
+        checkin: checkinDisplayValue(c, today, checkinPending),
       });
     });
     return json(res, 200, { ok: true, current: currentAccount(), accounts: enriched, checkin: checkinSnapshot() });
@@ -3988,7 +4169,24 @@ function handleApi(req, res) {
     } catch (e) {
       officialError = e.message;
     }
-    return json(res, 200, { ok: true, file: workbuddyModelsFile(), official, officialError, backups: listModelBackups(DATA_DIR) });
+    return json(res, 200, { ok: true, file: workbuddyModelsFile(), official, officialError, backups: listModelBackups(DATA_DIR), imports: listInstalledModelSources(PROFILE.id) });
+  }
+  if (req.method === 'POST' && p === '/api/models/import') {
+    return readBody(req).then((body) => {
+      try {
+        const profileId = String((body && body.profileId) || '').trim();
+        const source = listInstalledModelSources(PROFILE.id).find((item) => item.profileId === profileId);
+        if (profileId === PROFILE.id) return json(res, 400, { ok: false, error: '不能从当前客户端导入模型' });
+        if (!source) return json(res, 404, { ok: false, error: '未找到可导入的客户端模型配置' });
+        // 两个 WorkBuddy 桌面端共用同一 models.json：配置天然互通，无需导入
+        if (source.shared) return json(res, 200, { ok: true, shared: true, imported: [], skipped: [] });
+        if (!source.available) return json(res, 404, { ok: false, error: `未找到 ${source.name} 的模型配置文件` });
+        const result = importModels(workbuddyModelsFile(), source.modelsFile);
+        return json(res, 200, { ok: true, imported: result.imported, skipped: result.skipped, official: result.official });
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message || String(e) });
+      }
+    });
   }
   if (req.method === 'POST' && p === '/api/models/backup') {
     return readBody(req).then((body) => {
@@ -4054,7 +4252,7 @@ function handleApi(req, res) {
         const ids = Array.isArray(body && body.backupIds) ? body.backupIds : [];
         if (!ids.length) return json(res, 400, { ok: false, error: '未选择模型备份' });
         const deleted = deleteModelBackups(DATA_DIR, ids);
-        return json(res, 200, { ok: true, deleted, backups: listModelBackups(DATA_DIR) });
+        return json(res, 200, { ok: true, requested: ids.length, deleted, backups: listModelBackups(DATA_DIR) });
       } catch (e) {
         return json(res, 400, { ok: false, error: e.message });
       }
@@ -4157,7 +4355,7 @@ function handleApi(req, res) {
         // 1) 真实删除 DB 记录（非软删）
         await sqliteRun("DELETE FROM sessions WHERE id IN (" + esc + ");");
         // 2) 删除本地消息文件（jsonl/目录/workspace/tasks/file-history/artifact-index）
-        const wbHome = path.join(os.homedir(), '.workbuddy');
+        const wbHome = PROFILE.dataRoot;
         let filesRemoved = 0;
         for (const id of ids) filesRemoved += deleteSessionFiles(wbHome, id);
         let rulesRemoved = 0;
@@ -4363,15 +4561,15 @@ function handleApi(req, res) {
     } catch (_) { /* 解析失败忽略 */ }
     return json(res, 200, {
       ok: true,
-      name: 'WorkDaddy',
-      tagline: 'WorkBuddy 的多账号 · 主题 · 增强工具集',
+      name: WORKDADDY_INSTALL_NAME,
+      tagline: PROFILE.name + ' 的多账号 · 主题 · 增强工具集',
       version: build.version,
       appVersion: appVersion,
       license: 'AGPL-3.0',
       repository: 'https://github.com/babygoton/WorkDaddy',
       principle: '本机回环 CDP 注入 · 不改官方安装包',
       platform: IS_WIN ? 'Windows 10+（x64）' : 'macOS 11+',
-      author: 'WorkDaddy',
+      author: WORKDADDY_INSTALL_NAME,
       nodeVersion: process.version,
       ...platform,
       ...build,
@@ -4793,10 +4991,10 @@ function startServer() {
       const c = currentAccount();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(
-        '<!doctype html><html lang="zh"><meta charset="utf-8"><title>WorkDaddy</title>' +
+        '<!doctype html><html lang="zh"><meta charset="utf-8"><title>' + WORKDADDY_INSTALL_NAME + '</title>' +
         '<body style="font-family:-apple-system,sans-serif;background:#0f1115;color:#e6e6e8;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">' +
-        '<div style="text-align:center"><h1 style="margin:0 0 8px">WorkDaddy v' + DAEMON_VERSION + '</h1>' +
-        '<p style="color:#9a9aa0;margin:0">面板入口：WorkBuddy 右下角机器人按钮</p>' +
+        '<div style="text-align:center"><h1 style="margin:0 0 8px">' + WORKDADDY_INSTALL_NAME + ' v' + DAEMON_VERSION + '</h1>' +
+        '<p style="color:#9a9aa0;margin:0">面板入口：' + PROFILE.name + ' 右下角机器人按钮</p>' +
         '<p style="color:#555;font-size:12px;margin-top:16px">守护进程运行中 · CDP ' + (cdp.connected ? '已连接' : '未连接') +
         (c && c.nickname ? ' · 当前账号：' + String(c.nickname).replace(/</g, '&lt;') : '') + '</p></div></body></html>'
       );
@@ -4937,7 +5135,7 @@ process.on('SIGTERM', () => {
   releaseDaemonLock();
   try { stopCaffeinate(); } catch (_) {}
   try {
-    fs.unwatchFile(AUTH_FILE);
+    if (AUTH_FILE) fs.unwatchFile(AUTH_FILE);
   } catch (_) {}
   process.exit(0);
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 一键修复/启用 CDP 模式：
-#   1) 把守护进程注册到 launchd（独立于 WorkBuddy 存活，重启应用/重启电脑都不影响）
+# 一键修复/启用 CDP 模式（仅手动启动 daemon，不注册登录自启）：
+#   1) 清理旧的 launchd 注册并手动启动守护进程
 #   2) 彻底退出 WorkBuddy（注意：其进程名是 Electron，不能按 "WorkBuddy" 杀）
 #   3) 带 --remote-debugging-port 直接执行应用二进制启动（保证参数生效）
 #   4) 验证 CDP 端口开放
@@ -15,19 +15,27 @@ set -uo pipefail
 
 PORT="${WBSWITCH_CDP_PORT:-${1:-}}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LABEL="com.workbuddy.workdaddy"
+PROFILE="${WBSWITCH_PROFILE:-workbuddy-cn}"
+case "$PROFILE" in
+  workbuddy-ai) APP_NAME="WorkBuddy AI"; APP_BIN="/Applications/WorkBuddy AI.app/Contents/MacOS/Electron"; DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy/profiles/workbuddy-ai"; DEFAULT_UI_PORT=47833; DEFAULT_CDP_PORT=9223; AUTH_DEFAULT="$HOME/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info" ;;
+  codebuddy-cn) APP_NAME="CodeBuddy CN"; APP_BIN="/Applications/CodeBuddy CN.app/Contents/MacOS/Electron"; DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy/profiles/codebuddy-cn"; DEFAULT_UI_PORT=47834; DEFAULT_CDP_PORT=9224; AUTH_DEFAULT="" ;;
+  codebuddy-intl) APP_NAME="CodeBuddy"; APP_BIN="/Applications/CodeBuddy.app/Contents/MacOS/Electron"; DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy/profiles/codebuddy-intl"; DEFAULT_UI_PORT=47835; DEFAULT_CDP_PORT=9225; AUTH_DEFAULT="" ;;
+  *) PROFILE="workbuddy-cn"; APP_NAME="WorkBuddy"; APP_BIN="/Applications/WorkBuddy.app/Contents/MacOS/Electron"; DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy"; DEFAULT_UI_PORT=47832; DEFAULT_CDP_PORT=9222; AUTH_DEFAULT="$HOME/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info" ;;
+esac
+export WBSWITCH_PROFILE="$PROFILE"
+if [ -z "$PORT" ]; then PORT="$DEFAULT_CDP_PORT"; fi
+LABEL="com.workbuddy.workdaddy.${PROFILE}"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 LEGACY_LABEL="com.workbuddy.hellobuddy"
 LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
-DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy"
 LEGACY_DATA_DIR="$HOME/Library/Application Support/HelloBuddy"
 if [ "${WBSWITCH_DATA_DIR:-}" = "$LEGACY_DATA_DIR" ]; then
   DATA_DIR="$DEFAULT_DATA_DIR"
 else
   DATA_DIR="${WBSWITCH_DATA_DIR:-$DEFAULT_DATA_DIR}"
 fi
-AUTH_FILE="${WBSWITCH_AUTH_FILE:-$HOME/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info}"
-APP_BIN="/Applications/WorkBuddy.app/Contents/MacOS/Electron"
+UI_PORT="${WBSWITCH_PORT:-$DEFAULT_UI_PORT}"
+AUTH_FILE="${WBSWITCH_AUTH_FILE:-$AUTH_DEFAULT}"
 CDP_PORT_FILE="$DATA_DIR/cdp-port.json"
 
 # 统一使用的 node 路径（优先系统 PATH，兜底用 managed runtime）
@@ -72,7 +80,14 @@ resolve_cdp_port() {
 }
 resolve_cdp_port
 
-# 清理旧版常驻服务，但保留 HelloBuddy 数据目录；新 daemon 会在启动时迁移旧账号。
+# 清理旧版常驻服务和旧 profile 自启项，但保留账号数据；daemon 仅由本次手动执行启动。
+for old_profile in workbuddy-cn workbuddy-ai codebuddy-cn codebuddy-intl; do
+  old_label="com.workbuddy.workdaddy.${old_profile}"
+  old_plist="$HOME/Library/LaunchAgents/${old_label}.plist"
+  launchctl bootout "gui/$(id -u)" "$old_plist" 2>/dev/null || true
+  launchctl remove "$old_label" 2>/dev/null || true
+  rm -f "$old_plist"
+done
 launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST" 2>/dev/null || true
 launchctl remove "$LEGACY_LABEL" 2>/dev/null || true
 rm -f "$LEGACY_PLIST"
@@ -151,40 +166,32 @@ launch_plugin() {
     *) echo "已取消"; exit 0 ;;
   esac
 
-  # ---------- 1. 注册 launchd 守护进程（若尚未注册） ----------
-  if [ -f "$PLIST" ] && ! launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
-    echo "==> 注册 launchd 守护进程（使后台服务独立于 WorkBuddy 存活）"
-    # 先停掉可能存在的临时守护进程，避免双实例抢端口
-    pkill -f "scripts/daemon.js" 2>/dev/null || true
-    sleep 1
-    if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
-      echo "   launchd 注册成功"
-    else
-      echo "   警告：launchd 注册失败，改用 nohup 方式启动守护进程（重启电脑后需重新执行本脚本）"
-      mkdir -p "$DATA_DIR/accounts"
-      WBSWITCH_DATA_DIR="$DATA_DIR" nohup "$NODE_BIN" "$DIR/scripts/daemon.js" >> "$DATA_DIR/daemon.log" 2>&1 &
-      disown 2>/dev/null || true
-    fi
+  # ---------- 1. 手动启动 daemon（不注册 launchd，避免多个 profile 登录自启） ----------
+  if ! curl -s -m 1 "http://127.0.0.1:${UI_PORT}/api/status" >/dev/null 2>&1; then
+    echo "==> 手动启动 WorkDaddy 守护进程"
+    mkdir -p "$DATA_DIR/accounts"
+    WBSWITCH_PROFILE="$PROFILE" WBSWITCH_DATA_DIR="$DATA_DIR" WBSWITCH_PORT="$UI_PORT" nohup "$NODE_BIN" "$DIR/scripts/daemon.js" >> "$DATA_DIR/daemon.log" 2>&1 &
+    disown 2>/dev/null || true
   else
-    echo "==> launchd 守护进程已注册，跳过"
+    echo "==> WorkDaddy 守护进程已运行，跳过启动"
   fi
 
   # 等待守护进程就绪
   for i in $(seq 1 10); do
-    curl -s -m 1 "http://127.0.0.1:${PORT:-47832}/api/status" >/dev/null 2>&1 && { echo "==> 守护进程运行中"; break; }
+    curl -s -m 1 "http://127.0.0.1:${UI_PORT}/api/status" >/dev/null 2>&1 && { echo "==> 守护进程运行中"; break; }
     sleep 1
   done
 
   # ---------- 2. 彻底退出 WorkBuddy ----------
   echo "==> 退出 WorkBuddy ..."
-  osascript -e 'quit app "WorkBuddy"' 2>/dev/null || true
+  osascript -e "quit app \"${APP_NAME}\"" 2>/dev/null || true
   sleep 3
   # 兜底：按真实进程路径精确清理（进程名是 Electron，切勿 killall Electron 以免误伤其他应用）
-  pkill -f "/Applications/WorkBuddy.app/Contents/MacOS/Electron" 2>/dev/null || true
+  pkill -f "$APP_BIN" 2>/dev/null || true
   sleep 2
-  if pgrep -f "/Applications/WorkBuddy.app/Contents/MacOS/Electron" >/dev/null 2>&1; then
+  if pgrep -f "$APP_BIN" >/dev/null 2>&1; then
     echo "   警告：WorkBuddy 仍在运行，强制结束"
-    pkill -9 -f "/Applications/WorkBuddy.app/Contents/MacOS/Electron" 2>/dev/null || true
+    pkill -9 -f "$APP_BIN" 2>/dev/null || true
     sleep 2
   fi
 

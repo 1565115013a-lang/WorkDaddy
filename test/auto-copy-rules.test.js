@@ -28,6 +28,8 @@ const {
   editModelBackup,
   deleteModelBackups,
   enableModelBackup,
+  importModels,
+  checkinDisplayValue,
 } = require('../scripts/lib.js');
 
 function tempDataDir() {
@@ -177,6 +179,28 @@ test('official model batch deletion only changes official config and leaves back
   assert.equal(fs.existsSync(path.join(dataDir, 'models', backup.backupId + '.json')), true);
 });
 
+test('model import appends new names and preserves current same-name configuration', () => {
+  const dataDir = tempDataDir();
+  const targetFile = path.join(dataDir, 'current.json');
+  const sourceFile = path.join(dataDir, 'source.json');
+  fs.writeFileSync(targetFile, JSON.stringify({ models: [
+    { id: 'shared-id', name: 'Shared', apiKey: 'current-key', url: 'https://current.invalid' },
+  ], metadata: { keep: true }}));
+  fs.writeFileSync(sourceFile, JSON.stringify({ models: [
+    { id: 'shared-id', name: 'Shared', apiKey: 'source-key', url: 'https://source.invalid' },
+    { id: 'new-id', name: 'New model', apiKey: 'new-key' },
+  ], metadata: { source: true }}));
+
+  const result = importModels(targetFile, sourceFile);
+  assert.deepEqual(result.imported, ['New model']);
+  assert.deepEqual(result.skipped, ['Shared']);
+  const saved = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
+  assert.equal(saved.metadata.keep, true);
+  assert.equal(saved.models.length, 2);
+  assert.equal(saved.models[0].apiKey, 'current-key');
+  assert.equal(saved.models[1].id, 'new-id');
+});
+
 test('api keys keep their full masked length without exposing the middle', () => {
   const raw = 'sk-abcdefghijklmnopqrstuvwxyz0123456789-dlzj';
   const masked = maskApiKey(raw);
@@ -184,4 +208,13 @@ test('api keys keep their full masked length without exposing the middle', () =>
   assert.equal(masked.slice(0, 3), 'sk-');
   assert.equal(masked.slice(-4), 'dlzj');
   assert.equal(masked.includes('abcdef'), false);
+});
+
+test('checkin display hides cached result while the current claim is still running', () => {
+  const record = { date: '2026-08-23', ok: true, already: false, code: 0, message: 'ok' };
+  assert.equal(checkinDisplayValue(record, '2026-08-23', true), null);
+  assert.deepEqual(checkinDisplayValue(record, '2026-08-23', false), {
+    ok: true, already: false, code: 0, message: 'ok',
+  });
+  assert.equal(checkinDisplayValue(record, '2026-08-22', false), null);
 });

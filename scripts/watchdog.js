@@ -15,11 +15,14 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
+const { getProfile, profileDataDir } = require('./profiles.js');
 
 const SCRIPTS_DIR = __dirname;
+const PROFILE_ID = process.env.WBSWITCH_PROFILE || 'workbuddy-cn';
+const PROFILE = getProfile(PROFILE_ID);
 const DATA_DIR =
   process.env.WBSWITCH_DATA_DIR ||
-  path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy');
+  profileDataDir(PROFILE);
 const PID_FILE = path.join(DATA_DIR, 'watchdog.pid');
 const LOG_FILE = path.join(DATA_DIR, 'watchdog.log');
 const UPDATE_PENDING_FILE = path.join(DATA_DIR, 'update', 'pending.json'); // 自动更新进行中标记（update 目录由 apply 流程创建）

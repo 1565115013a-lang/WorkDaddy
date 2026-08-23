@@ -16,6 +16,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { getProfile, profileDataDir, sharedDataDir } = require('./profiles.js');
 
 const IS_WIN = process.platform === 'win32';
 
@@ -39,9 +40,10 @@ function isLegacyDataDir(dataDir) {
 
 // macOS: ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
 // Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info（真机已确认）
-const AUTH_FILE =
-  process.env.WBSWITCH_AUTH_FILE ||
-  (IS_WIN
+const ACTIVE_PROFILE = getProfile();
+const AUTH_FILE = process.env.WBSWITCH_AUTH_FILE !== undefined
+  ? process.env.WBSWITCH_AUTH_FILE
+  : (ACTIVE_PROFILE.authFile === null ? null : (ACTIVE_PROFILE.authFile || (IS_WIN
     ? path.join(
         process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
         'CodeBuddyExtension',
@@ -53,7 +55,7 @@ const AUTH_FILE =
     : path.join(
         os.homedir(),
         'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
-      ));
+      ))));
 
 const LOGOUT_MARKER = `${AUTH_FILE}.logged-out`;
 
@@ -61,7 +63,7 @@ function defaultDataDir() {
   // 旧版 launchd 可能把 WBSWITCH_DATA_DIR 设成 HelloBuddy；新版本始终落到 WorkDaddy，
   // 避免旧服务被新 daemon 拉起后继续写入旧目录。
   const configured = process.env.WBSWITCH_DATA_DIR;
-  return configured && !isLegacyDataDir(configured) ? configured : PLATFORM_DATA_DIR;
+  return configured && !isLegacyDataDir(configured) ? configured : profileDataDir(ACTIVE_PROFILE);
 }
 
 function accountsDir(dataDir) {
@@ -72,10 +74,47 @@ function metaFile(dataDir) {
 }
 
 function workbuddyModelsFile() {
-  return path.join(os.homedir(), '.workbuddy', 'models.json');
+  return ACTIVE_PROFILE.modelsFile || path.join(os.homedir(), '.workbuddy', 'models.json');
+}
+
+function isManagedProfileDataDir(dataDir) {
+  const root = path.resolve(sharedDataDir());
+  const current = path.resolve(dataDir || '');
+  return current === root || current.startsWith(root + path.sep + 'profiles' + path.sep);
+}
+
+function migrateLegacyModelBackups(dataDir) {
+  if (!isManagedProfileDataDir(dataDir)) return;
+  const root = sharedDataDir();
+  const target = path.join(root, 'models');
+  const marker = path.join(target, '.legacy-migrated-v1');
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  // 迁移只允许发生一次。旧 profile 目录保留作兼容/恢复，但不能在用户删除
+  // 共享备份后再次把同一个文件复制回来。
+  if (fs.existsSync(marker)) return;
+  let profileDirs = [];
+  try { profileDirs = fs.readdirSync(path.join(root, 'profiles'), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => path.join(root, 'profiles', entry.name, 'models')); } catch (_) {}
+  for (const source of profileDirs) {
+    let names = [];
+    try { names = fs.readdirSync(source).filter((name) => /^[A-Za-z0-9_-]{8,100}\.json$/.test(name)); } catch (_) { continue; }
+    for (const name of names) {
+      const from = path.join(source, name);
+      const to = path.join(target, name);
+      if (fs.existsSync(to)) continue;
+      try { fs.copyFileSync(from, to); fs.chmodSync(to, 0o600); } catch (_) {}
+    }
+  }
+  try {
+    fs.writeFileSync(marker, JSON.stringify({ version: 1, migratedAt: new Date().toISOString(), deleted: [] }) + '\n', { mode: 0o600 });
+    fs.chmodSync(marker, 0o600);
+  } catch (_) {}
 }
 
 function modelBackupsDir(dataDir) {
+  if (isManagedProfileDataDir(dataDir)) {
+    migrateLegacyModelBackups(dataDir);
+    return path.join(sharedDataDir(), 'models');
+  }
   return path.join(dataDir, 'models');
 }
 
@@ -105,8 +144,15 @@ function sanitizeModel(model, opts) {
   };
 }
 
+function checkinDisplayValue(record, today, pending) {
+  if (pending || !record || record.date !== today) return null;
+  return { ok: !!record.ok, already: !!record.already, code: record.code, message: record.message };
+}
+
 function readModelsFile(file = workbuddyModelsFile()) {
-  if (!fs.existsSync(file)) throw new Error(`未找到模型配置文件: ${file}`);
+  // 文件不存在视为"还没有模型"，返回空列表而不是抛错——模型页应显示
+  // "当前还未添加模型"占位，而不是"当前模型加载失败: 未找到模型配置文件"。
+  if (!fs.existsSync(file)) return { file, format: 'array', models: [] };
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -256,10 +302,21 @@ function editModelBackup(dataDir, backupId, patch) {
 function deleteModelBackups(dataDir, backupIds) {
   const ids = Array.isArray(backupIds) ? backupIds : [];
   let deleted = 0;
+  const removed = [];
   for (const id of ids) {
     try {
       const file = modelBackupPath(dataDir, id);
-      if (fs.existsSync(file)) { fs.unlinkSync(file); deleted++; }
+      if (fs.existsSync(file)) { fs.unlinkSync(file); deleted++; removed.push(String(id)); }
+    } catch (_) {}
+  }
+  if (removed.length && isManagedProfileDataDir(dataDir)) {
+    const marker = path.join(sharedDataDir(), 'models', '.legacy-migrated-v1');
+    try {
+      const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+      const deletedIds = new Set(Array.isArray(state.deleted) ? state.deleted : []);
+      removed.forEach((id) => deletedIds.add(id));
+      fs.writeFileSync(marker, JSON.stringify(Object.assign({}, state, { deleted: Array.from(deletedIds) })) + '\n', { mode: 0o600 });
+      fs.chmodSync(marker, 0o600);
     } catch (_) {}
   }
   return deleted;
@@ -283,6 +340,29 @@ function enableModelBackup(dataDir, backupId, file = workbuddyModelsFile()) {
   if (!inserted) next.push(record.model);
   writeModelsFile(parsed, next);
   return { backupId, id: modelId, replaced: first >= 0, ...sanitizeModel(record.model) };
+}
+
+function modelImportName(model) {
+  return String(model && (model.name || model.id) || '').trim();
+}
+
+function importModels(targetFile, sourceFile) {
+  const target = readModelsFile(targetFile);
+  const source = readModelsFile(sourceFile);
+  if (path.resolve(target.file) === path.resolve(source.file)) throw new Error('不能从当前客户端导入模型');
+  const existing = new Set(target.models.map(modelImportName).filter(Boolean));
+  const imported = [];
+  const skipped = [];
+  for (const model of source.models) {
+    if (!model || typeof model !== 'object' || Array.isArray(model)) continue;
+    const name = modelImportName(model);
+    if (!name || existing.has(name)) { if (name) skipped.push(name); continue; }
+    target.models.push(model);
+    existing.add(name);
+    imported.push(name);
+  }
+  if (imported.length) writeModelsFile(target, target.models);
+  return { imported, skipped, official: target.models.map((model, index) => Object.assign({ index }, sanitizeModel(model, { revealKey: true }))) };
 }
 
 function readMeta(dataDir) {
@@ -704,6 +784,9 @@ function ensureDirs(dataDir, log = () => {}) {
 
 /** 读取登录信息文件并抽取账号关键字段（不返回令牌内容） */
 function readAuthFile() {
+  if (!ACTIVE_PROFILE.authFile && !process.env.WBSWITCH_AUTH_FILE) {
+    throw new Error(`${ACTIVE_PROFILE.name} 没有可读取的明文认证文件`);
+  }
   const raw = fs.readFileSync(AUTH_FILE, 'utf8');
   const json = JSON.parse(raw);
   if (!json || typeof json !== 'object') {
@@ -742,6 +825,7 @@ function updateMeta(dataDir, info) {
 
 /** 把当前登录信息备份到 accounts/<uid>.info（原子写入，0600） */
 function backupCurrent(dataDir, log = () => {}) {
+  if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号文件备份`);
   ensureDirs(dataDir, log);
   const info = readAuthFile();
   const dest = backupPath(dataDir, info.uid);
@@ -758,6 +842,7 @@ function backupCurrent(dataDir, log = () => {}) {
 
 /** 列出所有已备份账号（直接读备份文件提取展示字段，按最近刷新时间倒序） */
 function listAccounts(dataDir) {
+  if (!ACTIVE_PROFILE.capabilities.accounts) return [];
   migrateLegacyDataDir(dataDir);
   const dir = accountsDir(dataDir);
   let names = [];
@@ -805,6 +890,7 @@ function listAccounts(dataDir) {
 
 /** 永久删除某个账号的备份文件（不影响当前登录） */
 function deleteAccount(dataDir, uid) {
+  if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号切换`);
   migrateLegacyDataDir(dataDir);
   const file = backupPath(dataDir, uid);
   let deletedFile = false;
@@ -827,6 +913,7 @@ function deleteAccount(dataDir, uid) {
 
 /** 切换登录账号：把备份文件复制回登录信息文件（先校验 uid 匹配） */
 function switchTo(dataDir, uid, log = () => {}) {
+  if (!ACTIVE_PROFILE.capabilities.accounts) throw new Error(`${ACTIVE_PROFILE.name} 暂不支持账号切换`);
   migrateLegacyDataDir(dataDir, log);
   const src = backupPath(dataDir, uid);
   if (!fs.existsSync(src)) {
@@ -877,6 +964,7 @@ function switchTo(dataDir, uid, log = () => {}) {
 
 module.exports = {
   AUTH_FILE,
+  ACTIVE_PROFILE,
   defaultDataDir,
   migrateLegacyDataDir,
   accountsDir,
@@ -885,6 +973,7 @@ module.exports = {
   modelBackupsDir,
   maskApiKey,
   sanitizeModel,
+  checkinDisplayValue,
   listOfficialModels,
   readOfficialModel,
   readModelBackup,
@@ -895,6 +984,7 @@ module.exports = {
   editModelBackup,
   deleteModelBackups,
   enableModelBackup,
+  importModels,
   logFile,
   backupPath,
   retireLogoutMarker,

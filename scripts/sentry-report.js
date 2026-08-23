@@ -16,9 +16,18 @@ const DEFAULT_DSN = 'https://6cc1bae83102c222717df3b6e74ae9d4@o4511947624939520.
 const CLIENT = 'workdaddy-sentry/1';
 const HOME = os.homedir();
 const IS_WIN = process.platform === 'win32';
-const DATA_DIR = process.env.WBSWITCH_DATA_DIR || (IS_WIN
+const PROFILE_ID = String(process.env.WBSWITCH_PROFILE || 'workbuddy-cn').trim().toLowerCase();
+const CLIENT_VARIANT = PROFILE_ID === 'workbuddy-ai' ? 'workbuddy-ai'
+  : PROFILE_ID === 'codebuddy-cn' ? 'codebuddy-cn'
+    : PROFILE_ID === 'codebuddy-intl' ? 'codebuddy-intl' : 'workbuddy';
+const CLIENT_NAME = CLIENT_VARIANT === 'workbuddy-ai' ? 'WorkBuddy AI'
+  : CLIENT_VARIANT === 'codebuddy-cn' ? 'CodeBuddy CN'
+    : CLIENT_VARIANT === 'codebuddy-intl' ? 'CodeBuddy' : 'WorkBuddy';
+const SHARED_DATA_DIR = IS_WIN
   ? path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'WorkDaddy')
-  : path.join(HOME, 'Library', 'Application Support', 'WorkDaddy'));
+  : path.join(HOME, 'Library', 'Application Support', 'WorkDaddy');
+const DATA_DIR = process.env.WBSWITCH_DATA_DIR || (PROFILE_ID === 'workbuddy-cn'
+  ? SHARED_DATA_DIR : path.join(SHARED_DATA_DIR, 'profiles', PROFILE_ID));
 const OUTBOX_DIR = path.join(DATA_DIR, 'telemetry', 'outbox');
 const MAX_OUTBOX_FILES = 50;
 const MAX_FLUSH_FILES = 1;
@@ -153,6 +162,9 @@ function makeEvent({ stage, message, level = 'error', tags = {}, extra = {}, exc
     tags: sanitize({
       source: 'workdaddy',
       stage: stage || 'unknown',
+      client: CLIENT_VARIANT,
+      client_name: CLIENT_NAME,
+      workbuddy_variant: CLIENT_VARIANT === 'workbuddy-ai' ? 'workbuddy-ai' : CLIENT_VARIANT === 'workbuddy' ? 'workbuddy' : 'other',
       os: process.platform,
       arch: process.arch,
       workdaddy_version: version,
@@ -161,6 +173,7 @@ function makeEvent({ stage, message, level = 'error', tags = {}, extra = {}, exc
     contexts: {
       runtime: { name: 'node', version: process.version },
       os: { name: process.platform, version: os.release() },
+      client: { name: CLIENT_NAME, profile: PROFILE_ID, variant: CLIENT_VARIANT },
     },
     extra: sanitize(extra),
   };

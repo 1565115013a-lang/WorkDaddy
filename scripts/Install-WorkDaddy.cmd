@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================
 rem  WorkDaddy 一键安装（zip 解压后的顶层入口，双击运行）
-rem  作用：复制到 %LOCALAPPDATA%\Programs\WorkDaddy → 注册开机自启
+rem  作用：复制到 %LOCALAPPDATA%\Programs\WorkDaddy → 清理旧开机自启 → 创建桌面快捷方式
 rem        → 创建桌面快捷方式 → 启动守护进程并以调试模式拉起 WorkBuddy
 rem  提示：本插件为 WorkBuddy 的增强工具，需先安装 WorkBuddy 桌面端。
 rem        运行所需的 Node 运行时由 WorkBuddy 自带托管（.workbuddy\binaries\node），

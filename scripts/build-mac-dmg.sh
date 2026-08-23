@@ -17,8 +17,20 @@ cd "$DIR"
 
 VERSION="${WORKDADDY_BUILD_VERSION:-$(grep -o "DAEMON_VERSION = '[^']*'" scripts/daemon.js | head -1 | cut -d"'" -f2)}"
 APP="WorkDaddy.app"
-OUT="release/macos/WorkDaddy-${VERSION}.dmg"
+PROFILE="${WORKDADDY_BUILD_PROFILE:-}"
+if [ -z "$PROFILE" ]; then
+  for profile in workbuddy-cn workbuddy-ai; do
+    WORKDADDY_BUILD_PROFILE="$profile" bash "$0"
+  done
+  exit 0
+fi
+case "$PROFILE" in
+  workbuddy-ai) PACKAGE_APP_NAME="WorkDaddy AI"; OUT="release/macos/WorkDaddy-AI-${VERSION}.dmg" ;;
+  *) PROFILE="workbuddy-cn"; PACKAGE_APP_NAME="WorkDaddy"; OUT="release/macos/WorkDaddy-${VERSION}.dmg" ;;
+esac
+VERSION_CODE="$(printf '%s' "$VERSION" | tr -d '.')"
 
+echo "==> profile: ${PROFILE}"
 echo "==> 版本: ${VERSION}"
 echo "==> 产物: ${OUT}"
 
@@ -27,7 +39,7 @@ chmod 755 "$APP/Contents/MacOS/launcher"
 echo "==> launcher 可执行位已保证: $(stat -f '%Sp' "$APP/Contents/MacOS/launcher")"
 
 # 2) 只覆盖前端代码（保留壳的其余一切：launcher/Info.plist/builtin/node_modules/theme-audit.js）
-for f in daemon.js inject.js theme-patches.js credit-segments.js lib.js sentry-report.js install.sh relaunch-with-cdp.sh uninstall.sh apply-update.sh; do
+for f in daemon.js inject.js theme-patches.js credit-segments.js lib.js profiles.js cdp-targets.js sentry-report.js install.sh relaunch-with-cdp.sh uninstall.sh apply-update.sh; do
   [ -f "scripts/$f" ] && cp "scripts/$f" "$APP/Contents/Resources/scripts/$f"
 done
 # 恢复这些文件的壳权限（与 1.0.3 壳内一致：sh/lib/daemon 755，inject/theme-patches 644）
@@ -44,10 +56,17 @@ echo "==> 前端代码已覆盖（权限按壳原样）"
 
 # 3) 打包：staging 放 WorkDaddy.app + Applications 软链（与 1.0.3 dmg 同构）
 STAGE="$(mktemp -d)"
-cp -R "$APP" "$STAGE/WorkDaddy.app"
+PACKAGE_APP="$STAGE/${PACKAGE_APP_NAME}.app"
+cp -R "$APP" "$PACKAGE_APP"
+sed -i.bak "s|^PROFILE=.*|PROFILE=\"${PROFILE}\"|" "$PACKAGE_APP/Contents/MacOS/launcher"
+rm -f "$PACKAGE_APP/Contents/MacOS/launcher.bak"
+if [ "$PROFILE" = "workbuddy-ai" ]; then
+  perl -0pi -e 's/<string>WorkDaddy<\/string>/<string>WorkDaddy AI<\/string>/g' "$PACKAGE_APP/Contents/Info.plist"
+fi
+perl -0pi -e "s/<string>1\\.0\\.8<\\/string>/<string>${VERSION}<\\/string>/g; s/<string>108<\\/string>/<string>${VERSION_CODE}<\\/string>/g" "$PACKAGE_APP/Contents/Info.plist"
 if [ -n "${WORKDADDY_BUILD_VERSION:-}" ]; then
   perl -0pi -e "s/(const DAEMON_VERSION = ')[^']+(';)/\${1}${VERSION}\${2}/" \
-    "$STAGE/WorkDaddy.app/Contents/Resources/scripts/daemon.js"
+    "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"
 fi
 ln -s /Applications "$STAGE/Applications"
 cat > "$STAGE/安装失败自主解决提示词.txt" <<'EOF'
@@ -109,7 +128,7 @@ WorkDaddy macOS 安装失败自助修复
 如果测试仍未通过，不得伪造 fixed 状态；可以改用 status=unresolved 上报，并在报告中写清楚阻塞原因。
 EOF
 rm -f "$OUT"
-hdiutil create -volname "WorkDaddy" -srcfolder "$STAGE" -ov -format UDZO -imagekey zlib-level=9 "$OUT" >/dev/null
+hdiutil create -volname "$PACKAGE_APP_NAME" -srcfolder "$STAGE" -ov -format UDZO -imagekey zlib-level=9 "$OUT" >/dev/null
 rm -rf "$STAGE"
 
 echo "==> 完成: $(ls -lh "$OUT" | awk '{print $5}')"

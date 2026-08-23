@@ -3,12 +3,13 @@
 > **WorkBuddy 的多账号 · 主题 · 增强工具集**
 > 本机回环 CDP 注入 · 不改官方安装包
 
-一个基于 **Chrome DevTools Protocol (CDP)** 的 [WorkBuddy](https://www.workbuddy.cn/) 桌面端增强工具。
+一个基于 **Chrome DevTools Protocol (CDP)** 的 [WorkBuddy](https://www.workbuddy.cn/)、[WorkBuddy AI](https://www.workbuddy.ai/) 桌面端增强工具。
 零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。
 
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blueviolet)
 ![Platform](https://img.shields.io/badge/platform-macOS%2011%2B%20%7C%20Windows%2010%2F11-lightgrey)
 ![Node](https://img.shields.io/badge/node-%E2%89%A518-green)
+
 
 ---
 
@@ -42,6 +43,9 @@ v1.0.3 演示图（非最新版）
 
 ## 安装
 
+>- 国内版 [WorkBuddy](https://www.workbuddy.cn/) 请下载 `WorkDaddy` 安装包
+>- 国际版 [WorkBuddy AI](https://www.workbuddy.ai/) 请下载 `WorkDaddy AI` 安装包
+
 ### macOS
 
 1. 在 [Releases](../../releases) 下载最新 `WorkDaddy-x.y.z.dmg`
@@ -73,21 +77,27 @@ bash scripts/install.sh        # 创建备份目录 + 启动守护进程
 bash scripts/relaunch-with-cdp.sh   # 把 WorkBuddy 切换到调试模式（端口 9222）
 ```
 
+WorkBuddy 国内版和 WorkBuddy AI 使用同一套 daemon，通过 profile 绑定客户端，不靠“第一个 CDP 端口”猜测目标：
+
+```bash
+WBSWITCH_PROFILE=workbuddy-cn bash scripts/relaunch-with-cdp.sh
+WBSWITCH_PROFILE=workbuddy-ai bash scripts/relaunch-with-cdp.sh
+```
+
+暂存提示词和主题功能在两个 WorkBuddy profile 开启。CodeBuddy profile 的适配暂缓，不进入当前发布包。
+
+当前发布脚本只打包两个 WorkBuddy 客户端，共 4 个包：`WorkDaddy-<version>.dmg`、`WorkDaddy-AI-<version>.dmg`，以及对应的 `-win64.zip`；传 `WORKDADDY_BUILD_PROFILE=workbuddy-cn` 或 `workbuddy-ai` 可单独重打一个客户端。CodeBuddy profile 代码暂不进入发布包。
+
 `install.sh` 做了：
 
 - 创建 `~/Library/Application Support/WorkDaddy` 备份目录
 - 首次启动自动兼容迁移旧版 `~/Library/Application Support/HelloBuddy/accounts` 账号备份（旧目录保留不删除）
 - 首次备份当前 WorkBuddy 账号
-- 注册 launchd 守护进程（登录自启、崩溃拉起）
+- 清理旧 launchd 注册并手动启动守护进程（不再登录自启）
 - 立即启动后台守护进程
 - 打开管理界面 `http://127.0.0.1:47832`
 
-> 若从 WorkBuddy 应用内执行安装，launchd 注册可能失败——这属正常。
-> 此时守护进程已在后台运行；如需开机自启在「终端」手动执行：
->
-> ```bash
-> launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.workbuddy.workdaddy.plist
-> ```
+> 守护进程会在安装结束时手动启动；需要使用时手动启动对应的 WorkDaddy 端即可。
 
 ---
 
@@ -167,12 +177,6 @@ WorkBuddy 右下角的机器人按钮 → 弹出面板 → 选你要的操作：
 
 ---
 
-## 兼容性说明
-
-- macOS 11+（Big Sur 起），Apple Silicon 与 Intel 均支持
-- Windows 10/11 64 位（需 WorkBuddy Windows 版；node 使用 WorkBuddy 自带托管运行时或 PATH 中的 Node 18+）
-- WorkBuddy 桌面端 0.6.6+（daemon 与 inject 同步升级后覆盖更新）
-
 ## 社区支持
 
-[Linux](https://linux.do/)
+[Linux.do](https://linux.do/)

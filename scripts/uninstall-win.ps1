@@ -3,17 +3,25 @@
 # 默认保留备份数据（%APPDATA%\WorkDaddy）；加 -RemoveData 一并删除。
 param(
   [switch]$RemoveData,
-  [string]$AppDir = (Join-Path $env:LOCALAPPDATA 'Programs\WorkDaddy')
+  [string]$AppDir = '',
+  [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
 $ErrorActionPreference = 'Continue'
-$dataDir = Join-Path $env:APPDATA 'WorkDaddy'
+if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
+if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
+$productName = if ($Profile -eq 'workbuddy-ai') { 'WorkDaddy AI' } else { 'WorkDaddy' }
+if ([string]::IsNullOrWhiteSpace($AppDir)) { $AppDir = Join-Path $env:LOCALAPPDATA (Join-Path 'Programs' $productName) }
+$dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
+$dataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
 
-Write-Host '卸载 WorkDaddy...'
+Write-Host ('卸载 ' + $productName + '...')
 
-# 1) 移除登录自启
+# 1) 移除登录自启（兼容 WorkDaddy / WorkDaddy AI 两个 profile）
 try {
-  Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WorkDaddy' -ErrorAction SilentlyContinue
+  foreach ($runName in @('WorkDaddy', 'WorkDaddy AI')) {
+    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $runName -ErrorAction SilentlyContinue
+  }
   Write-Host '  已移除登录自启项'
 } catch {}
 

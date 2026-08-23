@@ -133,6 +133,49 @@ test('Windows launcher tolerates slow WorkBuddy startup beyond the old 20 second
   assert.match(launcher, /await sleep\(1000\)/);
 });
 
+test('Windows launcher keeps local port probing and profile CDP candidates defined', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /const HOST\s*=\s*['"]127\.0\.0\.1['"]/);
+  assert.match(launcher, /function portOpen\(port\)/);
+  assert.match(launcher, /function daemonRunning\(\)\s*\{\s*return portOpen\(UI_PORT\);/);
+  assert.match(launcher, /'workbuddy-cn': \[9222/);
+  assert.match(launcher, /'workbuddy-ai': \[9223/);
+  assert.match(launcher, /isTargetForProfile\(target, PROFILE\)/);
+});
+
+test('macOS updater validates a cached/downloaded DMG before mounting it', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /hdiutil['"],\s*\['imageinfo'/);
+  assert.match(daemon, /validateUpdateArtifact|validateDmg|inspectDmg|isValidDmg/);
+  assert.match(daemon, /下载内容不是有效 DMG|DMG 预检失败/);
+  assert.match(daemon, /dmgSize/);
+  assert.match(daemon, /Content-Type|content-type/);
+});
+
+test('Windows launcher covers both WorkBuddy images and records exit diagnostics', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /WorkBuddy\.exe/);
+  assert.match(launcher, /WorkBuddyAI\.exe/);
+  assert.match(launcher, /\[exit\]/);
+  assert.match(launcher, /taskkill=/);
+  assert.match(launcher, /tasklistProcessIds/);
+  assert.match(launcher, /processDiagnostics/);
+});
+
+test('release scripts package only WorkDaddy and WorkDaddy AI', () => {
+  const win = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  const mac = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
+  const installer = read('install-win.ps1');
+  for (const script of [win, mac]) {
+    assert.match(script, /for profile in workbuddy-cn workbuddy-ai/);
+    assert.doesNotMatch(script, /codebuddy-cn|codebuddy-intl/);
+  }
+  assert.match(win, /WorkDaddy AI\.lnk|PACKAGE_NAME="WorkDaddy AI"/);
+  assert.match(win, /OUT="release\/windows\/WorkDaddy/);
+  assert.match(mac, /PACKAGE_APP_NAME="WorkDaddy AI"/);
+  assert.match(installer, /\$lnkPath\s*=\s*Join-Path\s+\$desktopDir\s+\(\$productName\s+\+\s+'\.lnk'\)/);
+});
+
 test('Windows launcher verifies the real WorkBuddy process tree and launch arguments', () => {
   const launcher = read('win-launcher.js');
   assert.match(launcher, /Get-CimInstance Win32_Process/);
@@ -190,7 +233,17 @@ test('account cards keep the compact three-row layout', () => {
   assert.match(script, /wbs-secondary-row/);
   assert.match(script, /剩余积分/);
   assert.match(script, /今日已签到/);
-  assert.match(script, /登录过期于/);
+  // 登录有效期展示：国际版也将 token 有效截止时间展示为「有效期至」而非歧义的「登录过期于」
+  assert.match(script, /有效期至/);
+  assert.doesNotMatch(script, /登录过期于/);
+  assert.match(script, /var isUinMode = !a\.phone;/);
+  assert.match(script, /var idLbl = a\.phone \? '手机' : \(a\.uin \? 'UIN' : '账号'\)/);
+  assert.match(script, /\.wbs-phone-cell\.wbs-uin-cell\{gap:8px\}/);
+  // 国际版：签到标签不展示；暂存按钮内联进操作栏按钮组第一位（AI 端无 voice-mic-wrap）
+  assert.match(script, /if \(PROFILE_ID === 'workbuddy-ai'\) return '';/);
+  assert.match(script, /function findAiToolbar\(\)/);
+  assert.match(script, /wbs-stash-inline-inline/);
+  assert.match(script, /row0\.insertBefore\(stashBtn, row0\.firstChild\)/);
   assert.match(script, /wbs-credit-hidden/);
   assert.match(script, /var expired = isIdentityExpired\(a\)/);
   assert.match(script, /expired \? '' : '<button class="wbs-icon-btn wbs-acc-switch"/);
@@ -242,6 +295,34 @@ test('home composer keeps the robot button at the WorkBuddy bottom-right', () =>
   const script = read('inject.js');
   assert.match(script, /\.wb-home-page \[class\*="_topRightSlotStandalone_"\] > div:nth-child\(1\) > div:nth-child\(3\)/);
   assert.match(script, /fab\.style\.right = '22px';\s*fab\.style\.bottom = '22px';/);
+});
+
+test('WorkBuddy AI welcome composer keeps the robot at the window bottom-right', () => {
+  const script = read('inject.js');
+  assert.match(script, /PROFILE_ID === 'workbuddy-ai'/);
+  assert.match(script, /_topRightSlotStandalone_\"\] > div:nth-child\(1\) > div:nth-child\(2\)/);
+  assert.match(script, /aiHomeComposerCorner/);
+});
+
+test('installers disable login auto-start and clean prior registrations', () => {
+  const win = read('install-win.ps1');
+  assert.doesNotMatch(win, /Set-ItemProperty\s+-Path\s+\$runKey/);
+  assert.match(win, /Remove-ItemProperty[\s\S]*WorkDaddy AI/);
+  assert.match(win, /Remove-ItemProperty[\s\S]*WorkDaddy/);
+
+  const mac = read('install.sh');
+  assert.doesNotMatch(mac, /<key>RunAtLoad<\/key>/);
+  assert.doesNotMatch(mac, /launchctl bootstrap/);
+  assert.match(mac, /开机自启\s*:\s*已禁用/);
+
+  const relaunch = read('relaunch-with-cdp.sh');
+  assert.doesNotMatch(relaunch, /launchctl bootstrap/);
+  assert.match(relaunch, /手动启动(?: WorkDaddy)? 守护进程/);
+});
+
+test('daemon and Windows launcher logs identify the active WorkBuddy client', () => {
+  assert.match(read('daemon.js'), /\[client=\$\{PROFILE\.name\}\] \[profile=\$\{PROFILE\.id\}\]/);
+  assert.match(read('win-launcher.js'), /\[client=\$\{PROFILE\.name\}\] \[profile=\$\{PROFILE\.id\}\]/);
 });
 
 test('zero credits omit the empty-state label', () => {
@@ -298,12 +379,16 @@ test('session summary counts effective sessions and models tab only exposes sani
   assert.match(inject, /data-model-tab="official"/);
   assert.match(inject, /data-model-tab="mine"/);
   assert.match(daemon, /GET' && p === '\/api\/models'/);
+  assert.match(daemon, /POST' && p === '\/api\/models\/import'/);
+  assert.match(daemon, /listInstalledModelSources/);
   assert.match(daemon, /POST' && p === '\/api\/models\/backup'/);
   assert.match(daemon, /POST' && p === '\/api\/models\/delete-official'/);
   assert.match(daemon, /POST' && p === '\/api\/models\/test'/);
   assert.match(daemon, /POST' && p === '\/api\/models\/copy'/);
   assert.match(daemon, /POST' && p === '\/api\/models\/edit'/);
   assert.match(daemon, /POST' && p === '\/api\/models\/delete'/);
+  assert.match(daemon, /requested: ids\.length, deleted/);
+  assert.match(read('lib.js'), /\.legacy-migrated-v1/);
   assert.match(daemon, /POST' && p === '\/api\/models\/enable'/);
   // 模型页 UI 明文展示 apiKey：列表走 sanitizeModel(model, { revealKey: true })，默认仍脱敏
   assert.match(read('lib.js'), /function sanitizeModel\(model, opts\)/);
@@ -319,6 +404,12 @@ test('session summary counts effective sessions and models tab only exposes sani
   assert.match(inject, /小贴士.*解决 WorkBuddy 不支持多个同名模型的问题/);
   assert.match(inject, /data-model-tab="official">当前模型/);
   assert.match(inject, /data-model-tab="mine">备选模型/);
+  assert.match(inject, /data-model-import=/);
+  assert.match(inject, /\/api\/models\/import/);
+  assert.match(inject, /签到请求完成后再查询积分/);
+  assert.match(inject, /fetchCreditsForAccounts\(\);/);
+  assert.match(read('lib.js'), /function checkinDisplayValue\(record, today, pending\)/);
+  assert.match(daemon, /checkin: checkinDisplayValue\(c, today, checkinPending\)/);
   assert.doesNotMatch(inject, /id="wbs-model-refresh"/);
   assert.match(inject, /wbs-model-group-title/);
   assert.match(inject, /delete-official/);

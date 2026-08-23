@@ -1,13 +1,19 @@
 ﻿# WorkDaddy Windows 安装脚本（install.sh 的 Windows 对应物）
 # 用法：双击 install-win.cmd，或 powershell -ExecutionPolicy Bypass -File install-win.ps1
-# 作用：复制到安装目录 → 初始化数据目录 → 注册登录自启(HKCU Run) → 启动 launcher（自动拉起 daemon + 以 CDP 模式重启 WorkBuddy）
+# 作用：复制到安装目录 → 初始化数据目录 → 清理旧登录自启 → 启动 launcher（自动拉起 daemon + 以 CDP 模式重启 WorkBuddy）
 # 全程用户态，无需管理员权限。
 param(
   [string]$SrcDir = $PSScriptRoot,
-  [string]$AppDir = (Join-Path $env:LOCALAPPDATA 'Programs\WorkDaddy')
+  [string]$AppDir = '',
+  [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
 $ErrorActionPreference = 'Continue'
+if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
+if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
+$env:WBSWITCH_PROFILE = $Profile
+$productName = if ($Profile -eq 'workbuddy-ai') { 'WorkDaddy AI' } else { 'WorkDaddy' }
+if ([string]::IsNullOrWhiteSpace($AppDir)) { $AppDir = Join-Path $env:LOCALAPPDATA (Join-Path 'Programs' $productName) }
 $targetScripts = Join-Path $AppDir 'scripts'
 $sentryReporter = Join-Path $SrcDir 'sentry-report.js'
 $nodeBin = $null
@@ -65,7 +71,7 @@ function Release-LockedLauncher {
 }
 
 Write-Host '=============================================================='
-Write-Host ' WorkDaddy Windows 安装'
+Write-Host (" " + $productName + " Windows 安装")
 Write-Host '=============================================================='
 Write-Host ("  源目录   : " + $SrcDir)
 Write-Host ("  安装目录 : " + $AppDir)
@@ -99,8 +105,9 @@ if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
   }
 }
 
-# 2) 数据目录
-$dataDir = Join-Path $env:APPDATA 'WorkDaddy'
+# 2) profile 数据目录（与 profiles.js / watchdog.js 一致）
+$dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
+$dataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
 New-Item -ItemType Directory -Force -Path (Join-Path $dataDir 'accounts') | Out-Null
 
 # 2.5) Logo 图标：随安装复制到安装目录根（桌面快捷方式用），源在 scripts 同级的 WorkDaddy.ico
@@ -110,19 +117,22 @@ if (Test-Path $logoIcoSrc) {
   try { Copy-Item $logoIcoSrc $logoIco -Force; Write-Host ('  图标复制 : ' + $logoIco) } catch {}
 }
 
-# 3) 登录自启（HKCU Run，登录时自动跑 launcher.cmd；崩溃自愈由 watchdog 负责）
+# 3) 禁用登录自启：WorkDaddy / WorkDaddy AI 共存时由用户手动启动对应端。
+#    同时清理旧版本可能留下的两个 Run 项；不要触碰其他应用的启动项。
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$launcher = Join-Path $targetScripts 'launcher.cmd'
 try {
-  Set-ItemProperty -Path $runKey -Name 'WorkDaddy' -Value ('"' + $launcher + '"')
-  Write-Host '  自启注册：HKCU\...\Run\WorkDaddy = ' $launcher
+  foreach ($runName in @('WorkDaddy', 'WorkDaddy AI')) {
+    Remove-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue
+  }
+  Write-Host '  自启：已禁用（已清理 WorkDaddy / WorkDaddy AI 登录启动项）'
 } catch {
-  Write-Host ('  自启注册失败（可忽略，之后手动双击 launcher.cmd 即可）: ' + $_.Exception.Message)
-  Send-Sentry 'windows-install-autostart' ('注册登录自启失败: ' + $_.Exception.Message) 0
+  Write-Host ('  自启清理失败（可忽略，之后手动双击 launcher.cmd 即可）: ' + $_.Exception.Message)
+  Send-Sentry 'windows-install-autostart-cleanup' ('清理登录自启失败: ' + $_.Exception.Message) 0
 }
 
 # 4) 启动（daemon + 以 CDP 模式重启 WorkBuddy + 注入）
-Write-Host '  正在启动 WorkDaddy（如果 WorkBuddy 正在运行，会重启它以开启调试模式）...'
+$launcher = Join-Path $targetScripts 'launcher.cmd'
+Write-Host ("  正在启动 " + $productName + "（如果 WorkBuddy 正在运行，会重启它以开启调试模式）...")
 $launcherVbs = Join-Path $targetScripts 'launcher-hidden.vbs'
 if (Test-Path $launcher) {
   if (Test-Path $launcherVbs) {
@@ -134,12 +144,12 @@ if (Test-Path $launcher) {
   Write-Host '  警告：launcher.cmd 不存在，跳过自动启动（请到安装目录手动双击）'
 }
 
-# 5) 创建桌面快捷方式「WorkDaddy」
+# 5) 创建桌面快捷方式（名称跟随安装包 profile）
 #    优先使用 wscript.exe 隐藏入口，避免 Windows Terminal 为管理员 cmd 创建空白窗口；
 #    缺少隐藏入口时回退到 cmd.exe，兼容旧包/手工安装目录。
 $desktopDir = [Environment]::GetFolderPath('Desktop')
 if (-not $desktopDir) { $desktopDir = Join-Path $env:USERPROFILE 'Desktop' }
-$lnkPath = Join-Path $desktopDir 'WorkDaddy.lnk'
+$lnkPath = Join-Path $desktopDir ($productName + '.lnk')
 # Logo 图标（macOS 版同款黑白的 WorkBuddy 机器人，打包时置于安装目录根）
 $logoIco = Join-Path $AppDir 'WorkDaddy.ico'
 try {
@@ -153,7 +163,7 @@ try {
     $sc.Arguments        = '/d /c call "' + $launcher + '"'
   }
   $sc.WorkingDirectory = (Split-Path $launcher)
-  $sc.Description      = 'WorkDaddy – WorkBuddy 增强工具（请以管理员身份运行）'
+  $sc.Description      = ($productName + ' – WorkBuddy 增强工具（请以管理员身份运行）')  # 描述跟随安装包 profile（WorkDaddy / WorkDaddy AI）
   if (Test-Path $logoIco) { $sc.IconLocation = $logoIco + ',0' }   # 用官方 logo，而非 cmd 默认图标
   $sc.Save()
   Write-Host ('  桌面快捷方式 : ' + $lnkPath)
@@ -165,6 +175,7 @@ try {
 
 Write-Host '=============================================================='
 Write-Host ' 安装完成！'
+Write-Host ('  profile  : ' + $Profile)
 Write-Host ("  安装目录 : " + $AppDir)
 Write-Host ("  数据目录 : " + $dataDir)
 Write-Host ('  备份账号 : ' + (Join-Path $dataDir 'accounts'))
