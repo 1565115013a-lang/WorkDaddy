@@ -92,7 +92,9 @@ function cdpPortCandidates() {
   const add = (port) => { if (validCdpPort(port) && !result.includes(port)) result.push(port); };
   add(CDP_PORT);
   add(readCdpPortFile());
-  for (const port of (PROFILE_CDP_PORTS[PROFILE.id] || [DEFAULT_CDP_PORT])) add(port);
+  // 与 daemon.js 的候选顺序保持一致：首选/持久化端口之后，扫描完整的本机回环端口池。
+  for (let port = 9222; port <= 9232; port++) add(port);
+  add(9333);
   return result;
 }
 
@@ -148,6 +150,25 @@ function portOpen(port) {
   });
 }
 
+function isLocalPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    let settled = false;
+    const finish = (available) => {
+      if (settled) return;
+      settled = true;
+      if (available) {
+        try { server.close(() => resolve(true)); } catch (_) { resolve(true); }
+      } else {
+        try { server.close(); } catch (_) {}
+        resolve(false);
+      }
+    };
+    server.once('error', () => finish(false));
+    server.listen({ host: HOST, port }, () => finish(true));
+  });
+}
+
 function httpGet(port, p) {
   return new Promise((resolve) => {
     const req = http.get({ host: HOST, port, path: p, timeout: 1500 }, (res) => {
@@ -163,8 +184,10 @@ function httpGet(port, p) {
 function httpPost(port, p) {
   return new Promise((resolve) => {
     const req = http.request({ host: HOST, port, path: p, method: 'POST', timeout: 1500 }, (res) => {
-      res.resume();
-      res.on('end', () => resolve({ status: res.statusCode }));
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; if (body.length > 20000) body = body.slice(0, 20000); });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
     });
     req.on('timeout', () => { req.destroy(); resolve(null); });
     req.on('error', () => resolve(null));
@@ -201,10 +224,11 @@ async function configureCdpPort() {
     }
   }
   for (const port of cdpPortCandidates()) {
-    if (!(await portOpen(port))) {
+    // TCP connect 对无响应的残留 socket 可能返回超时并误报空闲；bind 才能确认新进程能否监听。
+    if (await isLocalPortAvailable(port)) {
       CDP_PORT = port;
       writeCdpPortFile(port);
-      log('选择空闲 CDP 端口: ' + port);
+      log('选择可绑定 CDP 端口: ' + port);
       return port;
     }
   }
@@ -221,7 +245,7 @@ function psOut(cmd) {
 
 // 进程名并不总是可靠：Electron 的单实例宿主可能以 CodeBuddy.exe 或辅助进程名存在。
 // 通过 CIM 同时拿到路径、父 PID 和命令行，只在本地诊断使用；命令行正文绝不写入日志/Sentry。
-function getWorkBuddyProcesses() {
+function getWorkBuddyProcessesViaCim() {
   const command = [
     '$names=@("WorkBuddy.exe","CodeBuddy.exe","WorkBuddyAI.exe")',
     'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue',
@@ -239,6 +263,42 @@ function getWorkBuddyProcesses() {
   }
 }
 
+function parseTasklistOutput(raw) {
+  const processes = [];
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const match = line.match(/^"([^"]+)","(\d+)"/);
+    if (!match) continue;
+    processes.push({
+      ProcessId: Number(match[2]),
+      ParentProcessId: null,
+      Name: match[1],
+      ExecutablePath: null,
+      CommandLine: '',
+      processSource: 'tasklist',
+    });
+  }
+  return processes;
+}
+
+function getWorkBuddyProcessesViaTasklist() {
+  const processes = [];
+  for (const name of PROFILE_PROCESS_NAMES) {
+    try {
+      const result = spawnSync('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], {
+        encoding: 'utf8', timeout: 5000, windowsHide: true,
+      });
+      processes.push(...parseTasklistOutput(result.stdout));
+    } catch (_) {}
+  }
+  return processes;
+}
+
+function getWorkBuddyProcesses() {
+  const cimProcesses = getWorkBuddyProcessesViaCim();
+  // CIM 偶发返回空或不可解析时，tasklist 仍能提供 PID，避免把运行中的客户端误判为不存在。
+  return cimProcesses.length ? cimProcesses : getWorkBuddyProcessesViaTasklist();
+}
+
 function sameWindowsPath(a, b) {
   if (!a || !b) return false;
   return String(a).replace(/[\\/]+$/, '').toLowerCase() === String(b).replace(/[\\/]+$/, '').toLowerCase();
@@ -248,8 +308,8 @@ function workBuddyProcesses(binary = null) {
   return getWorkBuddyProcesses().filter((p) => {
     if (!PROFILE_PROCESS_NAMES.has(String(p.Name || '').toLowerCase())) return false;
     if (!binary) return true;
-    // 缺少 ExecutablePath 时不能证明它属于当前安装目录；交给 tasklist 回退并记录为不确定。
-    if (!p.ExecutablePath) return false;
+    // tasklist 回退没有路径，只接受与目标二进制同名的主进程，避免跨客户端误杀。
+    if (!p.ExecutablePath) return String(p.Name || '').toLowerCase() === path.basename(binary).toLowerCase();
     // WorkBuddy 可能把 Electron 主进程拆成同目录下的 CodeBuddy.exe/辅助宿主；按安装目录归组。
     return sameWindowsPath(p.ExecutablePath, binary) ||
       sameWindowsPath(path.dirname(p.ExecutablePath), path.dirname(binary));
@@ -261,10 +321,13 @@ function targetProcessNames(binary = null) {
   const normalized = String(binary || '').toLowerCase();
   for (const p of getWorkBuddyProcesses()) {
     if (!PROFILE_PROCESS_NAMES.has(String(p.Name || '').toLowerCase())) continue;
-    if (binary && p.ExecutablePath && !(
-      sameWindowsPath(p.ExecutablePath, binary) ||
-      sameWindowsPath(path.dirname(p.ExecutablePath), path.dirname(binary))
-    )) continue;
+    if (binary) {
+      if (!p.ExecutablePath && String(p.Name || '').toLowerCase() !== path.basename(binary).toLowerCase()) continue;
+      if (p.ExecutablePath && !(
+        sameWindowsPath(p.ExecutablePath, binary) ||
+        sameWindowsPath(path.dirname(p.ExecutablePath), path.dirname(binary))
+      )) continue;
+    }
     names.add(String(p.Name).toLowerCase());
   }
   if (names.size) return names;
@@ -383,11 +446,60 @@ function findWorkBuddy() {
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.APPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'CodeBuddy', 'CodeBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy', 'CodeBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy', 'WorkBuddy.exe'),
     path.join(process.env.USERPROFILE || '', 'scoop', 'apps', 'workbuddy', 'current', 'WorkBuddy.exe'),
     'D:\\workbuddy\\WorkBuddy.exe',
   ];
+  if (PROFILE.id === 'workbuddy-ai') {
+    roots.unshift(
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI', 'WorkBuddyAI.exe')
+    );
+  }
   if (process.env.WBSWITCH_WORKBUDDY_DIR) roots.push(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, 'WorkBuddy.exe'));
-  // 兼容类似 D:\Software\workbuddy\WorkBuddy.exe 的便携目录，不递归扫描整盘。
+  for (const candidate of roots) {
+    const hit = tryFile(candidate);
+    if (hit) return (wbBinaryCache = hit);
+  }
+  // 兼容 Electron/Squirrel 把 exe 放在 app-5.3.14 等版本子目录的安装方式；
+  // 只扫描明确的客户端目录，避免递归扫描整盘或整个用户目录。
+  try {
+    const scanDirs = [
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy'),
+      path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy'),
+      path.join(process.env.APPDATA || '', 'WorkBuddy'),
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy'),
+      path.join(process.env.LOCALAPPDATA || '', 'CodeBuddy'),
+    ];
+    if (PROFILE.id === 'workbuddy-ai') {
+      scanDirs.unshift(
+        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI'),
+        path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI')
+      );
+    }
+    const names = PROFILE.id === 'workbuddy-ai'
+      ? ['WorkBuddyAI.exe', 'WorkBuddy.exe']
+      : ['WorkBuddy.exe', 'CodeBuddy.exe'];
+    const rootArgs = scanDirs.map(psQuote).join(', ');
+    const nameArgs = names.map(psQuote).join(', ');
+    const command = [
+      '$roots=@(' + rootArgs + ')',
+      '$names=@(' + nameArgs + ')',
+      'foreach($root in $roots){',
+      'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
+      '$hit=Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } | Select-Object -First 1 -ExpandProperty FullName',
+      'if($hit){$hit;break}',
+      '}',
+    ].join('; ');
+    const p = psOut(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop();
+    const hit = tryFile(p);
+    if (hit) return (wbBinaryCache = hit);
+  } catch (_) {}
+  // 兼容类似 D:\Software\workbuddy\WorkBuddy.exe 的便携目录。
   try {
     const driveRoots = psOut('(Get-PSDrive -PSProvider FileSystem).Root').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
     for (const root of driveRoots) {
@@ -396,8 +508,8 @@ function findWorkBuddy() {
       roots.push(path.join(root, 'WorkBuddy', 'WorkBuddy.exe'));
     }
   } catch (_) {}
-  for (const c of roots) {
-    const hit = tryFile(c);
+  for (const candidate of roots) {
+    const hit = tryFile(candidate);
     if (hit) return (wbBinaryCache = hit);
   }
   return null;
@@ -677,6 +789,7 @@ function launchWorkBuddy(wb) {
 async function waitForWorkBuddyCdp(binary) {
   const deadline = Date.now() + CDP_STARTUP_TIMEOUT_MS;
   let retryWithoutCdpArg = false;
+  let retryOnNextPort = false;
   let lastDiagnosticAt = 0;
   let launchStartedAt = Date.now();
 
@@ -696,6 +809,18 @@ async function waitForWorkBuddyCdp(binary) {
     const diagnostics = processDiagnostics(binary);
     const hasProcessWithoutArg = diagnostics.length > 0 && diagnostics.every((p) => p.hasCommandLine) &&
       !diagnostics.some((p) => p.hasCdpArg);
+    if (!retryOnNextPort && Date.now() - launchStartedAt >= 5000 && diagnostics.length === 0 &&
+        await isLocalPortAvailable(CDP_PORT)) {
+      const nextPort = await findNextAvailableCdpPort(CDP_PORT);
+      if (nextPort) {
+        retryOnNextPort = true;
+        CDP_PORT = nextPort;
+        writeCdpPortFile(nextPort);
+        log('当前 CDP 端口未成功监听，改用备用端口重试: ' + nextPort);
+        start();
+        continue;
+      }
+    }
     if (hasProcessWithoutArg && elapsed >= 5000 && !retryWithoutCdpArg) {
       // 单实例宿主可能接管了第一次启动请求；精确结束该安装目录的进程树后只重试一次。
       logProcessDiagnostics(binary, '启动后进程未携带 CDP 参数，准备重试');
@@ -727,13 +852,30 @@ async function waitForWorkBuddyCdp(binary) {
   return false;
 }
 
+async function findNextAvailableCdpPort(exclude) {
+  for (const port of cdpPortCandidates()) {
+    if (port === exclude) continue;
+    if (await isWorkBuddyCdpAt(port)) return port;
+    if (await isLocalPortAvailable(port)) return port;
+  }
+  return 0;
+}
+
 async function injectNow() {
   // daemon 的 /api/inject 是 POST
-  try { await httpPost(UI_PORT, '/api/inject'); } catch (_) {}
+  const response = await httpPost(UI_PORT, '/api/inject');
+  if (!response) throw new Error('注入请求无响应');
+  let payload = null;
+  try { payload = JSON.parse(response.body || '{}'); } catch (_) {}
+  if (response.status !== 200 || !payload || payload.ok !== true || payload.mounted !== true) {
+    const detail = payload && payload.error ? ': ' + payload.error : ` (HTTP ${response.status})`;
+    throw new Error('WorkDaddy 组件注入失败' + detail);
+  }
+  return payload;
 }
 
 // ---------- main ----------
-(async () => {
+if (require.main === module) (async () => {
   // 入口级 breadcrumb 必须先于 Node/PowerShell/进程探测写出，避免管理员启动时
   // 探测耗时让 Windows Terminal 看起来像“空白无响应”；同一行也会落到 launcher.log。
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
@@ -812,3 +954,15 @@ async function injectNow() {
   console.error(WBS_BRAND + ' 启动异常: ' + (e && e.message || e));
   captureException(e, { stage: 'windows-launcher-uncaught' }).catch(() => {}).finally(() => process.exit(4));
 });
+
+module.exports = {
+  getWorkBuddyProcesses,
+  getWorkBuddyProcessesViaCim,
+  getWorkBuddyProcessesViaTasklist,
+  parseTasklistOutput,
+  workBuddyProcesses,
+  tasklistProcessIds,
+  targetProcessNames,
+  workBuddyRunning,
+  isElevated,
+};

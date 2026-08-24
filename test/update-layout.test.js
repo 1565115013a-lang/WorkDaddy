@@ -54,6 +54,13 @@ test('update download starts asynchronously and reports transfer telemetry', () 
   assert.match(statusBlock, /etaSeconds/);
 });
 
+test('update progress hides zero-rate and unknown-ETA placeholder text', () => {
+  const inject = read('inject.js');
+  assert.match(inject, /function formatDownloadTransfer\(status\)/);
+  assert.match(inject, /if \(rate > 0\)/);
+  assert.match(inject, /transfer = formatDownloadTransfer\(s\)/);
+});
+
 test('Windows updater stops the watchdog before waiting for the API port', () => {
   const script = read('apply-update.ps1');
   const stop = script.indexOf('function Stop-WatchdogAndPort');
@@ -177,10 +184,24 @@ test('Windows launcher keeps local port probing and profile CDP candidates defin
   const launcher = read('win-launcher.js');
   assert.match(launcher, /const HOST\s*=\s*['"]127\.0\.0\.1['"]/);
   assert.match(launcher, /function portOpen\(port\)/);
+  assert.match(launcher, /function isLocalPortAvailable\(port\)/);
+  assert.match(launcher, /server\.listen\(\{ host: HOST, port \}/);
+  assert.match(launcher, /改用备用端口重试/);
+  assert.match(launcher, /for \(let port = 9222; port <= 9232; port\+\+\)/);
+  assert.match(launcher, /add\(9333\)/);
   assert.match(launcher, /function daemonRunning\(\)\s*\{\s*return portOpen\(UI_PORT\);/);
   assert.match(launcher, /'workbuddy-cn': \[9222/);
   assert.match(launcher, /'workbuddy-ai': \[9223/);
   assert.match(launcher, /isTargetForProfile\(target, PROFILE\)/);
+});
+
+test('Windows launcher does not report success when manual injection is not mounted', () => {
+  const daemon = read('daemon.js');
+  const launcher = read('win-launcher.js');
+  assert.match(daemon, /注入后未检测到 WorkDaddy 组件/);
+  assert.match(daemon, /mounted: !!\(info && info\.mounted\)/);
+  assert.match(launcher, /payload\.mounted !== true/);
+  assert.match(launcher, /WorkDaddy 组件注入失败/);
 });
 
 test('macOS updater validates a cached/downloaded DMG before mounting it', () => {
@@ -285,11 +306,42 @@ test('Windows launcher discovers portable WorkBuddy installations', () => {
   assert.match(launcher, /WBSWITCH_WORKBUDDY_BIN/);
 });
 
+test('macOS updater validates and refreshes a cached app before reusing it', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /cachedArtifact/);
+  assert.match(daemon, /cachedMatches/);
+  assert.match(daemon, /artifact-cache/);
+  assert.match(daemon, /cachedMatches[\s\S]*extractAppFromDmg/);
+  assert.match(daemon, /安装包内部 daemon 版本不可读/);
+  assert.match(daemon, /安装包应用版本不可读/);
+});
+
+test('Windows launcher searches app-data roots and versioned WorkBuddy installs', () => {
+  const launcher = read('win-launcher.js');
+  const daemon = read('daemon.js');
+  assert.match(launcher, /LOCALAPPDATA[\s\S]*WorkBuddy/);
+  assert.match(launcher, /APPDATA[\s\S]*WorkBuddy/);
+  assert.match(launcher, /Get-ChildItem[\s\S]*-Recurse/);
+  assert.match(daemon, /LOCALAPPDATA[\s\S]*WorkBuddy/);
+  assert.match(daemon, /APPDATA[\s\S]*WorkBuddy/);
+  assert.match(daemon, /Get-ChildItem[\s\S]*-Recurse/);
+});
+
 test('Windows release package includes the troubleshooting prompt as UTF-8', () => {
   const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
   assert.match(build, /安装失败自主解决提示词\.txt/);
   assert.match(build, /Python zipfile/);
   assert.match(build, /ZIP_DEFLATED/);
+});
+
+test('troubleshooting prompts keep Sentry reports short and omit raw logs', () => {
+  const prompt = fs.readFileSync(path.join(repoRoot, '安装失败自主解决提示词.txt'), 'utf8');
+  const macBuild = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
+  assert.ok(prompt.length < 3500, 'Windows prompt should stay compact');
+  assert.match(prompt, /报告硬上限 3500 字符/);
+  assert.match(prompt, /不要粘贴完整日志/);
+  assert.match(macBuild, /报告硬上限 3500 字符/);
+  assert.match(macBuild, /不附完整日志/);
 });
 
 test('daemon lock falls back when the data-directory lock is not writable on Windows', () => {
@@ -302,7 +354,7 @@ test('daemon lock falls back when the data-directory lock is not writable on Win
   assert.match(daemon, /releaseDaemonLock[\s\S]*daemonLockPath/);
 });
 
-test('session ranges use last-modified time and hide non-copyable task sessions', () => {
+test('session ranges use last-modified time and preserve standard WorkBuddy workspaces', () => {
   const daemon = read('daemon.js');
   const inject = read('inject.js');
   assert.match(daemon, /COALESCE\(last_activity_at, updated_at, created_at\) >=/);
@@ -421,6 +473,32 @@ test('update card keeps the action button stable beside short progress text', ()
   assert.match(script, /\.wbs-update-btn\{[^}]*flex:0 0 112px/);
   assert.match(script, /启动较慢，请稍候…/);
   assert.doesNotMatch(script, /也可双击桌面 .* 图标手动启动/);
+});
+
+test('update notes keep the full release text inside the panel scroll area', () => {
+  const script = read('inject.js');
+  assert.doesNotMatch(script, /\.slice\(0,\s*3\)\.map/);
+  assert.doesNotMatch(script, /l\.length\s*>\s*48/);
+  assert.doesNotMatch(script, /\.wbs-update-notes\{[^}]*max-height\s*:/);
+  assert.doesNotMatch(script, /\.wbs-update-notes\{[^}]*overflow\s*:\s*hidden/);
+  assert.match(script, /\.wbs-update-notes\{[^}]*overflow:visible/);
+});
+
+test('session listing does not hide standard timestamped WorkBuddy workspaces', () => {
+  const inject = read('inject.js');
+  const daemon = read('daemon.js');
+  assert.match(inject, /function isTaskSessionRecordUI\(cwd\)\s*\{[\s\S]*return false;/);
+  assert.match(daemon, /function isTaskSessionRecord\(cwd\)\s*\{[\s\S]*return false;/);
+  assert.doesNotMatch(inject, /WorkBuddy\\\\\]\\d\{4\}/);
+  assert.doesNotMatch(daemon, /WorkBuddy\\\\\]\\d\{4\}/);
+  assert.doesNotMatch(daemon, /\.filter\(\(row\) => !isTaskSessionRecord\(row\.cwd\)\)/);
+});
+
+test('session file copy skips destinations nested inside the source directory', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /path\.relative\(fromResolved, toResolved\)/);
+  assert.match(daemon, /targetInsideSource/);
+  assert.match(daemon, /跳过源目录内复制/);
 });
 
 test('about page reports the running daemon version instead of stale package metadata', () => {
@@ -560,7 +638,6 @@ test('automatic session copy has a status endpoint, idempotency mapping, and no 
   assert.match(inject, /data-auto-kind="' \+ kind \+ '"/);
   assert.match(inject, /autoCopyButton\('workspace'/);
   assert.match(inject, /autoCopyButton\('session'/);
-  assert.match(inject, /任务组本身没有自动复制按钮/);
 });
 
 test('session summary counts effective sessions and models tab only exposes sanitized model APIs', () => {

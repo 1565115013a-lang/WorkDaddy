@@ -81,7 +81,8 @@ const {
   importModels,
   checkinDisplayValue,
 } = require('./lib.js');
-const { extractCreditSegments, sortCreditSegments } = require('./credit-segments.js');
+const { extractCreditSegments, sortCreditSegments, mergeCreditSegments } = require('./credit-segments.js');
+const { buildCreditResourceBody } = require('./credit-resource-queries.js');
 const { captureException, captureMessage } = require('./sentry-report.js');
 const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
@@ -144,11 +145,17 @@ const DATA_DIR = defaultDataDir();
 //        自动扣费），并在禁用按钮/点击异常处加护栏，避免误触与渲染进程异常。
 // 1.0.17：Windows 退出失败时对剩余 PID 请求一次提权 taskkill；HTTP 异步响应增加幂等保护，避免重复写 headers。
 // 1.0.18：Windows 更新包缺少 apply-update.vbs 时，在可写更新目录生成运行时桥接，避免更新直接失败。
+// 1.0.19：更新缓存按 daemon/应用版本校验后再复用；补强 Windows 客户端路径探测。
+// 1.0.20：修复标准工作区被误判为任务会话；复制文件时跳过源目录到自身子目录的无效操作。
+// 1.0.21：按个人中心四类资源查询积分；合并同一赠送包的多条额度记录。
+// 1.0.22：对齐 WorkBuddy v2 全量资源接口，避免 PackageCodes 白名单漏掉赠送/付费额度。
+// 1.0.23：手动注入确认组件已挂载；注入失败不再让 Windows launcher 假报成功。
+// 1.0.24：下载尚未收到数据时隐藏 0 B/s 和未知剩余时间文案。
 // 1.0.9：WorkBuddy / WorkBuddy AI profile 隔离；修复 Windows launcher 的本地端口探测、
 //        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
 // 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
-const DAEMON_VERSION = '1.0.18';
-const DAEMON_BUILD_ID = 'release-1.0.18-20260824-update-vbs';
+const DAEMON_VERSION = '1.0.24';
+const DAEMON_BUILD_ID = 'release-1.0.24-20260824-download-progress-copy';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -665,6 +672,18 @@ function inspectPackagedApp(appDir) {
   return result;
 }
 
+function packagedAppVersionError(artifact, expectedVersion) {
+  if (!artifact.daemonVersion) return new Error('安装包内部 daemon 版本不可读');
+  if (!artifact.appVersion) return new Error('安装包应用版本不可读');
+  if (expectedVersion && semverCompare(artifact.daemonVersion, expectedVersion) !== 0) {
+    return new Error(`安装包内部 daemon 版本 ${artifact.daemonVersion} 与目标版本 ${expectedVersion} 不一致`);
+  }
+  if (expectedVersion && semverCompare(artifact.appVersion, expectedVersion) !== 0) {
+    return new Error(`安装包应用版本 ${artifact.appVersion} 与目标版本 ${expectedVersion} 不一致`);
+  }
+  return null;
+}
+
 // 文件存在或没有 Release notes 摘要都不能证明它是可挂载的 DMG：断流、代理错误页
 // 和旧版残留文件都可能留下普通文件。hdiutil imageinfo 是 macOS UDIF 的确定性预检。
 function validateUpdateArtifact(file, expectSha = null) {
@@ -938,9 +957,8 @@ function extractAppFromDmg(dmgPath) {
             }
             const artifact = inspectPackagedApp(appDest);
             updateDebug('artifact-inspect', { expectedVersion: updateState.latest, daemonVersion: artifact.daemonVersion, appVersion: artifact.appVersion, source: path.basename(dmgPath) });
-            if (artifact.daemonVersion && updateState.latest && semverCompare(artifact.daemonVersion, updateState.latest) !== 0) {
-              return reject(new Error(`安装包内部 daemon 版本 ${artifact.daemonVersion} 与目标版本 ${updateState.latest} 不一致`));
-            }
+            const versionError = packagedAppVersionError(artifact, updateState.latest);
+            if (versionError) return reject(versionError);
             resolve(appDest);
           });
         });
@@ -1064,7 +1082,22 @@ function applyUpdate() {
   // 解出新应用：下载阶段只落了 .dmg，这里才把 WorkDaddy.app 从 dmg 解到 UPDATE_DIR（幂等：已解出则复用）
   const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
   const dmgPath = path.join(UPDATE_DIR, updatePrefix + updateState.latest + '.dmg');
-  const preUnpack = fs.existsSync(srcApp)
+  const cachedArtifact = fs.existsSync(srcApp) ? inspectPackagedApp(srcApp) : null;
+  const cachedMatches = Boolean(
+    cachedArtifact &&
+    cachedArtifact.daemonVersion &&
+    cachedArtifact.appVersion &&
+    updateState.latest &&
+    semverCompare(cachedArtifact.daemonVersion, updateState.latest) === 0 &&
+    semverCompare(cachedArtifact.appVersion, updateState.latest) === 0
+  );
+  updateDebug('artifact-cache', {
+    expectedVersion: updateState.latest,
+    cachedDaemonVersion: cachedArtifact && cachedArtifact.daemonVersion,
+    cachedAppVersion: cachedArtifact && cachedArtifact.appVersion,
+    reused: cachedMatches,
+  });
+  const preUnpack = cachedMatches
     ? Promise.resolve(srcApp)
     : (fs.existsSync(dmgPath)
         ? (updateState.message = '正在解包新应用…', extractAppFromDmg(dmgPath))
@@ -1073,9 +1106,8 @@ function applyUpdate() {
     if (!fs.existsSync(p)) throw new Error('缺少解包后的新应用');
     const artifact = inspectPackagedApp(p);
     updateDebug('artifact-ready', { expectedVersion: updateState.latest, daemonVersion: artifact.daemonVersion, appVersion: artifact.appVersion, source: path.basename(p) });
-    if (artifact.daemonVersion && updateState.latest && semverCompare(artifact.daemonVersion, updateState.latest) !== 0) {
-      throw new Error(`安装包内部 daemon 版本 ${artifact.daemonVersion} 与目标版本 ${updateState.latest} 不一致`);
-    }
+    const versionError = packagedAppVersionError(artifact, updateState.latest);
+    if (versionError) throw versionError;
     attempt.sourceApp = p;
     attempt.targetApp = appPath;
     writeUpdateAttempt(attempt);
@@ -1554,17 +1586,55 @@ function resolveWorkBuddyBinary() {
     const hit = tryFile(p);
     if (hit) return (wbBinaryCache = hit);
   } catch (_) {}
-  // 4) 常见路径兜底（含探测机实际安装位）
+  // 4) 常见路径兜底（含 per-user 安装和 Electron/Squirrel 版本目录）
   const cands = [
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.APPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'CodeBuddy', 'CodeBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy', 'CodeBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy', 'WorkBuddy.exe'),
     'D:\\workbody\\WorkBuddy\\WorkBuddy.exe',
   ];
+  if (PROFILE.id === 'workbuddy-ai') {
+    cands.unshift(
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+      path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI', 'WorkBuddyAI.exe')
+    );
+  }
   for (const c of cands) {
     const hit = tryFile(c);
     if (hit) return (wbBinaryCache = hit);
   }
+  try {
+    const roots = [
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'WorkBuddy'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'WorkBuddy'),
+      process.env.APPDATA && path.join(process.env.APPDATA, 'WorkBuddy'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'CodeBuddy'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'CodeBuddy'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'WorkBuddyAI'),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'WorkBuddyAI'),
+    ].filter(Boolean);
+    const names = PROFILE.id === 'workbuddy-ai'
+      ? ['WorkBuddyAI.exe', 'WorkBuddy.exe']
+      : ['WorkBuddy.exe', 'CodeBuddy.exe'];
+    const psQuote = (value) => "'" + String(value).replace(/'/g, "''") + "'";
+    const command = [
+      '$roots=@(' + roots.map(psQuote).join(', ') + ')',
+      '$names=@(' + names.map(psQuote).join(', ') + ')',
+      'foreach($root in $roots){',
+      'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
+      '$hit=Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } | Select-Object -First 1 -ExpandProperty FullName',
+      'if($hit){$hit;break}',
+      '}',
+    ].join('; ');
+    const p = psCmd(command).trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop();
+    const hit = tryFile(p);
+    if (hit) return (wbBinaryCache = hit);
+  } catch (_) {}
   return null;
 }
 
@@ -2107,16 +2177,21 @@ function injectWidget(reason) {
     })
     .then(async (r) => {
       // Runtime.evaluate 本身成功不代表脚本完成挂载；回读 DOM/全局守卫，区分“协议成功”与“用户可见”。
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // 手动注入是 launcher 的成功判据，给页面首屏最多约 1.3 秒完成挂载，避免把正常加载延迟误报为失败。
       let state = null;
-      try {
-        const check = await cdpSend('Runtime.evaluate', {
-          expression: '({ url: location.href, readyState: document.readyState, body: !!document.body, root: !!document.querySelector(".wbs-root"), widget: !!window.__wbsWidget })',
-          returnByValue: true,
-        });
-        state = check && check.result && check.result.value;
-      } catch (e) {
-        log(`[cdp] 注入结果校验失败(${reason}): ${e.message}`);
+      const checks = reason === 'manual' ? 5 : 1;
+      for (let attempt = 0; attempt < checks; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 120 : 300));
+        try {
+          const check = await cdpSend('Runtime.evaluate', {
+            expression: '({ url: location.href, readyState: document.readyState, body: !!document.body, root: !!document.querySelector(".wbs-root"), widget: !!window.__wbsWidget })',
+            returnByValue: true,
+          });
+          state = check && check.result && check.result.value;
+        } catch (e) {
+          log(`[cdp] 注入结果校验失败(${reason}): ${e.message}`);
+        }
+        if (state && state.root && state.widget) break;
       }
       if (!state || !state.root || !state.widget) {
         log(`[cdp] 注入后未检测到组件(${reason}): ${JSON.stringify(state || {})}`);
@@ -2125,12 +2200,17 @@ function injectWidget(reason) {
         if (!String(reason).endsWith('-retry')) {
           setTimeout(() => { if (cdp.connected) injectWidget(String(reason) + '-retry').catch(() => {}); }, 700);
         }
+        if (reason === 'manual') throw new Error('注入后未检测到 WorkDaddy 组件（请检查 WorkBuddy 页面是否正常加载）');
       } else {
         log(`[cdp] 注入结果确认(${reason}): root=true widget=true url=${state.url}`);
       }
-      return r;
+      return { result: r, mounted: Boolean(state && state.root && state.widget), state };
     })
-    .catch((e) => log(`[cdp] 注入失败: ${e.message}`));
+    .catch((e) => {
+      log(`[cdp] 注入失败: ${e.message}`);
+      if (reason === 'manual') throw e;
+      return { result: null, mounted: false, error: e.message };
+    });
 }
 
 async function readCdpTargets() {
@@ -2328,6 +2408,14 @@ function copySessionFiles(wbHome, oldId, newId) {
   const copyOne = (from, to) => {
     try {
       if (!fsMod.existsSync(from)) return;
+      const fromResolved = path.resolve(from);
+      const toResolved = path.resolve(to);
+      const relative = path.relative(fromResolved, toResolved);
+      const targetInsideSource = relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+      if (targetInsideSource) {
+        log('[sessions-copy] 跳过源目录内复制 ' + from + ' -> ' + to);
+        return;
+      }
       fsMod.mkdirSync(path.dirname(to), { recursive: true });
       fsMod.cpSync(from, to, { recursive: true, force: true });
       result.copied++;
@@ -2370,7 +2458,8 @@ const SESSION_COPY_COLUMNS = [
 const sessionCopyLocks = new Map();
 
 function isTaskSessionRecord(cwd) {
-  return /[\\/]WorkBuddy[\\/]\d{4}-\d{2}-\d{2}[-]\d{2}[-]\d{2}[-]\d{2}/i.test(String(cwd || ''));
+  // WorkBuddy 的普通工作区也使用 WorkBuddy\\YYYY-MM-DD-HH-MM-SS；仅凭 cwd 无法可靠区分任务会话。
+  return false;
 }
 
 function sqlQuote(value) {
@@ -2473,7 +2562,6 @@ async function buildAutoCopyPlan(sourceUid, targetUid) {
   const sessionSet = new Set(rules.sessionIds);
   const workspaceSet = new Set(rules.workspaces.map(canonicalWorkspace));
   return rows
-    .filter((row) => !isTaskSessionRecord(row.cwd))
     .filter((row) => sessionSet.has(String(row.id)) || workspaceSet.has(canonicalWorkspace(row.cwd)))
     .map((row) => Object.assign({}, row, { lineageId: rules.lineages[String(row.id)] || null }));
 }
@@ -3864,22 +3952,14 @@ async function sendStashToComposer(record) {
   return { sent: true, textLen: text.length, itemCount: allItems.length, imagesRestored, imagesFailed, blocksRestored, blocksFailed };
 }
 
-function pad(n) {
-  return String(n).padStart(2, '0');
-}
-
-function formatLocalDateTime(d) {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
 /**
- * 查询剩余积分余额（单套 PackageCodes）。
- * 接口返回 Account 数组，累加每个 Account 的 CapacityRemainPrecise。
+ * 查询剩余积分余额。
+ * WorkBuddy v2 接口返回所有有效资源 Account，避免按 PackageCode 白名单漏掉赠送或付费额度。
  */
 async function fetchResource(accessToken, body, source) {
   // 积分查询与签到同源：按 profile 归属域名请求（国际版为 www.workbuddy.ai）
   const apiHost = PROFILE.apiHost || 'https://www.workbuddy.cn';
-  const r = await fetch(`${apiHost}/billing/meter/get-user-resource`, {
+  const r = await fetch(`${apiHost}/v2/billing/meter/get-user-resource`, {
     method: 'POST',
     headers: {
       accept: 'application/json, text/plain, */*',
@@ -3902,8 +3982,13 @@ async function fetchResource(accessToken, body, source) {
   }
   if (!r.ok) throw new Error(`积分接口 HTTP ${r.status}: ${text.slice(0, 120)}`);
   if (o.code !== 0 && o.code !== undefined) throw new Error(o.msg || `积分接口返回 code=${o.code}`);
-  const data = o.data && o.data.Response && o.data.Response.Data;
-  const accounts = (data && data.Accounts) || [];
+  const data = (o.data && o.data.Response && o.data.Response.Data) ||
+    (o.data && o.data.data && o.data.data.Response && o.data.data.Response.Data) ||
+    null;
+  const accounts = (data && Array.isArray(data.Accounts) ? data.Accounts : null) ||
+    (o.data && Array.isArray(o.data.accounts) ? o.data.accounts : null) ||
+    (o.data && o.data.data && Array.isArray(o.data.data.accounts) ? o.data.data.accounts : null) ||
+    [];
   let credits = 0;
   for (const a of accounts) {
     // 剩余字段优先「周期剩余」(CycleCapacityRemainPrecise)：月度包用完时 CapacityRemainPrecise
@@ -3921,22 +4006,18 @@ async function fetchResource(accessToken, body, source) {
     credits: parseFloat(credits.toFixed(2)),
     count: accounts.length,
     totalDosage: data && data.TotalDosage,
-    segments: extractCreditSegments(accounts, source),
+    segments: mergeCreditSegments(extractCreditSegments(accounts, source)),
   };
 }
 
 /**
- * 用指定账号的 accessToken 查询 workbuddy 总剩余积分。
- * 余额由两部分相加：
- *  - meter：计量包（原查询的 PackageCodes，如 26.27）
- *  - package：体验/赠送包（用户提供的第二套 PackageCodes，如 CodeBuddy 个人体验版 500）
- * 两者 CapacityRemainPrecise 累加即为该账号总剩余积分。
- * 任一组查询失败不影响另一组的结果（但单组失败会先重试，避免余额被偏低计入）。
+ * 用指定账号的 accessToken 查询 WorkBuddy 总剩余积分。
+ * 单次全量资源查询失败会有限重试，避免临时接口异常把余额显示为偏低值。
  */
 const retryDelay = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 单组查询带有限重试：接口/http 偶发失败或返回空 Accounts 时，若直接按 0 计入会让总余额
-// 偏低（如数百积分的体验/赠送包被漏掉）。重试耗尽仍失败才抛出，由上层作为该组 0 处理。
+// 接口/http 偶发失败或返回空 Accounts 时，若直接按 0 计入会让总余额偏低。
+// 重试耗尽仍失败才抛出，由上层按现有错误路径处理。
 async function robustFetchResource(accessToken, body, label) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -3961,52 +4042,10 @@ async function robustFetchResource(accessToken, body, label) {
 }
 
 async function fetchCredits(accessToken) {
-  // 1) 计量包（meter）
-  const meterBody = {
-    PageNumber: 1,
-    PageSize: 200,
-    ProductCode: 'p_tcaca',
-    Status: [0],
-    PackageEndTimeRangeBegin: formatLocalDateTime(new Date()),
-    PackageEndTimeRangeEnd: '2127-08-14 22:55:11',
-    PackageCodes: ['TCACA_code_007_nzdH5h4Nl0', 'TCACA_code_029_6wCGEWquYy', 'TCACA_code_030_BjSt89qTvr'],
-    OrderBy: 'endTime',
-    SortBy: 'desc',
-  };
-  // 2) 体验/赠送包（package）：来自用户提供的 curl（含 CodeBuddy 个人体验版 500 分等）
-  const pkgBody = {
-    PageNumber: 1,
-    PageSize: 200,
-    ProductCode: 'p_tcaca',
-    Status: [0, 3],
-    OnlyValidPeriod: true,
-    PackageCodes: [
-      'TCACA_code_008_cfWoLwvjU4',
-      'TCACA_code_002_AkiJS3ZHF5',
-      'TCACA_code_023_4xbGhMrE6q',
-      'TCACA_code_026_BaESVICNoi',
-      'TCACA_code_027_0FCGVA6vSa',
-      // Current CodeBuddy activity/bonus packages. Older WorkBuddy accounts use the
-      // codes above; querying both keeps daily grants visible across editions.
-      'TCACA_code_035_ArVxJcGDsm',
-      'TCACA_code_036_lupO5WgNdG',
-      'TCACA_code_037_WxOD3MpI2o',
-      'TCACA_code_039_KRcQj7wUat',
-      'TCACA_code_040_mi9rCYg46x',
-    ],
-  };
-  const [m, p] = await Promise.allSettled([
-    robustFetchResource(accessToken, meterBody, 'meter'),
-    robustFetchResource(accessToken, pkgBody, 'package'),
-  ]);
-  const meter = m.status === 'fulfilled' ? m.value : { credits: 0, count: 0, totalDosage: 0, segments: [] };
-  const pkg = p.status === 'fulfilled' ? p.value : { credits: 0, count: 0, totalDosage: 0, segments: [] };
-  if (m.status === 'rejected' && p.status === 'rejected') {
-    throw m.reason; // 两组都失败才真正报错
-  }
-  const totalDosage = (Number(meter.totalDosage) || 0) + (Number(pkg.totalDosage) || 0);
-  const credits = parseFloat((meter.credits + pkg.credits).toFixed(2));
-  let segments = sortCreditSegments([...(meter.segments || []), ...(pkg.segments || [])]);
+  const result = await robustFetchResource(accessToken, buildCreditResourceBody(), 'all-resources');
+  const credits = result.credits;
+  const totalDosage = Number(result.totalDosage) || 0;
+  let segments = sortCreditSegments(result.segments || []);
   const visibleSegmentCredits = segments.reduce((sum, segment) => sum + segment.remaining, 0);
   // Keep the total and the bar consistent even when a new API field is not recognized yet.
   if (credits > visibleSegmentCredits + 0.01) {
@@ -4017,12 +4056,12 @@ async function fetchCredits(accessToken) {
   }
   return {
     credits,
-    count: meter.count + pkg.count,
+    count: result.count,
     totalDosage,
-    meterCredits: meter.credits,
-    packageCredits: pkg.credits,
-    meterError: m.status === 'rejected' ? String((m.reason && m.reason.message) || m.reason) : null,
-    packageError: p.status === 'rejected' ? String((p.reason && p.reason.message) || m.reason) : null,
+    meterCredits: credits,
+    packageCredits: 0,
+    meterError: null,
+    packageError: null,
     segments,
   };
 }
@@ -4101,7 +4140,7 @@ function handleApi(req, res) {
 
   if (req.method === 'POST' && p === '/api/inject') {
     return injectWidget('manual').then(
-      () => json(res, 200, { ok: true }),
+      (info) => json(res, 200, { ok: true, mounted: !!(info && info.mounted) }),
       (e) => json(res, 500, { ok: false, error: e.message })
     );
   }
@@ -4331,7 +4370,7 @@ function handleApi(req, res) {
     return json(res, 200, { ok: true, current: currentAccount(), accounts: enriched, checkin: checkinSnapshot() });
   }
 
-  // 查询指定账号的剩余积分（累加 Account 数组的 CapacityRemainPrecise）
+  // 查询指定账号的剩余积分（v2 全量资源 Account 汇总）
   if (req.method === 'POST' && p === '/api/credits') {
     return readBody(req).then(async (body) => {
       const uid = (body.uid || '').trim();

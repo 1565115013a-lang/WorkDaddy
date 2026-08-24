@@ -104,6 +104,7 @@ function extractCreditSegments(accounts, source) {
           total: Number((total === null ? remaining : Math.max(total, remaining)).toFixed(2)),
           expiresAt: firstTimestamp(item, EXPIRY_FIELDS),
           source: firstText(item, LABEL_FIELDS) || source || '积分',
+          packageCode: item && item.PackageCode ? String(item.PackageCode) : '',
         };
       });
     })
@@ -118,6 +119,7 @@ function sortCreditSegments(segments) {
       total: Number(Number(segment.total || segment.remaining).toFixed(2)),
       expiresAt: segment.expiresAt === null || segment.expiresAt === undefined ? null : Number(segment.expiresAt),
       source: String(segment.source || '积分'),
+      packageCode: String(segment.packageCode || ''),
     }))
     .sort((a, b) => {
       if (a.expiresAt === null && b.expiresAt !== null) return 1;
@@ -126,4 +128,28 @@ function sortCreditSegments(segments) {
     });
 }
 
-module.exports = { extractCreditSegments, sortCreditSegments };
+function mergeCreditSegments(segments) {
+  const merged = new Map();
+  for (const segment of Array.isArray(segments) ? segments : []) {
+    if (!segment || Number(segment.remaining) <= 0) continue;
+    // Multiple records can represent one grant package (for example ten 500-credit
+    // records that the account page renders as one 5000-credit gift quota).
+    const key = [segment.packageCode || segment.source || '积分', segment.expiresAt ?? 'unknown'].join('|');
+    const previous = merged.get(key);
+    if (previous) {
+      previous.remaining += Number(segment.remaining) || 0;
+      previous.total += Number(segment.total || segment.remaining) || 0;
+    } else {
+      merged.set(key, {
+        remaining: Number(segment.remaining) || 0,
+        total: Number(segment.total || segment.remaining) || 0,
+        expiresAt: segment.expiresAt === undefined ? null : segment.expiresAt,
+        source: String(segment.source || '积分'),
+        packageCode: String(segment.packageCode || ''),
+      });
+    }
+  }
+  return sortCreditSegments(Array.from(merged.values()));
+}
+
+module.exports = { extractCreditSegments, sortCreditSegments, mergeCreditSegments };

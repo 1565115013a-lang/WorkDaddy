@@ -1,7 +1,10 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
-const { extractCreditSegments, sortCreditSegments } = require('../scripts/credit-segments.js');
+const { extractCreditSegments, sortCreditSegments, mergeCreditSegments } = require('../scripts/credit-segments.js');
+const { buildCreditResourceBody } = require('../scripts/credit-resource-queries.js');
 
 test('extracts each expiring account as an independent credit segment', () => {
   const segments = extractCreditSegments([
@@ -41,4 +44,34 @@ test('sorts expiring segments first and keeps unknown expiry last', () => {
     { remaining: 100, expiresAt: 1000, source: 'sooner' },
   ]);
   assert.deepEqual(sorted.map((segment) => segment.source), ['sooner', 'later', 'unknown']);
+});
+
+test('merges repeated 500-credit records into one 5000-credit grant segment', () => {
+  const segments = extractCreditSegments(Array.from({ length: 10 }, () => ({
+    PackageCode: 'TCACA_code_037_WxOD3MpI2o',
+    CycleCapacityRemainPrecise: '500',
+    CycleCapacitySizePrecise: '500',
+    CycleEndTime: '2034-08-20 14:29:00',
+  })), '赠送用量');
+  const merged = mergeCreditSegments(segments);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].remaining, 5000);
+  assert.equal(merged[0].total, 5000);
+});
+
+test('builds a v2 all-resource query without a PackageCode allowlist', () => {
+  const body = buildCreditResourceBody(new Date(2026, 7, 24, 12, 34, 56));
+  assert.equal(body.PageNumber, 1);
+  assert.equal(body.PageSize, 100);
+  assert.equal(body.ProductCode, 'p_tcaca');
+  assert.deepEqual(body.Status, [0, 3]);
+  assert.equal(Object.prototype.hasOwnProperty.call(body, 'PackageCodes'), false);
+  assert.equal(body.PackageEndTimeRangeBegin, '2026-08-24 12:34:56');
+  assert.equal(body.PackageEndTimeRangeEnd, '2127-08-24 12:34:56');
+});
+
+test('daemon calls the v2 all-resource billing endpoint', () => {
+  const daemon = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'daemon.js'), 'utf8');
+  assert.match(daemon, /\/v2\/billing\/meter\/get-user-resource/);
+  assert.doesNotMatch(daemon, /fetch\(`\$\{apiHost\}\/billing\/meter\/get-user-resource/);
 });

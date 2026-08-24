@@ -43,7 +43,7 @@ chmod 755 "$APP/Contents/MacOS/launcher"
 echo "==> launcher 可执行位已保证: $(stat -f '%Sp' "$APP/Contents/MacOS/launcher")"
 
 # 2) 只覆盖前端代码（保留壳的其余一切：launcher/Info.plist/builtin/node_modules/theme-audit.js）
-for f in daemon.js inject.js theme-patches.js credit-segments.js lib.js profiles.js cdp-targets.js sentry-report.js install.sh relaunch-with-cdp.sh uninstall.sh apply-update.sh; do
+for f in daemon.js inject.js theme-patches.js credit-segments.js credit-resource-queries.js lib.js profiles.js cdp-targets.js sentry-report.js install.sh relaunch-with-cdp.sh uninstall.sh apply-update.sh; do
   [ -f "scripts/$f" ] && cp "scripts/$f" "$APP/Contents/Resources/scripts/$f"
 done
 # 恢复这些文件的壳权限（与 1.0.3 壳内一致：sh/lib/daemon 755，inject/theme-patches 644）
@@ -87,61 +87,39 @@ fi
 ln -s /Applications "$STAGE/Applications"
 cat > "$STAGE/安装失败自主解决提示词.txt" <<'EOF'
 WorkDaddy macOS 安装失败自助修复
-================================
+============================
 
-你是 WorkDaddy 的故障修复 agent。用户已经无法正常安装或启动 WorkDaddy，请在用户明确授权的范围内完成排查、修复和自动上报。
+你是 WorkDaddy 故障修复 agent。仅在用户明确授权的范围内排查、修复和上报。
 
-一、准备源码
+一、准备与排查
 
-1. 在一个新的临时目录执行：
-
+1. 在临时目录执行：
    git clone https://github.com/babygoton/WorkDaddy.git
    cd WorkDaddy
+2. 阅读 README.md、scripts/install.sh、scripts/relaunch-with-cdp.sh、scripts/daemon.js，结合用户提供的错误复现问题。
+3. 只在源码目录操作；不要读取、复制、上传或修改 ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/、~/Library/Application Support/WorkDaddy/accounts/、数据库、Cookie、环境变量、私钥或完整日志。
+4. 记录一条关键错误、系统/Node/WorkBuddy 版本和可复现命令；不要粘贴完整日志。
+5. 可复现时运行 `bash scripts/install.sh` 和 `bash scripts/relaunch-with-cdp.sh`。
 
-2. 先阅读 README.md、scripts/install.sh、scripts/relaunch-with-cdp.sh、scripts/daemon.js，以及用户提供的终端错误和 daemon.log。不要读取、复制、上传或修改以下内容：
+二、修复与验证
 
-   - ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/
-   - ~/Library/Application Support/WorkDaddy/accounts/
-   - WorkBuddy 数据库、Cookie、环境变量、私有密钥
-
-二、复现问题
-
-1. 只在源码目录中操作。先运行：
-
-   bash scripts/install.sh
-   bash scripts/relaunch-with-cdp.sh
-
-2. 如果命令失败，记录实际失败命令、完整错误文本、系统版本、Node 版本和 WorkBuddy 版本。不要猜测根因。
-
-三、修复问题
-
-1. 只修改 GitHub 源码目录，不直接修改 /Applications/WorkDaddy.app 或用户数据目录。
-2. 保持现有 macOS 行为和安全边界；不要删除账号数据，不要关闭现有脱敏逻辑。
-3. 修改后重新执行最小复现命令，并运行：
-
+1. 只修改源码，保持用户数据和脱敏逻辑不变。
+2. 先确认根因；无法确认时明确写“未确认”，不要猜测。
+3. 运行：
    node --check scripts/sentry-report.js
    node --check scripts/daemon.js
    node --test test/*.test.js
 
-四、生成修复报告
+三、生成短报告
 
-在源码根目录创建 WORKDADDY_FIX_REPORT.md，必须包含：
+在源码根目录写 WORKDADDY_FIX_REPORT.md。报告硬上限 3500 字符，最多包含：问题/根因、修改文件及目的、测试汇总、用户下一步。每项用短句；只引用一条脱敏错误，不附完整日志、命令输出、账号数据或凭据。
 
-   - 原始问题和复现命令
-   - 确认的根因；如果没有确认，写“未确认”
-   - 修改的文件和每个修改的目的
-   - 测试命令和实际结果
-   - 用户安装时需要重新执行的命令
+四、自动上报
 
-五、自动上报
+测试通过后执行：
+node scripts/sentry-report.js --stage agent-fix --level info --message-file WORKDADDY_FIX_REPORT.md --tags-json '{"source":"workbuddy-agent","status":"fixed","platform":"macos"}'
 
-只有在修复已经通过测试后，执行：
-
-   node scripts/sentry-report.js --stage agent-fix --level info --message-file WORKDADDY_FIX_REPORT.md --tags-json '{"source":"workbuddy-agent","status":"fixed","platform":"macos"}'
-
-命令输出必须是 JSON。看到 sent=true 表示已发送；看到 queued=true 表示网络暂时不可用，报告已写入 WorkDaddy 的 telemetry/outbox，后续会自动重试。不要把 token、账号备份、数据库或完整日志放进 WORKDADDY_FIX_REPORT.md。
-
-如果测试仍未通过，不得伪造 fixed 状态；可以改用 status=unresolved 上报，并在报告中写清楚阻塞原因。
+命令必须输出 JSON。sent=true 表示已发送，queued=true 表示已进入本地重试队列。测试未通过不得标记 fixed，应使用 status=unresolved 并写明阻塞原因。上报前再次确认报告不超过 3500 字符且不含敏感数据。
 EOF
 rm -f "$OUT"
 hdiutil create -volname "$PACKAGE_APP_NAME" -srcfolder "$STAGE" -ov -format UDZO -imagekey zlib-level=9 "$OUT" >/dev/null

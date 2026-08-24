@@ -1919,7 +1919,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // ===== 会话 pane（构建：账号/时间筛选 + 按空间分组[默认2条/展开10条] + 刷新 + 批量操作[迁移/删除]）=====
     var sessionsState = { uid: undefined, range: '7d', list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null };
     function isTaskSessionRecordUI(cwd) {
-      return /[\\/]WorkBuddy[\\/]\d{4}-\d{2}-\d{2}[-]\d{2}[-]\d{2}[-]\d{2}/i.test(String(cwd || ''));
+      // WorkBuddy 的普通工作区也使用 WorkBuddy\\YYYY-MM-DD-HH-MM-SS；仅凭 cwd 无法可靠区分任务会话。
+      return false;
     }
     function canonicalWorkspaceUI(cwd) {
       var value = String(cwd || '').trim().replace(/\\/g, '/');
@@ -2018,7 +2019,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var url = '/api/sessions?range=' + (sessionsState.range || '7d');
       if (sessionsState.uid !== undefined) url += '&uid=' + encodeURIComponent(sessionsState.uid);
       api(url).then(function (d) {
-        // 任务会话不支持复制，也不参与批量操作；从会话页数据源直接隐藏，避免出现不可操作的只读分组。
+        // cwd 的时间戳路径同时用于普通工作区，不能据此隐藏会话；所有记录先保留给用户查看和操作。
         sessionsState.list = ((d && d.sessions) || []).filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
         sessionsState.autoCopy = (d && d.autoCopy) || null;
         sessionsState.selected = {};
@@ -2039,7 +2040,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // 按空间分组渲染：每个空间最多显示 INIT 条 + 展开按钮（每次 +STEP）。
-    // 自动复制只支持会话和空间；任务组本身没有自动复制按钮。
     function renderSessions() {
       var listEl = sessionsPane.querySelector('#wbs-sess-list');
       var countEl = sessionsPane.querySelector('#wbs-sess-count');
@@ -3028,8 +3028,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             return l.trim().replace(/^[-*+]\s*/, '').replace(/^#+\s*/, '');
           }).filter(function (l) {
             return l && !/^SHA-?256[:：]/i.test(l) && !/^https?:\/\//i.test(l) && !/full changelog/i.test(l);
-          }).slice(0, 3).map(function (l) {
-            return l.length > 48 ? l.slice(0, 47) + '…' : l;
           });
           notes.textContent = noteLines.join('\n') || '有新版本可用，点击更新。';
         }
@@ -3071,6 +3069,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var m = Math.floor(s / 60);
       var rem = s % 60;
       return '预计剩余 ' + m + ' 分 ' + rem + ' 秒';
+    }
+    function formatDownloadTransfer(status) {
+      var rate = Number(status && status.downloadRate) || 0;
+      var eta = status && status.etaSeconds;
+      var parts = [];
+      // 初始请求尚未收到数据时不要展示“0 B/s · 剩余时间计算中”。
+      if (rate > 0) {
+        parts.push(formatDownloadRate(rate));
+        parts.push(formatDownloadEta(eta));
+      } else if (eta !== null && typeof eta !== 'undefined' && isFinite(Number(eta))) {
+        parts.push(formatDownloadEta(eta));
+      }
+      return parts.length ? ' · ' + parts.join(' · ') : '';
     }
     function formatUpdateFailure(value, fallback) {
       var payload = value && value.payload ? value.payload : (value && typeof value === 'object' ? value : null);
@@ -3169,7 +3180,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             if (st === 'downloading' || st === 'verifying') {
               var transfer = '';
               if (st === 'downloading') {
-                transfer = ' · ' + formatDownloadRate(s.downloadRate) + ' · ' + formatDownloadEta(s.etaSeconds);
+                transfer = formatDownloadTransfer(s);
               }
               appendUpdateLog(prog, (s.message || '正在下载…') + (s.progress ? ' ' + s.progress + '%' : '') + transfer);
             } else if (st === 'installing') {
@@ -5747,7 +5758,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-update-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}',
     '.wbs-update-dot{width:8px;height:8px;border-radius:50%;background:#e24b4a;flex-shrink:0}',
     '.wbs-update-title{font-size:13px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f)}',
-    '.wbs-update-notes{font-size:11.5px;line-height:1.6;color:var(--wb-icon-tertiary,#777);white-space:pre-line;max-height:72px;overflow:hidden;margin-bottom:10px}',
+    '.wbs-update-notes{font-size:11.5px;line-height:1.6;color:var(--wb-icon-tertiary,#777);white-space:pre-wrap;overflow:visible;overflow-wrap:anywhere;margin-bottom:10px}',
     '.wbs-update-actions{display:flex;align-items:center;gap:10px;min-width:0}',
     '.wbs-update-btn{font-size:12px;font-weight:600;color:var(--wb-button-primary-fg,#fff);background:var(--wb-button-primary-bg,#1f1f1f);border:none;padding:6px 10px;border-radius:8px;cursor:pointer;transition:opacity .15s;flex:0 0 112px;min-width:112px;box-sizing:border-box;white-space:nowrap}',
     '.wbs-update-btn:hover{opacity:.85}',
