@@ -213,6 +213,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     return false;
   }
 
+  function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function escAttr(t) { return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+
   function checkinHtml(a) {
     // 国际版不开放签到活动：积分卡上的签到标签整体不展示（CN 版保留完整逻辑）
     if (PROFILE_ID === 'workbuddy-ai') return '';
@@ -228,13 +231,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     if (c.ok) return '<span class="wbs-ck wbs-checkin-tag ok">今日已签到✓</span>';
     // 认证类错误（401/未授权）统一显示友好文案（daemon 已产出，缓存残留旧文案时兜底）
     if (/401|Unauthorized|未授权|登录身份过期/.test(msg)) msg = '登录身份过期';
-    return '<span class="wbs-ck wbs-checkin-tag fail">' + msg + '</span>';
+    return '<span class="wbs-ck wbs-checkin-tag fail">' + esc(msg) + '</span>';
   }
 
-  function el(tag, cls, html) {
+  function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) n.className = cls;
-    if (html !== undefined) n.innerHTML = html;
+    if (text !== undefined) n.textContent = String(text);
     return n;
   }
 
@@ -536,7 +539,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     function toast(msg, isErr, targetRoot) {
       if (!alive) return;
-      var t = el('div', 'wbs-toast' + (isErr ? ' err' : ''), msg);
+      var t = el('div', 'wbs-toast' + (isErr ? ' err' : ''));
+      t.textContent = String(msg == null ? '' : msg);
       (targetRoot || document.body).appendChild(t);
       setBuildTimeout(function () {
         t.classList.add('out');
@@ -1997,7 +2001,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var html = '<option value="">' + esc(curName) + '</option>';
         accts.forEach(function (a) {
           if (a.uid === curUid) return;
-          html += '<option value="' + a.uid + '">' + esc(a.nickname || '账号' + a.uid.slice(0, 4)) + '</option>';
+          html += '<option value="' + escAttr(a.uid) + '">' + esc(a.nickname || '账号' + a.uid.slice(0, 4)) + '</option>';
         });
         html += '<option value="*">全部账号</option>';
         sel.innerHTML = html;
@@ -2038,7 +2042,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
         updateSessCount();
       }).catch(function (e) {
-        listEl.innerHTML = '<div class="wbs-empty">会话加载失败: ' + (e.message || e) + '</div>';
+        listEl.innerHTML = '<div class="wbs-empty">会话加载失败: ' + esc(e.message || e) + '</div>';
       });
     }
 
@@ -2087,7 +2091,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           var title = s.custom_title || s.title || '(无标题)';
           html += '<div class="wbs-sess-row">' +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
-            '<span class="wbs-sess-meta">' + fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at) + '</span></span>' +
+            '<span class="wbs-sess-meta">' + esc(fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at)) + '</span></span>' +
             '</div>';
         });
         if (taskMore > 0) html += '<button class="wbs-sess-more" type="button" data-ws="__TASKS__">展开 ' + Math.min(taskMore, SESS_WS_STEP) + ' 条（剩余 ' + taskMore + '）</button>';
@@ -2117,7 +2121,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           html += '<div class="wbs-sess-row">' +
             (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
-            '<span class="wbs-sess-meta">' + fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at) + '</span></span>' +
+            '<span class="wbs-sess-meta">' + esc(fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at)) + '</span></span>' +
             (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
             '</div>';
         });
@@ -2282,8 +2286,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       if (lbl) lbl.textContent = allSel ? '取消全选' : '全选';
     }
-    function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-    function escAttr(t) { return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
     // 人性化时间：刚刚 / x 分钟前 / x 小时前 / 昨天 / x 天前 / 日期
     function fmtHumanTime(ts) {
       if (!ts) return '-';
@@ -2416,7 +2418,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           body.innerHTML = '<select class="wbs-sess-select wbs-sess-target" id="wbs-sess-target" title="选择目标账号">' +
             '<option value="">选择目标账号…</option>' +
             targets.map(function (a) {
-              return '<option value="' + a.uid + '">' + esc(a.nickname || a.uid) + (a.phone ? '（' + esc(a.phone) + '）' : '') + '</option>';
+              return '<option value="' + escAttr(a.uid) + '">' + esc(a.nickname || a.uid) + (a.phone ? '（' + esc(a.phone) + '）' : '') + '</option>';
             }).join('') +
             '</select>';
         }
@@ -2526,9 +2528,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 按钮组占流固定在标题行右侧，仅 hover/focus cell 时由透明变不透明，布局与高度恒定
       var actions = options.official
         ? '<div class="wbs-model-actions">' +
-          '<button class="wbs-model-icon-action" type="button" data-model-backup="' + model.index + '" title="备份" aria-label="备份">' + MODEL_BACKUP_SVG + '</button>' +
-          '<button class="wbs-model-icon-action" type="button" data-model-test="' + model.index + '" title="连通测试" aria-label="连通测试">' + MODEL_TEST_SVG + '</button>' +
-          '<button class="wbs-model-icon-action wbs-model-danger-action" type="button" data-model-delete-official="' + model.index + '" title="删除" aria-label="删除">' + TRASH_SVG + '</button>' +
+          '<button class="wbs-model-icon-action" type="button" data-model-backup="' + escAttr(model.index) + '" title="备份" aria-label="备份">' + MODEL_BACKUP_SVG + '</button>' +
+          '<button class="wbs-model-icon-action" type="button" data-model-test="' + escAttr(model.index) + '" title="连通测试" aria-label="连通测试">' + MODEL_TEST_SVG + '</button>' +
+          '<button class="wbs-model-icon-action wbs-model-danger-action" type="button" data-model-delete-official="' + escAttr(model.index) + '" title="删除" aria-label="删除">' + TRASH_SVG + '</button>' +
           '</div>'
         : '<div class="wbs-model-actions">' +
           '<button class="wbs-model-icon-action" type="button" data-model-copy="' + escAttr(model.backupId) + '" title="复制" aria-label="复制">' + MODEL_COPY_SVG + '</button>' +
@@ -3451,10 +3453,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (!list.length) { grid.innerHTML = '<div class="wbs-wp-loading">暂无官方壁纸</div>'; return; }
         var html = '';
         list.forEach(function (w) {
+          var wallpaperUrl = base + '/wallpapers/' + encodeURIComponent(w.name);
           html +=
-            '<div class="wbs-wp" data-wp="' + w.name + '" title="' + w.title + '">' +
-            '<div class="wbs-wp-thumb"><img data-src="' + base + '/wallpapers/' + encodeURIComponent(w.name) + '" alt="' + w.title + '" loading="lazy"></div>' +
-            '<div class="wbs-wp-badge">' + (String(w.name).replace(/\D/g, '').replace(/^0+/, '') || w.title) + '</div>' +
+            '<div class="wbs-wp" data-wp="' + escAttr(w.name) + '" title="' + escAttr(w.title) + '">' +
+            '<div class="wbs-wp-thumb"><img data-src="' + escAttr(wallpaperUrl) + '" alt="' + escAttr(w.title) + '" loading="lazy"></div>' +
+            '<div class="wbs-wp-badge">' + esc(String(w.name).replace(/\D/g, '').replace(/^0+/, '') || w.title) + '</div>' +
             '</div>';
         });
         grid.innerHTML = html;
@@ -3860,12 +3863,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         ['圆角', cs.borderRadius], ['模糊', cs.backdropFilter === 'none' ? '—' : cs.backdropFilter],
       ];
       for (var i = 0; i < items.length; i++) {
-        rows += '<div class="wbs-ins-row"><span>' + items[i][0] + '</span><code>' + (items[i][1] || '—') + '</code></div>';
+        rows += '<div class="wbs-ins-row"><span>' + esc(items[i][0]) + '</span><code>' + esc(items[i][1] || '—') + '</code></div>';
       }
       var vars = '';
       for (var k = 0; k < INSPECT_KEYS.length; k++) {
         var v = cs.getPropertyValue(INSPECT_KEYS[k][0]).trim();
-        vars += '<div class="wbs-ins-row"><span>' + INSPECT_KEYS[k][1] + ' <em>' + INSPECT_KEYS[k][0] + '</em></span><code>' + (v || '未定义（继承上层）') + '</code></div>';
+        vars += '<div class="wbs-ins-row"><span>' + esc(INSPECT_KEYS[k][1]) + ' <em>' + esc(INSPECT_KEYS[k][0]) + '</em></span><code>' + esc(v || '未定义（继承上层）') + '</code></div>';
       }
       var rules = [];
       try {
@@ -3882,7 +3885,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
       } catch (e) {}
       var rulesHtml = rules.length
-        ? rules.map(function (x) { return '<div class="wbs-ins-rule">' + x + '</div>'; }).join('')
+        ? rules.map(function (x) { return '<div class="wbs-ins-rule">' + esc(x) + '</div>'; }).join('')
         : '<div class="wbs-ins-rule muted">无直接样式规则（颜色来自继承）</div>';
       // 完整报告文本（复制用：选择器 + 基础样式 + 主题变量 + 匹配规则）
       var report = ['🔍 ' + buildSelector(el), ''];
@@ -3901,9 +3904,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 元素 query 路径（从 body 到该元素的完整 CSS 选择器，可直接用于 document.querySelector）
       var queryPath = buildQueryPath(el);
       div.innerHTML =
-        '<div class="wbs-ins-head"><span>🔍 ' + buildSelector(el) + '</span>' +
+        '<div class="wbs-ins-head"><span>🔍 ' + esc(buildSelector(el)) + '</span>' +
         '<span class="wbs-ins-btns"><button class="wbs-ins-copy" type="button" title="复制元素 query 路径（从 body 起的完整 CSS 选择器）">复制路径</button><button class="wbs-ins-repick" type="button">再检查</button><button class="wbs-ins-close" type="button">✕</button></span></div>' +
-        '<div class="wbs-ins-sec">元素路径</div><div class="wbs-ins-path">' + queryPath + '</div>' +
+        '<div class="wbs-ins-sec">元素路径</div><div class="wbs-ins-path">' + esc(queryPath) + '</div>' +
         '<div class="wbs-ins-sec">基础样式</div>' + rows +
         '<div class="wbs-ins-sec">主题变量（当前生效值）</div>' + vars +
         '<div class="wbs-ins-sec">匹配的样式规则</div>' + rulesHtml +
@@ -4843,8 +4846,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var ops = isCur
           ? ''
           : '<div class="wbs-ops">' +
-            (expired ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
-            '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + TRASH_SVG + '</button>' +
+            (expired ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
+            '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + TRASH_SVG + '</button>' +
             '</div>';
         // 国际版没有手机号：用 UIN（账号唯一数字标识）替代展示；国内版仍显示手机。
         // wbs-uin-cell 用于 UIN 模式下补齐标签与取值之间的间距（wbs-phone-cell 默认 gap:0 过于紧凑）。
@@ -4853,10 +4856,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var idVal = a.phone ? esc(a.phone) : (a.uin ? esc(a.uin) : '-');
         card.innerHTML =
           '<div class="wbs-info">' +
-          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + (a.nickname || '(未命名)') + '</span>' + badge + '</div>' + ops + '</div>' +
+          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + esc(a.nickname || '(未命名)') + '</span>' + badge + '</div>' + ops + '</div>' +
           '<div class="wbs-meta wbs-secondary-row">' +
           '<div class="wbs-mi wbs-phone-cell' + (isUinMode ? ' wbs-uin-cell' : '') + '"><span class="wbs-lbl">' + idLbl + '</span><span class="wbs-val">' + idVal + '</span></div>' +
-          '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + ts.label + '</span></div>' +
+          '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + esc(ts.label) + '</span></div>' +
           '</div>' +
           '<div class="wbs-credit-cell' + (isIdentityExpired(a) ? ' wbs-credit-hidden' : '') + '">' + creditBlockHtml(credits, a.creditSegments, a) + '</div>' +
           '</div>';
@@ -4960,7 +4963,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           fetchCreditsForAccounts();
         })
         .catch(function (e) {
-          var msg = '<div class="wbs-empty">无法连接本地服务: ' + e.message + '<br>请确认守护进程已运行</div>';
+          var msg = '<div class="wbs-empty">无法连接本地服务: ' + esc(e.message || e) + '<br>请确认守护进程已运行</div>';
           accountsPane.innerHTML = msg;
         });
     }
