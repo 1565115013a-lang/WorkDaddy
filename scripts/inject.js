@@ -103,6 +103,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var PROFILE_ID = '__WBS_PROFILE__';
   var CAPS = __WBS_CAPS__;
   var WBS_API_TOKEN = '__WBS_API_TOKEN__';
+  var WBS_DIAGNOSTIC_LOGS = __WBS_DIAGNOSTIC_LOGS__;
   // 面板品牌名跟随 profile：workbuddy-ai 显示 WorkDaddy AI，其余显示 WorkDaddy
   var WBS_BRAND = PROFILE_ID === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy';
 
@@ -121,9 +122,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } catch (_) {}
       var line = '[wbscrash] ' + kind + ': ' + msg + (stack ? '\n' + stack : '');
       try { console.error(line); } catch (_) {}
-      try {
-        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
-      } catch (_) {}
+      if (WBS_DIAGNOSTIC_LOGS) {
+        try {
+          fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
+        } catch (_) {}
+      }
     }
     window.addEventListener('error', function (ev) { wbsReportErr('error', ev); });
     window.addEventListener('unhandledrejection', function (ev) { wbsReportErr('unhandledrejection', ev); });
@@ -1553,7 +1556,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var curSid = adapter.currentActiveSessionId;
       if (!curSid) return;
       stashReorderBusy = true;
-      crumb('order:reorder:' + sessionId);
+      crumb('order:reorder');
       Promise.resolve(adapter.reorderConversationMessageQueueItems(sessionId, orderedIds))
         .then(function () { crumb('order:ok'); })
         .catch(function (e) { crumb('order:fail'); })

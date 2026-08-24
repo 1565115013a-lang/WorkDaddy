@@ -172,8 +172,10 @@ const DATA_DIR = defaultDataDir();
 // 1.0.25：会话删除仅作用于数据库匹配记录，并在清理失败时保留可重试的数据库记录。
 // 1.0.26：Windows launcher/logout 取消脚本提权与镜像名结束，只操作同安装目录的已验证 PID。
 // 1.0.27：会话数据库查询在原生 SQLite 与 CLI fallback 上统一使用绑定参数。
-const DAEMON_VERSION = '1.0.27';
-const DAEMON_BUILD_ID = 'release-1.0.27-20260824-session-db';
+// 1.0.28：诊断遥测和完整渲染器日志改为显式 opt-in，移除输入框内容调试落盘，
+//         并修正文档与打包排障提示中的网络、隐私和用户同意边界。
+const DAEMON_VERSION = '1.0.28';
+const DAEMON_BUILD_ID = 'release-1.0.28-20260824-telemetry-opt-in';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -217,6 +219,27 @@ function loadApiToken() {
 }
 
 const API_TOKEN = loadApiToken();
+
+const DIAGNOSTIC_LOGS_ENABLED = process.env.WORKDADDY_DIAGNOSTIC_LOGS === '1';
+
+function redactDiagnosticText(value, maxLength = 2500) {
+  const limit = Number.isInteger(maxLength) && maxLength > 0 ? maxLength : 2500;
+  return String(value == null ? '' : value)
+    .replace(/(authorization\s*[:=]\s*)(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[^\s,"']+/ig, '$1[redacted]')
+    .replace(/((?:set-)?cookie\s*[:=]\s*)[^\r\n]+/ig, '$1[redacted]')
+    .replace(/(["']?(?:access.?token|refresh.?token|token|cookie|password|api.?key|secret)["']?\s*[:=]\s*)"[^"\r\n]*"/ig, '$1"[redacted]"')
+    .replace(/(["']?(?:access.?token|refresh.?token|token|cookie|password|api.?key|secret)["']?\s*[:=]\s*)'[^'\r\n]*'/ig, "$1'[redacted]'")
+    .replace(/(["']?(?:access.?token|refresh.?token|token|cookie|password|api.?key|secret)["']?\s*[:=]\s*["']?)[^"'\s,}\]]+/ig, '$1[redacted]')
+    .replace(/\b(?:sk|key)-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g, '[redacted]')
+    .slice(0, limit);
+}
+
+function shouldPersistBreadcrumb(body, diagnosticsEnabled = DIAGNOSTIC_LOGS_ENABLED) {
+  const msg = String(body && body.msg || '');
+  const includesExceptionDetails = !!(body && body.extra) || /^crash:/i.test(msg);
+  return !!diagnosticsEnabled || !includesExceptionDetails;
+}
 
 function validCdpPort(port) {
   return Number.isInteger(port) && port >= 1024 && port <= 65535;
@@ -1521,6 +1544,7 @@ function onCdpEvent(method, params) {
       break;
     }
     case 'Runtime.consoleAPICalled': {
+      if (!DIAGNOSTIC_LOGS_ENABLED) break;
       // 持久采集渲染进程 console（含注入脚本 breadcrumb/console.error），崩溃时也能留痕
       const type = params.type || 'log';
       let args;
@@ -1529,16 +1553,17 @@ function onCdpEvent(method, params) {
       } catch (_) {
         args = [];
       }
-      log(`[renderer:${type}] ${args.join(' ')}`);
+      log(`[renderer:${type}] ${redactDiagnosticText(args.join(' '))}`);
       break;
     }
     case 'Runtime.exceptionThrown': {
+      if (!DIAGNOSTIC_LOGS_ENABLED) break;
       const d = params.exceptionDetails || {};
       const desc =
         d.exception && d.exception.description !== undefined
           ? d.exception.description
           : (d.exception && d.exception.value !== undefined ? String(d.exception.value) : '');
-      log('[renderer:exception] ' + String(desc || d.text || '').slice(0, 2500));
+      log('[renderer:exception] ' + redactDiagnosticText(desc || d.text || ''));
       break;
     }
     case 'Page.loadEventFired':
@@ -2219,6 +2244,7 @@ function injectWidget(reason) {
   script = script.replace(/__WBS_VERSION__/g, DAEMON_VERSION);
   // 注入本地 API 能力凭证；旧版面板不会携带该 header，但新版 daemon 会在启动时重新注入新版面板。
   script = script.replace(/__WBS_API_TOKEN__/g, API_TOKEN);
+  script = script.replace(/__WBS_DIAGNOSTIC_LOGS__/g, DIAGNOSTIC_LOGS_ENABLED ? 'true' : 'false');
   script = script.replace(/__WBS_PROFILE__/g, PROFILE.id);
   script = script.replace(/__WBS_CAPS__/g, JSON.stringify(PROFILE.capabilities));
   updateDebug('inject-version', { reason, injectedVersion: DAEMON_VERSION, profile: PROFILE.id });
@@ -2243,7 +2269,7 @@ function injectWidget(reason) {
       if (r && r.exceptionDetails) {
         const ex = r.exceptionDetails.exception;
         const desc = (ex && (ex.description || ex.value)) || r.exceptionDetails.text || '注入脚本页面抛错';
-        log(`[cdp] 注入脚本页面抛错(${reason}): ${String(desc).slice(0, 500)}`);
+        log(`[cdp] 注入脚本页面抛错(${reason}): ${redactDiagnosticText(desc, 500)}`);
         return writeDiagnosticsSnapshot('inject-exception').then(() => r);
       }
       return r;
@@ -2869,8 +2895,8 @@ function isApiRequestAuthorized(req, p) {
   const origin = String(req.headers.origin || '');
   if (origin && !isAllowedApiOrigin(origin)) return false;
   if (PUBLIC_API_PATHS.has(p)) return true;
-  // 保留无 Origin 的手动 launcher/curl 注入和错误面包屑兼容；二者不返回账号数据。
-  if (!origin && (p === '/api/inject' || p === '/api/breadcrumb')) return true;
+  // 保留无 Origin 的手动 launcher/curl 注入兼容；诊断面包屑仍需当前 profile token。
+  if (!origin && p === '/api/inject') return true;
   return hasApiToken(req);
 }
 
@@ -4595,24 +4621,6 @@ function handleApi(req, res) {
     });
   }
 
-  // 调试：保存输入框抓取内容（临时）。请求体为注入脚本抓取到的结构化对象。
-  if (req.method === 'POST' && p === '/api/save-composer') {
-    return readBody(req).then((body) => {
-      try {
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        const dir = path.join(DATA_DIR, 'composer-captures');
-        fs.mkdirSync(dir, { recursive: true });
-        const file = path.join(dir, `composer-${ts}.json`);
-        fs.writeFileSync(file, JSON.stringify(body, null, 2));
-        fs.writeFileSync(path.join(DATA_DIR, 'composer-debug.json'), JSON.stringify(body, null, 2));
-        log('[composer] 保存抓取内容 -> ' + file);
-        return json(res, 200, { ok: true, file: file });
-      } catch (e) {
-        return json(res, 500, { ok: false, error: e.message });
-      }
-    });
-  }
-
   // 清空输入框（点暂存按钮入队成功后调用）：CDP 真实键盘事件，安全清空 Slate 编辑器
   if (req.method === 'POST' && p === '/api/clear-composer') {
     return clearComposerByCdp()
@@ -5335,7 +5343,9 @@ function handleApi(req, res) {
   if (req.method === 'POST' && p === '/api/breadcrumb') {
     return readBody(req).then((body) => {
       try {
-        log('[breadcrumb] ' + String(body.msg || '?') + (body.extra ? ' ' + JSON.stringify(body.extra) : ''));
+        if (!shouldPersistBreadcrumb(body)) return json(res, 200, { ok: true });
+        const details = body.extra ? ' ' + redactDiagnosticText(JSON.stringify(body.extra), 1500) : '';
+        log('[breadcrumb] ' + redactDiagnosticText(body.msg || '?', 500) + details);
         return json(res, 200, { ok: true });
       } catch (e) {
         return json(res, 200, { ok: true });

@@ -34,6 +34,10 @@ const MAX_FLUSH_FILES = 1;
 const REQUEST_TIMEOUT_MS = 3000;
 const MAX_TEXT = 6000;
 
+function telemetryEnabled(env = process.env) {
+  return String(env.WORKDADDY_TELEMETRY || '').trim() === '1';
+}
+
 function readVersion() {
   try {
     const source = fs.readFileSync(path.join(__dirname, 'daemon.js'), 'utf8');
@@ -134,7 +138,7 @@ function queueEvent(event) {
 }
 
 async function flushOutbox() {
-  if (process.env.WORKDADDY_TELEMETRY === '0') return;
+  if (!telemetryEnabled()) return;
   let files;
   try { files = fs.readdirSync(OUTBOX_DIR).filter((name) => name.endsWith('.json')).sort(); } catch (_) { return; }
   for (const name of files.slice(0, MAX_FLUSH_FILES)) {
@@ -186,7 +190,7 @@ function makeEvent({ stage, message, level = 'error', tags = {}, extra = {}, exc
 }
 
 async function captureEvent(event) {
-  if (process.env.WORKDADDY_TELEMETRY === '0') return { disabled: true };
+  if (!telemetryEnabled()) return { disabled: true };
   await flushOutbox();
   try {
     await sendEvent(event);
@@ -237,7 +241,7 @@ async function cli() {
   process.stdout.write(JSON.stringify(result) + '\n');
 }
 
-module.exports = { captureMessage, captureException, flushOutbox, makeEvent };
+module.exports = { captureMessage, captureException, flushOutbox, makeEvent, telemetryEnabled };
 
 if (require.main === module) {
   cli().catch(() => { process.exitCode = 0; });
