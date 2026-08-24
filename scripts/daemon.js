@@ -154,8 +154,9 @@ const DATA_DIR = defaultDataDir();
 // 1.0.9：WorkBuddy / WorkBuddy AI profile 隔离；修复 Windows launcher 的本地端口探测、
 //        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
 // 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
-const DAEMON_VERSION = '1.0.24';
-const DAEMON_BUILD_ID = 'release-1.0.24-20260824-download-progress-copy';
+// 1.0.25：会话删除仅作用于数据库匹配记录，并在清理失败时保留可重试的数据库记录。
+const DAEMON_VERSION = '1.0.25';
+const DAEMON_BUILD_ID = 'release-1.0.25-20260824-session-delete-confinement';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -2680,41 +2681,103 @@ function publicAutoCopyJob(job) {
   };
 }
 
+const MAX_SESSION_ID_LENGTH = 200;
+
+function isValidSessionId(id) {
+  if (typeof id !== 'string' || !id || id.length > MAX_SESSION_ID_LENGTH) return false;
+  if (id === '.' || id === '..' || /[\\/\x00-\x1f\x7f]/.test(id)) return false;
+  if (/^[ .]|[ .]$/.test(id) || /[<>:"|?*]/.test(id)) return false;
+  if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(id)) return false;
+  if (/^[A-Za-z]:/.test(id) || path.posix.isAbsolute(id) || path.win32.isAbsolute(id)) return false;
+  return true;
+}
+
+function matchedSessionIds(requestedIds, rows) {
+  const selected = new Set((rows || []).map((row) => String(row && row.id || '')));
+  return Array.from(new Set(requestedIds)).filter((id) => selected.has(id));
+}
+
+function resolveManagedSessionTarget(parent, leaf) {
+  if (typeof leaf !== 'string' || !leaf || leaf === '.' || leaf === '..' || /[\\/\x00]/.test(leaf)) {
+    throw new Error('无效的会话文件目标');
+  }
+  const managedParent = path.resolve(parent);
+  const target = path.resolve(managedParent, leaf);
+  const relative = path.relative(managedParent, target);
+  if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+    throw new Error('会话文件目标不在 managed parent 内');
+  }
+  return target;
+}
+
+function isManagedDirectoryNoFollow(wbHome, directory) {
+  const root = path.resolve(wbHome);
+  const target = path.resolve(directory);
+  const relative = path.relative(root, target);
+  if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+    throw new Error('managed directory escaped the WorkBuddy data root');
+  }
+  let current = root;
+  for (const part of ['', ...relative.split(path.sep).filter(Boolean)]) {
+    if (part) current = path.join(current, part);
+    let stat;
+    try { stat = fs.lstatSync(current); }
+    catch (error) {
+      if (error && error.code === 'ENOENT') return false;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error('managed directory contains a symbolic link or non-directory: ' + current);
+    }
+  }
+  return true;
+}
+
 // 真实删除会话的消息文件：projects/<项目>/<id>.jsonl + <id>/、workspace/sessions/<id>/、
 // tasks/<id>/、file-history/<id>/、artifact-index/<id>.json（全部按会话 id 精确删除，不可恢复）
 function deleteSessionFiles(wbHome, id) {
-  const fsMod = fs;
+  if (!isValidSessionId(id)) throw new Error('无效的会话 ID');
   let removed = 0;
-  const delOne = (p) => {
+  const delOne = (parent, leaf) => {
+    let target;
     try {
-      if (fsMod.existsSync(p)) {
-        fsMod.rmSync(p, { recursive: true, force: true });
-        return true;
-      }
-    } catch (e) { log('[sessions-delete] 删除文件失败 ' + p + ': ' + e.message); }
-    return false;
+      if (!isManagedDirectoryNoFollow(wbHome, parent)) return false;
+      target = resolveManagedSessionTarget(parent, leaf);
+      const targetStat = fs.lstatSync(target);
+      if (targetStat.isSymbolicLink()) fs.unlinkSync(target);
+      else fs.rmSync(target, { recursive: true, force: true });
+      return true;
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return false;
+      log('[sessions-delete] 删除文件失败 ' + (target || parent) + ': ' + e.message);
+      throw e;
+    }
   };
   // 1) projects/<项目hash>/<id>.jsonl 与 <id>/ 目录（消息正文核心）
   const projDir = path.join(wbHome, 'projects');
   try {
-    if (fsMod.existsSync(projDir)) {
-      const projs = fsMod.readdirSync(projDir);
-      for (const pj of projs) {
-        const pjPath = path.join(projDir, pj);
-        if (!fsMod.statSync(pjPath).isDirectory()) continue;
-        if (delOne(path.join(pjPath, id + '.jsonl'))) removed++;
-        if (delOne(path.join(pjPath, id))) removed++;
+    if (isManagedDirectoryNoFollow(wbHome, projDir)) {
+      const projs = fs.readdirSync(projDir, { withFileTypes: true });
+      for (const entry of projs) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const pjPath = resolveManagedSessionTarget(projDir, entry.name);
+        const projectStat = fs.lstatSync(pjPath);
+        if (!projectStat.isDirectory() || projectStat.isSymbolicLink()) continue;
+        if (delOne(pjPath, id + '.jsonl')) removed++;
+        if (delOne(pjPath, id)) removed++;
       }
     }
-  } catch (_) {}
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') throw e;
+  }
   // 2) workspace/sessions/<id>/
-  if (delOne(path.join(wbHome, 'workspace', 'sessions', id))) removed++;
+  if (delOne(path.join(wbHome, 'workspace', 'sessions'), id)) removed++;
   // 3) tasks/<id>/
-  if (delOne(path.join(wbHome, 'tasks', id))) removed++;
+  if (delOne(path.join(wbHome, 'tasks'), id)) removed++;
   // 4) file-history/<id>/
-  if (delOne(path.join(wbHome, 'file-history', id))) removed++;
+  if (delOne(path.join(wbHome, 'file-history'), id)) removed++;
   // 5) artifact-index/<id>.json
-  if (delOne(path.join(wbHome, 'artifact-index', id + '.json'))) removed++;
+  if (delOne(path.join(wbHome, 'artifact-index'), id + '.json')) removed++;
   if (removed) log('[sessions-delete] 已删除消息文件 ' + id + '（' + removed + ' 项）');
   return removed;
 }
@@ -4899,27 +4962,35 @@ function handleApi(req, res) {
   // 删除会话（真实删除）：POST /api/sessions/delete { ids }——删除 DB 记录 + 该账号下全部会话文件（不可恢复）
   if (req.method === 'POST' && p === '/api/sessions/delete') {
     return readBody(req).then(async (body) => {
-      const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string') : [];
+      const ids = Array.isArray(body.ids) ? body.ids : [];
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
+      if (!ids.every(isValidSessionId)) return json(res, 400, { ok: false, error: '包含无效的会话 ID' });
       try {
         const esc = ids.map((i) => sqlQuote(i)).join(',');
         const before = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + esc + ');');
-        // 1) 真实删除 DB 记录（非软删）
-        await sqliteRun("DELETE FROM sessions WHERE id IN (" + esc + ");");
-        // 2) 删除本地消息文件（jsonl/目录/workspace/tasks/file-history/artifact-index）
+        const matchedIds = matchedSessionIds(ids, before);
+        const matchedSet = new Set(matchedIds);
+        const matchedRows = before.filter((row) => matchedSet.has(String(row.id || '')));
+        // 1) 先完成可重试的文件与规则清理；失败时保留 DB 记录作为重试锚点。
         const wbHome = PROFILE.dataRoot;
         let filesRemoved = 0;
-        for (const id of ids) filesRemoved += deleteSessionFiles(wbHome, id);
+        for (const id of matchedIds) filesRemoved += deleteSessionFiles(wbHome, id);
         let rulesRemoved = 0;
-        for (const row of before) {
+        for (const row of matchedRows) {
           try {
             if (removeAutoCopySession(DATA_DIR, row.user_id, row.id)) rulesRemoved++;
           } catch (e) {
             log(`[sessions-auto-copy] 删除规则 ${row.id} 失败: ${e.message}`);
+            throw e;
           }
         }
-        log(`[sessions-delete] 已真实删除 ${ids.length} 个会话（DB + ${filesRemoved} 项文件）`);
-        return json(res, 200, { ok: true, deleted: before.length, requested: ids.length, filesRemoved, rulesRemoved });
+        // 2) 最后真实删除 DB 记录（非软删）。若此步失败，重复请求可安全重试。
+        if (matchedIds.length) {
+          const matchedEsc = matchedIds.map((i) => sqlQuote(i)).join(',');
+          await sqliteRun("DELETE FROM sessions WHERE id IN (" + matchedEsc + ");");
+        }
+        log(`[sessions-delete] 已真实删除 ${matchedIds.length} 个会话（DB + ${filesRemoved} 项文件）`);
+        return json(res, 200, { ok: true, deleted: matchedIds.length, requested: ids.length, filesRemoved, rulesRemoved });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }
