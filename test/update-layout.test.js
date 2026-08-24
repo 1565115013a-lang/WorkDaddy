@@ -6,7 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const repoRoot = path.resolve(__dirname, '..');
-const read = (name) => fs.readFileSync(path.join(repoRoot, 'scripts', name), 'utf8');
+const read = (name) => fs.readFileSync(path.join(repoRoot, 'scripts', name), 'utf8').replace(/\r\n/g, '\n');
 const lib = require(path.join(repoRoot, 'scripts', 'lib.js'));
 
 test('Windows updater launches the installed scripts launcher', () => {
@@ -160,7 +160,7 @@ test('seamless login refreshes the running WorkBuddy session', () => {
 
 test('CDP startup supports a persisted fallback port instead of hardcoding 9222', () => {
   const daemon = read('daemon.js');
-  const macLauncher = fs.readFileSync(path.join(repoRoot, 'WorkDaddy.app', 'Contents', 'MacOS', 'launcher'), 'utf8');
+  const macLauncher = read('relaunch-with-cdp.sh');
   const winLauncher = read('win-launcher.js');
   assert.match(daemon, /cdp-port\.json/);
   assert.match(daemon, /findAvailableCdpPort/);
@@ -604,12 +604,13 @@ test('zero credits omit the empty-state label', () => {
 test('auto-copy rules persist sessions and canonical workspace keys without leaking account metadata', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-auto-copy-'));
   try {
+    const expectedWorkspace = process.platform === 'win32' ? '/users/example/project' : '/Users/example/project';
     lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'session', key: 'session-1', enabled: true });
     lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'workspace', key: '/Users/example/project/', enabled: true });
     let rules = lib.getAutoCopyRules(dir, 'source-a');
     assert.deepEqual(rules.sessionIds, ['session-1']);
-    assert.deepEqual(rules.workspaces, ['/Users/example/project']);
-    assert.equal(lib.canonicalWorkspace('/Users/example/project/'), '/Users/example/project');
+    assert.deepEqual(rules.workspaces, [expectedWorkspace]);
+    assert.equal(lib.canonicalWorkspace('/Users/example/project/'), expectedWorkspace);
 
     const lineageId = lib.getAutoCopySession(dir, 'source-a', 'session-1').lineageId;
     lib.setAutoCopyMapping(dir, lineageId, 'target-b', { targetId: 'copied-1', status: 'copied' });
