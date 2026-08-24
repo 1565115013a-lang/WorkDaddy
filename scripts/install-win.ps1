@@ -8,6 +8,24 @@ param(
   [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
+try {
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+  $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if ($isElevated -ne $false) {
+    [Console]::Error.WriteLine('拒绝以管理员权限运行 WorkDaddy 安装脚本；请使用普通用户终端。')
+    exit 5
+  }
+} catch {
+  [Console]::Error.WriteLine('无法确认当前 PowerShell 为普通用户权限；安装已停止。')
+  exit 5
+}
+
+$ErrorActionPreference = 'Stop'
+try { . (Join-Path $PSScriptRoot 'windows-process-boundary.ps1') } catch {
+  [Console]::Error.WriteLine('无法加载 Windows 进程身份边界；安装已停止。')
+  exit 5
+}
 $ErrorActionPreference = 'Continue'
 if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
 if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
@@ -37,39 +55,6 @@ function Send-Sentry {
   } catch {}
 }
 
-function Test-ExclusiveFile {
-  param([string]$Path)
-  if (-not (Test-Path -LiteralPath $Path)) { return $true }
-  $stream = $null
-  try {
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
-    return $true
-  } catch {
-    return $false
-  } finally {
-    if ($stream) { $stream.Dispose() }
-  }
-}
-
-function Release-LockedLauncher {
-  param([string]$LauncherPath)
-  if (Test-ExclusiveFile $LauncherPath) { return $true }
-  $needle = ([IO.Path]::GetFullPath($LauncherPath)).Replace('/', '\').ToLowerInvariant()
-  try {
-    Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
-      $commandLine = ([string]$_.CommandLine).Replace('/', '\').ToLowerInvariant()
-      if ($commandLine.Contains($needle) -and $_.ProcessId -ne $PID) {
-        taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null
-      }
-    }
-  } catch {}
-  for ($i = 0; $i -lt 10; $i++) {
-    if (Test-ExclusiveFile $LauncherPath) { return $true }
-    Start-Sleep -Milliseconds 300
-  }
-  return (Test-ExclusiveFile $LauncherPath)
-}
-
 Write-Host '=============================================================='
 Write-Host (" " + $productName + " Windows 安装")
 Write-Host '=============================================================='
@@ -91,7 +76,7 @@ if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
   Write-Host '  源目录与安装目录相同，跳过自拷贝。'
 } else {
   $launcherToReplace = Join-Path $targetScripts 'launcher.cmd'
-  if (-not (Release-LockedLauncher $launcherToReplace)) {
+  if (-not (Release-VerifiedLauncherLock -LauncherPath $launcherToReplace)) {
     Write-Host "复制前无法释放 launcher.cmd 文件锁: $launcherToReplace"
     Send-Sentry 'windows-install-launcher-lock' "无法释放 launcher.cmd 文件锁: $launcherToReplace" 2
     exit 2
@@ -145,7 +130,7 @@ if (Test-Path $launcher) {
 }
 
 # 5) 创建桌面快捷方式（名称跟随安装包 profile）
-#    优先使用 wscript.exe 隐藏入口，避免 Windows Terminal 为管理员 cmd 创建空白窗口；
+#    优先使用 wscript.exe 隐藏入口，避免启动时出现多余的终端窗口；
 #    缺少隐藏入口时回退到 cmd.exe，兼容旧包/手工安装目录。
 $desktopDir = [Environment]::GetFolderPath('Desktop')
 if (-not $desktopDir) { $desktopDir = Join-Path $env:USERPROFILE 'Desktop' }
@@ -163,7 +148,7 @@ try {
     $sc.Arguments        = '/d /c call "' + $launcher + '"'
   }
   $sc.WorkingDirectory = (Split-Path $launcher)
-  $sc.Description      = ($productName + ' – WorkBuddy 增强工具（请以管理员身份运行）')  # 描述跟随安装包 profile（WorkDaddy / WorkDaddy AI）
+  $sc.Description      = ($productName + ' – WorkBuddy 增强工具')  # 描述跟随安装包 profile（WorkDaddy / WorkDaddy AI）
   if (Test-Path $logoIco) { $sc.IconLocation = $logoIco + ',0' }   # 用官方 logo，而非 cmd 默认图标
   $sc.Save()
   Write-Host ('  桌面快捷方式 : ' + $lnkPath)

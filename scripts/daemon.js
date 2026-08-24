@@ -27,6 +27,20 @@ const os = require('os');
 const crypto = require('crypto');
 const net = require('net');
 const { spawn, spawnSync } = require('child_process');
+const {
+  assertSameProcessIdentity,
+  assertStandardWindowsPrivilege,
+  buildNativeProcessQuery,
+  filterVerifiedWindowsProcesses,
+  parseCimProcessResult,
+  resolveWindowsExecutable,
+  sameWindowsPath,
+  selectRunningProfileBinary,
+  selectUniqueDiscoveredBinary,
+} = require('./windows-process-boundary.js');
+const DAEMON_PRIVILEGE = process.platform === 'win32'
+  ? assertStandardWindowsPrivilege()
+  : 'standard';
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
 let wsLib = null;
@@ -86,7 +100,6 @@ const { buildCreditResourceBody } = require('./credit-resource-queries.js');
 const { captureException, captureMessage } = require('./sentry-report.js');
 const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
-
 const PROFILE = getProfile();
 const DATA_DIR = defaultDataDir();
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -111,7 +124,7 @@ const DATA_DIR = defaultDataDir();
 //     ③ 发布包内曾混入非 ASCII 文件名（安装失败自主解决提示词.txt），Windows .NET Expand-Archive 解压时
 //       文件名解码成非法字符直接抛「路径中具有非法字符」→ 备份/替换/回滚全部失效。
 //     修复：更新脚本改由 wscript.exe（GUI 子系统）+ apply-update.vbs 中介经 ShellExecute 启动独立进程树，
-//     daemon 随即自我退出释放文件锁；apply-update.ps1 对 watchdog 与端口进程一律 taskkill 不带 /T 精确杀，
+//     daemon 随即自我退出释放文件锁；apply-update.ps1 对 watchdog 与端口进程一律按 PID 精确结束，
 //     避免连坐自身；打包脚本 build-win-zip.sh 增加非 ASCII 文件名守护，杜绝中文/特殊字符条目进入安装包。
 //     另：daemon 单实例锁、启动竞态修复、注入结果校验与本地诊断快照；
 //       修复跨平台自动更新并展示按到期时间拆分的积分明细
@@ -155,8 +168,9 @@ const DATA_DIR = defaultDataDir();
 //        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
 // 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
 // 1.0.25：会话删除仅作用于数据库匹配记录，并在清理失败时保留可重试的数据库记录。
-const DAEMON_VERSION = '1.0.25';
-const DAEMON_BUILD_ID = 'release-1.0.25-20260824-session-delete-confinement';
+// 1.0.26：Windows launcher/logout 取消脚本提权与镜像名结束，只操作同安装目录的已验证 PID。
+const DAEMON_VERSION = '1.0.26';
+const DAEMON_BUILD_ID = 'release-1.0.26-20260824-least-privilege';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -1564,32 +1578,69 @@ const WORKBUDDY_APP_NAME = path.basename(WORKBUDDY_APP).replace(/\.app$/i, '');
 // Windows：解析 WorkBuddy 可执行文件真实路径（安装盘可自定义，必须动态查）
 // 优先级：WBSWITCH_WORKBUDDY_BIN > 运行进程 Path > 注册表卸载项 > 常见路径
 let wbBinaryCache = null;
+const PROFILE_BINARY_NAMES = new Set(
+  PROFILE.id === 'workbuddy-ai' ? ['workbuddyai.exe'] :
+    PROFILE.id === 'workbuddy-cn' ? ['workbuddy.exe'] : ['codebuddy.exe']
+);
+function queryWindowsWorkBuddyProcesses() {
+  const names = [...PROFILE_BINARY_NAMES].map((name) => `\"${name}\"`).join(',');
+  const helper = path.join(__dirname, 'windows-process-boundary.ps1');
+  const command = buildNativeProcessQuery(helper,
+    `$names=@(${names}); Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $names -contains $_.Name }`);
+  const result = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    encoding: 'utf8', timeout: 10000, windowsHide: true,
+  });
+  return parseCimProcessResult(result, {
+    requireCommandLine: true, requireCurrentOwner: true, requireNativeArguments: true,
+  });
+}
+
 function resolveWorkBuddyBinary() {
   if (!IS_WIN) return WORKBUDDY_BINARY;
   if (wbBinaryCache) return wbBinaryCache;
-  const tryFile = (p) => { try { if (p && fs.existsSync(p)) return p; } catch (_) {} return null; };
+  const tryFile = (p) => {
+    try {
+      const candidate = String(p || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
+      if (!candidate || !fs.existsSync(candidate)) return null;
+      const resolved = resolveWindowsExecutable(candidate);
+      const name = path.win32.basename(resolved).toLowerCase();
+      return PROFILE_BINARY_NAMES.has(name) ? resolved : null;
+    } catch (_) {
+      return null;
+    }
+  };
   const { execFileSync } = require('child_process');
   const psCmd = (cmd) => execFileSync('powershell', ['-NoProfile', '-Command', cmd], { encoding: 'utf8', timeout: 8000, windowsHide: true });
-  // 1) 显式指定（launcher/install 传入最可靠）
+  const runningBin = selectRunningProfileBinary(PROFILE_BINARY_NAMES, queryWindowsWorkBuddyProcesses());
+  // 1) 显式指定；若当前 profile 已运行，必须与运行路径完全一致。
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
-  if (envBin) return (wbBinaryCache = envBin);
-  // 2) 运行中的 WorkBuddy 进程 Path（最权威：多实例共享同一 exe）
-  try {
-    const out = psCmd('Get-Process WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path');
-    const p = out.trim().split(/\r?\n/).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
-  // 3) 注册表卸载项（DisplayIcon = "D:\xxx\WorkBuddy.exe,0" 取逗号前）
-  try {
-    const out = psCmd("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | Select-Object -First 1 DisplayIcon,InstallLocation | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }");
-    const p = out.trim().split(/\r?\n/).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
-  // 4) 常见路径兜底（含 per-user 安装和 Electron/Squirrel 版本目录）
+  if (process.env.WBSWITCH_WORKBUDDY_BIN && !envBin) {
+    throw new Error('WBSWITCH_WORKBUDDY_BIN 不是可验证的当前 profile 主程序；登录信息未修改');
+  }
+  if (envBin) {
+    if (runningBin && !sameWindowsPath(runningBin, envBin)) {
+      throw new Error('检测到当前 profile 正从另一安装目录运行，登录信息未修改');
+    }
+    return (wbBinaryCache = envBin);
+  }
+  // 2) 运行中当前 profile 的主程序优先（便携安装）。
+  if (runningBin) return (wbBinaryCache = runningBin);
+  const discovered = [];
+  const addCandidate = (candidate) => {
+    const hit = tryFile(candidate);
+    if (hit) discovered.push(hit);
+  };
+  // 3) 收集磁盘和注册表候选；无运行进程时只能接受唯一真实路径。
+  addCandidate(PROFILE.appPath);
+  const appPaths = psCmd("$k=@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe'); Get-ItemProperty $k -ErrorAction SilentlyContinue | ForEach-Object { if ($_.'(default)') { $_.'(default)' } elseif ($_.Path) { $_.Path } }");
+  for (const candidate of appPaths.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) addCandidate(candidate);
+  const registry = psCmd("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }");
+  for (const candidate of registry.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) addCandidate(candidate);
+  // 4) 常见路径兜底（含探测机实际安装位）
   const cands = [
+    PROFILE.appPath,
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
     path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
@@ -1599,44 +1650,38 @@ function resolveWorkBuddyBinary() {
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy', 'WorkBuddy.exe'),
     'D:\\workbody\\WorkBuddy\\WorkBuddy.exe',
   ];
-  if (PROFILE.id === 'workbuddy-ai') {
-    cands.unshift(
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
-      path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI', 'WorkBuddyAI.exe')
-    );
+  cands.push(
+    path.join(process.env.ProgramFiles || '', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+    path.join(process.env.ProgramFiles || '', 'CodeBuddy', 'CodeBuddy.exe'),
+    path.join(process.env.USERPROFILE || '', 'scoop', 'apps', 'workbuddy', 'current', 'WorkBuddy.exe'),
+    'D:\\workbuddy\\WorkBuddy.exe'
+  );
+  if (process.env.WBSWITCH_WORKBUDDY_DIR) {
+    cands.push(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, path.win32.basename(PROFILE.appPath)));
   }
-  for (const c of cands) {
-    const hit = tryFile(c);
-    if (hit) return (wbBinaryCache = hit);
-  }
-  try {
-    const roots = [
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'WorkBuddy'),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'WorkBuddy'),
-      process.env.APPDATA && path.join(process.env.APPDATA, 'WorkBuddy'),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'CodeBuddy'),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'CodeBuddy'),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'WorkBuddyAI'),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'WorkBuddyAI'),
-    ].filter(Boolean);
-    const names = PROFILE.id === 'workbuddy-ai'
-      ? ['WorkBuddyAI.exe', 'WorkBuddy.exe']
-      : ['WorkBuddy.exe', 'CodeBuddy.exe'];
-    const psQuote = (value) => "'" + String(value).replace(/'/g, "''") + "'";
-    const command = [
-      '$roots=@(' + roots.map(psQuote).join(', ') + ')',
-      '$names=@(' + names.map(psQuote).join(', ') + ')',
-      'foreach($root in $roots){',
-      'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
-      '$hit=Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } | Select-Object -First 1 -ExpandProperty FullName',
-      'if($hit){$hit;break}',
-      '}',
-    ].join('; ');
-    const p = psCmd(command).trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
-  return null;
+  for (const candidate of cands) addCandidate(candidate);
+  const scanRoots = [
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'WorkBuddy'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'WorkBuddy'),
+    process.env.APPDATA && path.join(process.env.APPDATA, 'WorkBuddy'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'CodeBuddy'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'CodeBuddy'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'WorkBuddyAI'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'WorkBuddyAI'),
+  ].filter(Boolean);
+  const names = [...PROFILE_BINARY_NAMES];
+  const psQuote = (value) => "'" + String(value).replace(/'/g, "''") + "'";
+  const command = [
+    '$roots=@(' + scanRoots.map(psQuote).join(', ') + ')',
+    '$names=@(' + names.map(psQuote).join(', ') + ')',
+    'foreach($root in $roots){',
+    'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
+    'Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } | Select-Object -ExpandProperty FullName',
+    '}',
+  ].join('; ');
+  for (const candidate of psCmd(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) addCandidate(candidate);
+  const selected = selectUniqueDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  return selected ? (wbBinaryCache = selected) : null;
 }
 
 function runCommand(command, args, options = {}) {
@@ -1699,55 +1744,79 @@ async function restoreWorkBuddyWindow(pid) {
   return true;
 }
 
-function workBuddyRunning() {
+function verifiedWindowsWorkBuddyProcesses(binary) {
+  if (!binary) throw new Error('未找到 WorkBuddy 可执行文件，无法验证运行中的进程');
+  const processes = queryWindowsWorkBuddyProcesses();
+  const verified = filterVerifiedWindowsProcesses(binary, processes);
+  if (processes.length !== verified.length) {
+    throw new Error('存在当前 profile 进程，但没有进程属于已验证安装目录；登录信息未修改');
+  }
+  return verified;
+}
+
+function revalidateWindowsWorkBuddyProcess(original, binary) {
+  const current = verifiedWindowsWorkBuddyProcesses(binary)
+    .find((process) => process.ProcessId === original.ProcessId);
+  if (!current) {
+    throw new Error(`结束前无法再次验证 WorkBuddy PID=${original.ProcessId}`);
+  }
+  return assertSameProcessIdentity(original, current);
+}
+
+function workBuddyRunning(binary = null) {
   try {
     if (IS_WIN) {
-      const r = spawnSync(
-        'tasklist',
-        ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
-        { encoding: 'utf8', timeout: 5000, windowsHide: true }
-      );
-      return r.status === 0 && /"WorkBuddy\.exe"/i.test(r.stdout || '');
+      return verifiedWindowsWorkBuddyProcesses(binary || resolveWorkBuddyBinary()).length > 0;
     }
     const r = spawnSync('pgrep', ['-f', WORKBUDDY_APP], { stdio: 'ignore', timeout: 5000 });
     return r.status === 0;
-  } catch (_) {
+  } catch (error) {
     // 探测失败时按仍在运行处理，避免误删身份文件后拉起旧实例。
+    if (IS_WIN) throw error;
     return true;
   }
 }
 
-async function waitForWorkBuddyExit(timeoutMs = 10000) {
+async function waitForWorkBuddyExit(timeoutMs = 10000, binary = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!workBuddyRunning()) return true;
+    if (!workBuddyRunning(binary)) return true;
     await sleep(200);
   }
-  return !workBuddyRunning();
-}
-
-async function elevatedWindowsKill() {
-  const command =
-    "$p = Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/IM','WorkBuddy.exe' -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
-  return runCommand('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { timeoutMs: 30000 });
+  return !workBuddyRunning(binary);
 }
 
 /** 退出 WorkBuddy，并确认进程已经消失；失败时拒绝继续登录切换。 */
 async function quitWorkBuddy() {
-  if (!workBuddyRunning()) return true;
-
   if (IS_WIN) {
-    await runCommand('taskkill', ['/IM', 'WorkBuddy.exe']);
-    if (await waitForWorkBuddyExit(1800)) return true;
+    const binary = resolveWorkBuddyBinary();
+    if (!binary) throw new Error('未找到 WorkBuddy 可执行文件，无法安全退出；登录信息未修改');
+    let processes = verifiedWindowsWorkBuddyProcesses(binary);
+    if (!processes.length) return true;
 
-    await runCommand('taskkill', ['/F', '/T', '/IM', 'WorkBuddy.exe']);
-    if (await waitForWorkBuddyExit(2500)) return true;
+    for (const process of processes) {
+      const current = revalidateWindowsWorkBuddyProcess(process, binary);
+      const result = await runCommand('taskkill', ['/PID', String(current.ProcessId)]);
+      if (result.error || result.code !== 0) {
+        throw result.error || new Error(`taskkill 无法结束已验证进程 PID=${process.ProcessId}`);
+      }
+    }
+    if (await waitForWorkBuddyExit(1800, binary)) return true;
 
-    // WorkBuddy 可能由管理员权限启动；普通 daemon 无法结束它时请求一次 UAC。
-    await elevatedWindowsKill();
-    if (await waitForWorkBuddyExit(5000)) return true;
-    throw new Error('无法确认 WorkBuddy 已退出（可能未通过管理员授权）');
+    processes = verifiedWindowsWorkBuddyProcesses(binary);
+    for (const process of processes) {
+      const current = revalidateWindowsWorkBuddyProcess(process, binary);
+      const result = await runCommand('taskkill', ['/F', '/PID', String(current.ProcessId)]);
+      if (result.error || result.code !== 0) {
+        throw result.error || new Error(`taskkill 无法强制结束已验证进程 PID=${process.ProcessId}`);
+      }
+    }
+    if (await waitForWorkBuddyExit(2500, binary)) return true;
+
+    throw new Error('无法以普通用户权限安全退出 WorkBuddy。请手动关闭该程序；若它以管理员身份运行，请先退出后再重试。登录信息未修改');
   }
+
+  if (!workBuddyRunning()) return true;
 
   // 先尝试正常退出（给 Electron 一次处理机会），再强制 kill 并验证。
   await runCommand('osascript', ['-e', `tell application "${WORKBUDDY_APP_NAME}" to quit`]);
@@ -4383,6 +4452,8 @@ function handleApi(req, res) {
       ok: true,
       version: DAEMON_VERSION,
       buildId: DAEMON_BUILD_ID,
+      pid: process.pid,
+      privilege: DAEMON_PRIVILEGE,
       profile: { id: PROFILE.id, name: PROFILE.name, kind: PROFILE.kind, mode: PROFILE.mode, capabilities: PROFILE.capabilities },
       cdp: {
         connected: cdp.connected,

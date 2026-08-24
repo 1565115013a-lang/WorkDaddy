@@ -7,28 +7,15 @@ const launcher = require('../scripts/win-launcher.js');
 
 test('requiring the Windows launcher does not execute its startup flow', () => {
   assert.equal(typeof launcher.getWorkBuddyProcesses, 'function');
-  assert.equal(typeof launcher.getWorkBuddyProcessesViaCim, 'function');
-  assert.equal(typeof launcher.getWorkBuddyProcessesViaTasklist, 'function');
+  assert.equal(typeof launcher.workBuddyProcesses, 'function');
+  assert.equal(typeof launcher.tasklistProcessIds, 'function');
+  assert.equal(typeof launcher.workBuddyRunning, 'function');
 });
 
-test('tasklist CSV fallback parses process names and PIDs', () => {
-  const rows = launcher.parseTasklistOutput(
-    '"WorkBuddy.exe","10436","Console","1","123,456 K"\n' +
-    'INFO: No tasks are running which match the specified criteria.\n'
-  );
-  assert.deepEqual(rows, [{
-    ProcessId: 10436,
-    ParentProcessId: null,
-    Name: 'WorkBuddy.exe',
-    ExecutablePath: null,
-    CommandLine: '',
-    processSource: 'tasklist',
-  }]);
-});
-
-test('tasklist fallback returns a safe array when the command is unavailable', () => {
-  assert.doesNotThrow(() => launcher.getWorkBuddyProcessesViaTasklist());
-  assert.ok(Array.isArray(launcher.getWorkBuddyProcessesViaTasklist()));
+test('tasklist data remains diagnostic-only', () => {
+  const ids = launcher.tasklistProcessIds();
+  assert.ok(ids instanceof Set);
+  assert.equal(launcher.getWorkBuddyProcessesViaTasklist, undefined);
 });
 
 test('process discovery always returns an array of positive-PID records', () => {
@@ -42,6 +29,5 @@ test('process discovery always returns an array of positive-PID records', () => 
 
 test('process helpers preserve safe return types without a running client', () => {
   assert.ok(Array.isArray(launcher.workBuddyProcesses()));
-  assert.ok(launcher.targetProcessNames() instanceof Set);
   assert.equal(typeof launcher.workBuddyRunning(), 'boolean');
 });

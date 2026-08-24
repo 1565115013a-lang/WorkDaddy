@@ -64,7 +64,7 @@ v1.0.3 演示图（非最新版）
 
 1. 在 [Releases](../../releases) 下载最新 `WorkDaddy-x.y.z-win64.zip`
 2. **解压到桌面以外的文件夹，双击一键安装脚本 `Install-WorkDaddy.cmd`**，安装后即可关闭该窗口：
-3. 以后只需**右键以管理员身份运行 WorkDaddy 图标** 即可
+3. 以后直接双击 WorkDaddy 图标即可；请勿以管理员身份运行
 4. 几秒后就会自动打开 WorkBuddy ，看到机器人按钮即成功；
 
 

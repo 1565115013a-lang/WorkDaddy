@@ -5,8 +5,7 @@ setlocal EnableExtensions
 chcp 65001 >nul 2>&1
 cd /d "%~dp0" >nul 2>&1
 
-rem 先输出一行 ASCII 状态：管理员启动时 Windows Terminal 可能在 Node 探测期间保持空白，
-rem 这行也能区分“正在启动”和“入口没有执行”。
+rem 先输出一行 ASCII 状态，便于区分“正在启动”和“入口没有执行”。
 echo WorkDaddy launcher starting...
 
 rem 定位 node：优先 WorkBuddy 托管运行时（.workbuddy\binaries\node\versions\*），其次 PATH

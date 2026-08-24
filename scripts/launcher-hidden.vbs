@@ -1,7 +1,6 @@
 Option Explicit
 
-' Desktop shortcut entry point. wscript.exe has no console window, so running the
-' shortcut as administrator cannot leave an empty Windows Terminal tab behind.
+' Desktop shortcut entry point. wscript.exe starts launcher.cmd without a console window.
 Dim shell, fso, launcher, command
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
