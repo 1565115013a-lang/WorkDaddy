@@ -64,24 +64,25 @@ test('update progress hides zero-rate and unknown-ETA placeholder text', () => {
 test('Windows updater stops the watchdog before waiting for the API port', () => {
   const script = read('apply-update.ps1');
   const stop = script.indexOf('function Stop-WatchdogAndPort');
-  const wait = script.indexOf('for ($wait = 0; $wait -lt 15; $wait++)');
+  const wait = script.indexOf('Invoke-RestMethod');
   assert.notEqual(stop, -1);
   assert.notEqual(wait, -1);
   assert.ok(stop < wait, 'watchdog shutdown must precede the port wait');
+  assert.match(script, /Stop-VerifiedWorkDaddyLifecycle/);
 });
 
 test('Windows install and update release a locked launcher before replacing it', () => {
   const install = read('install-win.ps1');
   const update = read('apply-update.ps1');
-  assert.match(install, /FileShare\]\s*::None/);
+  const boundary = read('windows-process-boundary.ps1');
+  assert.match(boundary, /FileShare\]\s*::None/);
   assert.match(install, /launcher\.cmd/);
-  assert.match(install, /Get-CimInstance\s+Win32_Process/);
-  assert.match(install, /taskkill \/F \/T \/PID/);
-  assert.ok(install.indexOf('Release-LockedLauncher') < install.indexOf('robocopy $SrcDir $targetScripts'), 'install must release launcher before robocopy');
-  assert.match(update, /FileShare\]\s*::None/);
+  assert.match(boundary, /Get-CimInstance\s+Win32_Process/);
+  assert.match(boundary, /Test-ExactCmdLauncherCommandLine/);
+  assert.doesNotMatch(boundary, /taskkill[^\r\n]*\/T\b/i);
+  assert.ok(install.indexOf('Release-VerifiedLauncherLock') < install.indexOf('robocopy $SrcDir $targetScripts'), 'install must release launcher before robocopy');
   assert.match(update, /launcher\.cmd/);
-  assert.match(update, /Get-CimInstance\s+Win32_Process/);
-  assert.ok(update.indexOf('Release-LockedLauncher') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must release launcher before moving the old app');
+  assert.ok(update.indexOf('Release-VerifiedLauncherLock') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must release launcher before moving the old app');
 });
 
 test('macOS updater stops the daemon before waiting for the API port', () => {
@@ -213,10 +214,11 @@ test('macOS updater validates a cached/downloaded DMG before mounting it', () =>
   assert.match(daemon, /Content-Type|content-type/);
 });
 
-test('Windows launcher covers both WorkBuddy images and records exit diagnostics', () => {
+test('Windows launcher scopes process discovery to the active profile and records exit diagnostics', () => {
   const launcher = read('win-launcher.js');
-  assert.match(launcher, /WorkBuddy\.exe/);
-  assert.match(launcher, /WorkBuddyAI\.exe/);
+  assert.match(launcher, /PROFILE\.id === 'workbuddy-ai' \? \['workbuddyai\.exe'\]/);
+  assert.match(launcher, /PROFILE\.id === 'workbuddy-cn' \? \['workbuddy\.exe'\]/);
+  assert.doesNotMatch(launcher, /\$names=@\("WorkBuddy\.exe","CodeBuddy\.exe","WorkBuddyAI\.exe"\)/);
   assert.match(launcher, /\[exit\]/);
   assert.match(launcher, /taskkill=/);
   assert.match(launcher, /tasklistProcessIds/);
@@ -266,11 +268,12 @@ test('Windows launcher verifies the real WorkBuddy process tree and launch argum
   assert.match(launcher, /processes: processDiagnostics\(wb\)/);
 });
 
-test('Windows launcher escalates a PID-only WorkBuddy exit fallback', () => {
+test('Windows launcher refuses elevated or image-name exit fallbacks', () => {
   const launcher = read('win-launcher.js');
-  assert.match(launcher, /tasklistProcessIds\(targetNames\)/);
-  assert.match(launcher, /Start-Process[\s\S]*taskkill\.exe[\s\S]*-Verb RunAs/);
-  assert.match(launcher, /remainingPids|剩余 PID|tasklistPids/);
+  assert.doesNotMatch(launcher, /Start-Process[\s\S]*taskkill\.exe[\s\S]*-Verb RunAs/);
+  assert.doesNotMatch(launcher, /taskkill[^\n]*\/IM/);
+  assert.doesNotMatch(launcher, /['"]\/T['"]/);
+  assert.match(launcher, /请手动关闭该程序/);
 });
 
 test('daemon JSON responses are idempotent after headers or body were sent', () => {
@@ -545,6 +548,14 @@ test('updaters reject an artifact whose internal daemon version disagrees with i
   assert.match(win, /artifact inspect package=/);
   assert.match(win, /更新包内部 daemon 版本/);
   assert.match(win, /新版 daemon 实际版本/);
+});
+
+test('Windows update runtime must match the packaged daemon version even without a semver ZIP name', () => {
+  const win = read('apply-update.ps1');
+  assert.match(win, /-ExpectedVersion \$sourceDaemonVersion/);
+  assert.match(win, /running daemon version=\$runningVersion expected=\$sourceDaemonVersion/);
+  assert.match(win, /if \(\$runningVersion -ne \$sourceDaemonVersion\)/);
+  assert.doesNotMatch(win, /if \(-not \[string\]::IsNullOrWhiteSpace\(\$packageVersion\) -and \$runningVersion -ne/);
 });
 
 test('sensitive local API routes require an injected token and do not expose wildcard CORS', () => {
