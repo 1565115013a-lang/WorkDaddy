@@ -5,6 +5,8 @@ rem  作用：验证 Setup.exe / zip 解出的 scripts 是否「完整、可装�
 rem  不修改任何系统状态，纯只读检查，可放心重复运行。
 rem ============================================================
 setlocal
+for /f "tokens=2 delims=:" %%C in ('chcp') do set "ORIGINAL_CODE_PAGE=%%C"
+set "ORIGINAL_CODE_PAGE=%ORIGINAL_CODE_PAGE: =%"
 chcp 65001 >nul
 cd /d "%~dp0"
 set "SCRIPT_DIR=%~dp0"
@@ -104,9 +106,13 @@ if exist "%USERPROFILE%\Desktop\WorkDaddy.lnk" (
 echo.
 echo ============================================================
 if "%FAIL%"=="0" (
+  set "VERIFY_EXIT=0"
   echo  自检通过：本包可用于 Windows 安装。
 ) else (
+  set "VERIFY_EXIT=1"
   echo  发现 %FAIL% 处问题，请在下方对照修正后再分发。
 )
 echo ============================================================
-pause
+if not defined CI pause
+if defined ORIGINAL_CODE_PAGE chcp %ORIGINAL_CODE_PAGE% >nul
+exit /b %VERIFY_EXIT%
