@@ -137,11 +137,18 @@ const DATA_DIR = defaultDataDir();
 // 1.0.15：新增「免打扰」模块（增强页）：基于 WorkBuddy 官方 sandbox 配置通道的 5 个开关，
 //        写入 ~/.workbuddy/settings.json 的 sandbox 域（excludedCommands/extraAllowWrite/
 //        批量删除阈值/删除保护）+ 弹窗自动点允许兜底（含审计）。
+// 1.0.16：修复免打扰「自动点允许」在 WorkBuddy AI 端无效：AI 拦截卡选项按钮带序号前缀
+//        （「1允许」「2本次会话内始终允许」）导致 once 匹配落空；文件/敏感路径拦截文案
+//        （「检测到受保护文件修改」等）不含旧关键词表导致语境校验失败。改为按钮文本
+//        规范化 + 加入「允许+拒绝」决策组结构化语境（自动排除积分/资费确认弹窗，绝不
+//        自动扣费），并在禁用按钮/点击异常处加护栏，避免误触与渲染进程异常。
+// 1.0.17：Windows 退出失败时对剩余 PID 请求一次提权 taskkill；HTTP 异步响应增加幂等保护，避免重复写 headers。
+// 1.0.18：Windows 更新包缺少 apply-update.vbs 时，在可写更新目录生成运行时桥接，避免更新直接失败。
 // 1.0.9：WorkBuddy / WorkBuddy AI profile 隔离；修复 Windows launcher 的本地端口探测、
 //        AI 端 CDP 误连国内端、watchdog 路径和退出确认问题。
 // 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
-const DAEMON_VERSION = '1.0.15';
-const DAEMON_BUILD_ID = 'release-1.0.15-20260823-no-disturb';
+const DAEMON_VERSION = '1.0.18';
+const DAEMON_BUILD_ID = 'release-1.0.18-20260824-update-vbs';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -338,6 +345,40 @@ function macWorkDaddyAppPath() {
   const bundledInfo = path.resolve(__dirname, '../../..', 'Contents', 'Info.plist');
   if (fs.existsSync(bundledInfo)) return path.resolve(__dirname, '../../..');
   return `/Applications/${WORKDADDY_INSTALL_NAME}.app`;
+}
+
+// wscript.exe 是 Windows 更新链路中唯一能在 daemon 退出后继续运行的中介。
+// 正常发布包使用源码中的 apply-update.vbs；旧/残缺包若漏掉该文件，则把等价桥接
+// 写到用户可写的更新目录，避免因安装目录只读或文件缺失而无法启动更新。
+const RUNTIME_APPLY_UPDATE_VBS = [
+  'Option Explicit',
+  '',
+  "Dim shell, i, cmd",
+  'Set shell = CreateObject("WScript.Shell")',
+  'If WScript.Arguments.Count = 0 Then WScript.Quit 1',
+  'cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File "',
+  'For i = 0 To WScript.Arguments.Count - 1',
+  '  cmd = cmd & " """ & WScript.Arguments(i) & """"',
+  'Next',
+  'shell.Run cmd, 0, False',
+].join('\r\n') + '\r\n';
+
+function resolveApplyUpdateVbs() {
+  const packaged = path.join(__dirname, 'apply-update.vbs');
+  try {
+    if (fs.statSync(packaged).isFile()) return packaged;
+  } catch (_) {}
+
+  const fallback = path.join(UPDATE_DIR, 'apply-update-runtime.vbs');
+  try {
+    fs.mkdirSync(UPDATE_DIR, { recursive: true });
+    fs.writeFileSync(fallback, RUNTIME_APPLY_UPDATE_VBS, { encoding: 'utf8', mode: 0o600 });
+    if (!fs.statSync(fallback).isFile()) throw new Error('运行时桥接文件未生成');
+    updateDebug('apply-vbs-fallback', { packaged, fallback });
+    return fallback;
+  } catch (e) {
+    throw new Error(`缺少 apply-update.vbs，且运行时桥接创建失败: ${e.message}`);
+  }
 }
 
 // 简单 semver 比较：a > b → 1，a < b → -1，相等 → 0（忽略预发布后缀）
@@ -980,11 +1021,12 @@ function applyUpdate() {
     //  ③ detached + cmd.exe /c 中转：cmd 同为 console 程序，一样不执行。
     // 唯一可靠的「父进程死后子进程照跑」通道：wscript.exe（GUI 子系统，不依赖控制台）做中介，
     // VBS 内 WScript.Shell.Run 用 ShellExecute 创建完全独立于 Node Job Object 的 powershell 进程。
-    const applyVbs = path.join(__dirname, 'apply-update.vbs');
-    if (!fs.existsSync(applyVbs)) {
-      const error = new Error('缺少 apply-update.vbs');
-      markAttemptFailure(error, 'preflight-error');
-      return Promise.reject(error);
+    let applyVbs;
+    try {
+      applyVbs = resolveApplyUpdateVbs();
+    } catch (e) {
+      markAttemptFailure(e, 'preflight-error');
+      return Promise.reject(e);
     }
     const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
     const child = spawn(
@@ -2590,6 +2632,12 @@ function deleteSessionFiles(wbHome, id) {
 }
 
 function json(res, code, obj) {
+  // 异步路由的成功/失败分支可能在响应已结束后再次进入 catch；响应只能写一次。
+  if (res.writableEnded || res.destroyed) return false;
+  if (res.headersSent) {
+    try { res.end(); } catch (_) {}
+    return false;
+  }
   const body = JSON.stringify(obj);
   const headers = {
     'Content-Type': 'application/json; charset=utf-8',

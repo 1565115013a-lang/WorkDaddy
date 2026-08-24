@@ -17,6 +17,15 @@ test('Windows updater launches the installed scripts launcher', () => {
   assert.match(script, /Invoke-RestMethod[\s\S]*\/api\/status/);
 });
 
+test('Windows updater keeps an apply-update VBS bridge in the package and has a runtime fallback', () => {
+  const daemon = read('daemon.js');
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  assert.match(build, /apply-update\.vbs/);
+  assert.match(build, /关键文件|required|必须/);
+  assert.match(daemon, /apply-update\.vbs/);
+  assert.match(daemon, /runtime.*vbs|生成.*VBS|写入.*VBS/i);
+});
+
 test('update status exposes the running daemon version so reboot polling can finish', () => {
   const daemon = read('daemon.js');
   const statusStart = daemon.indexOf("p === '/api/update-status'");
@@ -234,6 +243,39 @@ test('Windows launcher verifies the real WorkBuddy process tree and launch argum
   assert.match(launcher, /启动后进程未携带 CDP 参数，准备重试/);
   assert.match(launcher, /CDP 超时最终诊断/);
   assert.match(launcher, /processes: processDiagnostics\(wb\)/);
+});
+
+test('Windows launcher escalates a PID-only WorkBuddy exit fallback', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /tasklistProcessIds\(targetNames\)/);
+  assert.match(launcher, /Start-Process[\s\S]*taskkill\.exe[\s\S]*-Verb RunAs/);
+  assert.match(launcher, /remainingPids|剩余 PID|tasklistPids/);
+});
+
+test('daemon JSON responses are idempotent after headers or body were sent', () => {
+  const daemon = read('daemon.js');
+  const start = daemon.indexOf('function json(res, code, obj)');
+  const end = daemon.indexOf('\n\nconst PUBLIC_API_PATHS', start);
+  assert.ok(start >= 0 && end > start);
+  const json = new Function('Buffer', `${daemon.slice(start, end)}; return json;`)(Buffer);
+  let writes = 0;
+  const res = {
+    __wbsCorsOrigin: '',
+    headersSent: false,
+    writableEnded: false,
+    writeHead() {
+      if (this.headersSent) throw new Error('headers already sent');
+      this.headersSent = true;
+      writes++;
+    },
+    end() {
+      this.writableEnded = true;
+      writes++;
+    },
+  };
+  json(res, 200, { ok: true });
+  assert.doesNotThrow(() => json(res, 502, { ok: false }));
+  assert.equal(writes, 2, 'duplicate response must not write a second response');
 });
 
 test('Windows launcher discovers portable WorkBuddy installations', () => {

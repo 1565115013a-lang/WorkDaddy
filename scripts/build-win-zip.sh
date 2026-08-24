@@ -32,6 +32,11 @@ case "$PROFILE" in
   *) PROFILE="workbuddy-cn"; PACKAGE_NAME="WorkDaddy"; OUT="release/windows/WorkDaddy-${VERSION}-win64.zip" ;;
 esac
 
+if [ ! -f scripts/apply-update.vbs ]; then
+  echo "错误：关键文件 scripts/apply-update.vbs 缺失，无法生成 Windows 更新包" >&2
+  exit 2
+fi
+
 echo "==> profile: ${PROFILE}"
 echo "==> 版本: ${VERSION}"
 echo "==> 产物: ${OUT}"
@@ -125,7 +130,7 @@ with open(daemon, 'w', encoding='utf-8', newline='') as f:
 
 if not re.search(r"const DAEMON_VERSION = '" + re.escape(build_version) + r"';", s):
     raise SystemExit('staged daemon.js DAEMON_VERSION 与包版本不一致')
-if not re.search(r"const DAEMON_BUILD_ID = 'release-" + re.escape(build_version) + r"(?:-|');", s):
+if not re.search(r"const DAEMON_BUILD_ID = 'release-" + re.escape(build_version) + r"(?:-[^']*)?';", s):
     raise SystemExit('staged daemon.js DAEMON_BUILD_ID 与包版本不一致')
 
 # 同步可选 package.json 的版本元数据，避免旧壳版本覆盖关于页展示。

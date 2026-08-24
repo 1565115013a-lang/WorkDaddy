@@ -4485,8 +4485,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function ndVisible(el) {
       return !!(el && el.getClientRects && el.getClientRects().length && el.offsetParent !== null);
     }
-    // 仅在确认类弹窗容器内自动点：标题/正文含这些关键词才动手，宁可漏点也不错点
-    var ND_CONFIRM_PATTERN = /批量删除|沙箱|越界|系统级工具|系统工具|权限|允许访问|将运行|需要你确认|需要你的确认|确认允许|sandbox|approval/i;
+    // 仅在确认类弹窗容器内自动点，宁可漏点也不错点。语境判定两通道：
+    //  A. 关键词语境（老客户端 + 沙箱外执行命令兜底文案），向上至多 8 层
+    //  B. 结构化语境（WorkBuddy AI 拦截卡）：近层容器（≤3 层）内同时存在
+    //     「精确 once 允许选项」（允许/Allow/同意/…）+「拒绝选项」（拒绝/Deny），
+    //     且容器不含积分/资费等扣费弹窗文案（图片/视频生成等确认弹窗绝不自动点——
+    //     它们只有「确认/始终允许/拒绝」，没有独立「允许」选项，天然不命中）。
+    //  注意（1.0.16）：WorkBuddy AI 拦截卡选项按钮文本带序号前缀（如「1允许」「2本次会话内始终允许」），
+    //  once 匹配必须先规范化（去序号）；文件拦截文案是「检测到受保护文件修改」等，已补进关键词表。
+    var ND_CONFIRM_PATTERN = /批量删除|沙箱|越界|越权|系统级工具|系统工具|权限|允许访问|将运行|需要你确认|需要你的确认|确认允许|检测到|受保护|敏感|凭据|黑名单|sandbox|approval|permission/i;
+    var ND_CREDIT_PATTERN = /积分|信用|credit|消耗|付费|支付|费用|金额|余额|扣费/i;
+    var ND_DENY_WORD = /拒绝|Deny/i;
+    var ND_ONCE_LABEL = /^(允许|允许一次|Allow|Yes|同意|批准|确认允许)$/i;
+    function ndNormalizeLabel(t) {
+      return String(t || '').trim().replace(/^\d+\s*/g, '');
+    }
+    // 容器是否构成「允许+拒绝」决策组：含 ≥2 个按钮，且其中一个是精确 once 允许选项
+    function ndIsDecisionGroup(box) {
+      var opts = box.querySelectorAll('button');
+      if (!opts || opts.length < 2 || opts.length > 12) return false;
+      for (var i = 0; i < opts.length; i++) {
+        if (ND_ONCE_LABEL.test(ndNormalizeLabel(opts[i].textContent || ''))) return true;
+      }
+      return false;
+    }
     function scanNoDisturbApproval() {
       var doc = (window && window.document) || document;
       if (!doc) return;
@@ -4495,26 +4517,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var b = btns[i];
         if (b.getAttribute('data-nd-auto')) continue; // 已处理过
         if (!ndVisible(b)) continue;
-        var t = (b.textContent || '').trim();
+        if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue; // 禁用按钮不点
+        var t = ndNormalizeLabel(b.textContent || '');
         var kind = null;
-        if (t.indexOf('始终允许') > -1) kind = 'session';
-        else if (t === '允许' || t === 'Allow' || t === 'Yes' || t === '同意' || t === '确认允许') kind = 'once';
-        else if (t.indexOf('Yes') === 0 && t.length < 24) kind = 'once';
+        if (/始终允许|Always\s*allow/i.test(t)) kind = 'session';
+        else if (ND_ONCE_LABEL.test(t)) kind = 'once';
+        else if (/^Yes/i.test(t) && t.length < 24) kind = 'once';
         if (!kind) continue;
-        // 向上找确认容器（至多 8 层），验证语境
+        // 向上找确认容器（至多 8 层），验证语境：关键词命中，或近层命中「允许+拒绝」决策组（且无扣费文案）
         var box = b;
         var hit = false;
+        var creditSeen = false;
         for (var c = 0; c < 8 && box; c++) {
           box = box.parentElement;
           if (!box) break;
           var txt = box.textContent || '';
           if (txt.length > 500) txt = txt.slice(0, 500);
           if (ND_CONFIRM_PATTERN.test(txt)) { hit = true; break; }
+          if (ND_CREDIT_PATTERN.test(txt)) creditSeen = true;
+          if (c < 3 && !creditSeen && ND_DENY_WORD.test(txt) && ndIsDecisionGroup(box)) { hit = true; break; }
         }
         if (!hit) continue;
         b.setAttribute('data-nd-auto', '1');
         toNdAudit(kind, t);
-        if (b.click) b.click();
+        try { if (b.click) b.click(); } catch (e) {}
         return; // 每轮只确认一个，避免连环误触
       }
     }

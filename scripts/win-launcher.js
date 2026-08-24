@@ -520,6 +520,29 @@ function runTaskkill(args) {
   });
 }
 
+function runElevatedTaskkillPids(pids) {
+  const clean = Array.from(new Set(pids.map((pid) => String(pid)).filter((pid) => /^\d+$/.test(pid))));
+  if (!clean.length) return { code: 0, error: null };
+  const args = ['/F', '/T'];
+  for (const pid of clean) args.push('/PID', pid);
+  const command = [
+    '$p = Start-Process -FilePath ' + psQuote('taskkill.exe') +
+      ' -ArgumentList @(' + args.map(psQuote).join(', ') + ') -Verb RunAs -WindowStyle Hidden -Wait -PassThru',
+    'exit $p.ExitCode',
+  ].join('; ');
+  try {
+    const result = spawnSync('powershell', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command,
+    ], { encoding: 'utf8', windowsHide: true, timeout: 30000, stdio: 'ignore' });
+    return {
+      code: result.status,
+      error: result.error ? result.error.message : null,
+    };
+  } catch (e) {
+    return { code: null, error: e.message };
+  }
+}
+
 async function waitForWorkBuddyExit(timeoutMs, binary = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -579,6 +602,21 @@ async function quitWorkBuddy(binary) {
   if (await waitForWorkBuddyExit(5000, binary)) {
     log(`[exit] 镜像名兜底后已确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
     return true;
+  }
+  // 进程路径/CIM 信息缺失时，普通 taskkill 可能因旧 WorkBuddy 以管理员权限运行而失败。
+  // 最后只对已确认属于目标镜像的剩余 PID 请求一次 UAC，避免按名称误杀其他客户端。
+  const beforeElevated = exitSnapshot(binary);
+  const remainingPids = new Set([
+    ...beforeElevated.tasklistPids,
+    ...beforeElevated.processes.map((p) => p.pid).filter(Boolean),
+  ]);
+  if (remainingPids.size) {
+    const elevated = runElevatedTaskkillPids(Array.from(remainingPids));
+    log(`[exit] 提权 PID 兜底 taskkill=${Array.from(remainingPids).join(',')} code=${elevated.code == null ? 'null' : elevated.code}${elevated.error ? ' error=' + elevated.error : ''}`);
+    if (await waitForWorkBuddyExit(10000, binary)) {
+      log(`[exit] 提权 PID 兜底后已确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
+      return true;
+    }
   }
   const final = exitSnapshot(binary);
   log(`[exit] 无法确认退出 profile=${PROFILE.id} final=${JSON.stringify(final)}`);
