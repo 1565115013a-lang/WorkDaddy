@@ -169,11 +169,14 @@ test('delete route validates before SQL and deletes the matched set only', () =>
   const routeStart = source.indexOf("p === '/api/sessions/delete'");
   const routeEnd = source.indexOf("p === '/api/sessions/restore'", routeStart);
   const route = source.slice(routeStart, routeEnd);
+  const normalizeAt = route.indexOf('normalizeSessionIdBatch');
   const validateAt = route.indexOf('isValidSessionId');
   const selectAt = route.indexOf("SELECT id, user_id FROM sessions");
-  assert.ok(validateAt >= 0 && validateAt < selectAt, 'all IDs must be validated before SELECT or DELETE');
+  assert.ok(normalizeAt >= 0 && normalizeAt < validateAt, 'the raw batch must be bounded before path validation');
+  assert.ok(validateAt < selectAt, 'all IDs must be validated before SELECT or DELETE');
+  assert.match(route, /SELECT id, user_id FROM sessions WHERE id IN \(' \+ placeholders \+ '\);', ids/);
   assert.match(route, /const matchedIds = matchedSessionIds\(ids, before\)/);
-  assert.match(route, /DELETE FROM sessions WHERE id IN \(" \+ matchedEsc \+ "\)/);
+  assert.match(route, /DELETE FROM sessions WHERE id IN \(" \+ sqlPlaceholders\(matchedIds\) \+ "\);",\s+matchedIds/s);
   assert.match(route, /for \(const id of matchedIds\) filesRemoved \+= deleteSessionFiles\(wbHome, id\)/);
   assert.doesNotMatch(route, /for \(const id of ids\) filesRemoved/);
   const filesAt = route.indexOf('for (const id of matchedIds) filesRemoved += deleteSessionFiles');

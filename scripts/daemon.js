@@ -100,6 +100,8 @@ const { buildCreditResourceBody } = require('./credit-resource-queries.js');
 const { captureException, captureMessage } = require('./sentry-report.js');
 const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
+const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
+
 const PROFILE = getProfile();
 const DATA_DIR = defaultDataDir();
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -169,8 +171,9 @@ const DATA_DIR = defaultDataDir();
 // 1.0.13：下载使用唯一临时文件并在校验通过后原子替换，防止并发更新造成 ENOENT。
 // 1.0.25：会话删除仅作用于数据库匹配记录，并在清理失败时保留可重试的数据库记录。
 // 1.0.26：Windows launcher/logout 取消脚本提权与镜像名结束，只操作同安装目录的已验证 PID。
-const DAEMON_VERSION = '1.0.26';
-const DAEMON_BUILD_ID = 'release-1.0.26-20260824-least-privilege';
+// 1.0.27：会话数据库查询在原生 SQLite 与 CLI fallback 上统一使用绑定参数。
+const DAEMON_VERSION = '1.0.27';
+const DAEMON_BUILD_ID = 'release-1.0.27-20260824-session-db';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -2349,78 +2352,17 @@ async function writeDiagnosticsSnapshot(reason) {
 
 // ===== SESSIONS_API_MARK：会话管理（读 WorkBuddy workbuddy.db）=====
 const SESSIONS_DB = PROFILE.sessionDb;
-// Windows：无系统 sqlite3 CLI，优先用 Node 内置 node:sqlite（需 --experimental-sqlite 启动，launcher/install 已统一加）
-let NodeSqlite = null;
-if (IS_WIN) { try { NodeSqlite = require('node:sqlite'); } catch (_) { NodeSqlite = null; } }
-// 输出统一为 "header|header2\nval|val2" 格式，sqliteQuery 的解析两种后端通用
-function sqliteIsWrite(sql) {
-  // 复制/迁移/删除/恢复会执行写 SQL；其余当前调用均为查询。
-  return /^\s*(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|VACUUM|REINDEX|ANALYZE|BEGIN|COMMIT|ROLLBACK|ATTACH|DETACH)\b/i.test(String(sql || ''));
-}
-function sqliteRun(sql) {
+const SESSION_DB = createSessionDb({ dbPath: SESSIONS_DB });
+
+function sqliteRun(sql, params = []) {
   if (PROFILE.kind === 'codebuddy') {
     return Promise.reject(new Error(`${PROFILE.name} 会话库暂只支持读取`));
   }
-  if (IS_WIN && NodeSqlite) {
-    return new Promise((resolve, reject) => {
-      let db = null;
-      try {
-        const write = sqliteIsWrite(sql);
-        db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: !write });
-        if (write) {
-          db.exec(sql);
-          db.close(); db = null;
-          return resolve('');
-        }
-        const rows = db.prepare(sql).all();
-        db.close(); db = null;
-        if (!rows.length) return resolve('');
-        const header = Object.keys(rows[0]).join('|');
-        const lines = rows.map((r) =>
-          Object.values(r).map((v) => (v === null || v === undefined ? '' : String(v))).join('|')
-        );
-        resolve([header].concat(lines).join('\n'));
-      } catch (e) {
-        if (db) { try { db.close(); } catch (_) {} }
-        reject(new Error('sqlite 查询失败: ' + e.message));
-      }
-    });
-  }
-  return new Promise((resolve, reject) => {
-    const p = spawn('sqlite3', ['-header', SESSIONS_DB], { stdio: ['pipe', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    p.stdout.on('data', (d) => (out += d));
-    p.stderr.on('data', (d) => (err += d));
-    p.on('error', (e) => reject(new Error('sqlite3 不可用: ' + e.message)));
-    p.on('close', (code) => {
-      if (code !== 0) reject(new Error('sqlite 失败(' + code + '): ' + err.slice(0, 200)));
-      else resolve(out);
-    });
-    p.stdin.end(sql);
-  });
+  return SESSION_DB.run(sql, params);
 }
 function codeBuddySessionRows() {
-  if (NodeSqlite) {
-    try {
-      const db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: true });
-      const items = db.prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'session:%'").all();
-      db.close();
-      return Promise.resolve(items.map((item) => ({ key: item.key, value: item.value })));
-    } catch (e) {
-      return Promise.reject(new Error('CodeBuddy 会话库读取失败: ' + e.message));
-    }
-  }
-  return new Promise((resolve, reject) => {
-    const p = spawn('sqlite3', ['-json', SESSIONS_DB, 'SELECT key, value FROM ItemTable WHERE key LIKE \'session:%\';'], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    p.stdout.on('data', (d) => { out += d; });
-    p.stderr.on('data', (d) => { err += d; });
-    p.on('error', (e) => reject(new Error('sqlite3 不可用: ' + e.message)));
-    p.on('close', (code) => {
-      if (code !== 0) return reject(new Error('CodeBuddy 会话库读取失败: ' + err.slice(0, 200)));
-      let items = [];
-      try { items = JSON.parse(out || '[]'); } catch (e) { return reject(new Error('CodeBuddy 会话记录解析失败: ' + e.message)); }
-      resolve(items.map((item) => {
+  return SESSION_DB.all("SELECT key, value FROM ItemTable WHERE key LIKE 'session:%'")
+    .then((items) => items.map((item) => {
         let value = {};
         try { value = typeof item.value === 'string' ? JSON.parse(item.value) : (item.value || {}); } catch (_) {}
         const id = String(value.conversationId || String(item.key || '').replace(/^session:/, ''));
@@ -2430,36 +2372,51 @@ function codeBuddySessionRows() {
           last_activity_at: value.updatedAt || null, is_playground: value.isPlayground ? 1 : 0,
           deleted_at: null, source_mode: value.mode || 'agents', mode: value.mode || 'agents', model: value.model || '',
         };
-      }));
-    });
-  });
+      }))
+    .catch((e) => { throw new Error('CodeBuddy 会话库读取失败: ' + e.message); });
 }
-async function sqliteQuery(sql) {
+function sqlParamAt(textSql, params, questionIndex) {
+  return params[parameterCount(textSql.slice(0, questionIndex + 1)) - 1];
+}
+async function sqliteQuery(sql, params = []) {
+  const expectedParams = parameterCount(sql);
+  if (expectedParams !== params.length) {
+    throw new Error(`sqlite 参数数量不匹配: SQL 需要 ${expectedParams} 个，实际收到 ${params.length} 个`);
+  }
   if (PROFILE.kind === 'codebuddy') {
     const rows = await codeBuddySessionRows();
     const textSql = String(sql || '');
-    const uidMatch = textSql.match(/user_id\s*=\s*'([^']*)'/i);
-    const idMatch = textSql.match(/id\s+IN\s*\(([^)]*)\)/i);
+    const uidMatch = /user_id\s*=\s*\?/i.exec(textSql);
+    const idMatch = /id\s+IN\s*\(([^)]*)\)/i.exec(textSql);
+    const singleIdMatch = /\bid\s*=\s*\?/i.exec(textSql);
     let filtered = rows;
-    if (uidMatch) filtered = filtered.filter((r) => String(r.user_id) === uidMatch[1]);
+    if (uidMatch) {
+      const questionIndex = textSql.indexOf('?', uidMatch.index);
+      const uid = sqlParamAt(textSql, params, questionIndex);
+      filtered = filtered.filter((r) => String(r.user_id) === String(uid));
+    }
     if (idMatch) {
-      const ids = new Set(Array.from(idMatch[1].matchAll(/'([^']*)'/g)).map((m) => m[1]));
+      const questionIndex = textSql.indexOf('?', idMatch.index);
+      const start = parameterCount(textSql.slice(0, questionIndex + 1)) - 1;
+      const ids = new Set(params.slice(start, start + parameterCount(idMatch[1])).map(String));
       filtered = filtered.filter((r) => ids.has(String(r.id)));
+    }
+    if (singleIdMatch) {
+      const questionIndex = textSql.indexOf('?', singleIdMatch.index);
+      const id = sqlParamAt(textSql, params, questionIndex);
+      filtered = filtered.filter((r) => String(r.id) === String(id));
     }
     if (/SELECT\s+DISTINCT\s+cwd/i.test(textSql)) return Array.from(new Set(filtered.map((r) => r.cwd).filter(Boolean))).map((cwd) => ({ cwd }));
     if (/SELECT\s+user_id/i.test(textSql) && /LIMIT\s+1/i.test(textSql)) return filtered.slice(0, 1).map((r) => ({ user_id: r.user_id }));
     return filtered;
   }
-  const out = await sqliteRun(sql);
-  if (!out.trim()) return [];
-  const lines = out.trim().split('\n');
-  const header = lines[0].split('|');
-  return lines.slice(1).map((ln) => {
-    const parts = ln.split('|');
-    const o = {};
-    header.forEach((h, i) => (o[h.trim()] = parts[i] === undefined ? null : parts[i].trim()));
-    return o;
-  });
+  const rows = await SESSION_DB.all(sql, params);
+  // Keep the existing API contract (SQLite cells were strings, NULL was empty)
+  // while avoiding the delimiter/newline corruption of the former text parser.
+  return rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [
+    key,
+    value === null || value === undefined ? '' : String(value).trim(),
+  ])));
 }
 function sessionRangeMs(range) {
   const now = Date.now();
@@ -2532,39 +2489,38 @@ function isTaskSessionRecord(cwd) {
   return false;
 }
 
-function sqlQuote(value) {
-  return "'" + String(value == null ? '' : value).replace(/'/g, "''") + "'";
-}
-
-function sqlNullable(value) {
-  return value === null || value === undefined || value === '' ? 'NULL' : sqlQuote(value);
+function sqlPlaceholders(values) {
+  return values.map(() => '?').join(',');
 }
 
 async function insertCopiedSession(src, targetUid, newId) {
   const vals = [
-    sqlQuote(newId),
-    sqlQuote(src.cwd || ''),
-    sqlQuote(targetUid),
-    sqlQuote(src.title || ''),
-    sqlQuote(src.custom_title || ''),
-    sqlQuote(src.status || 'Pending'),
-    String(src.created_at || Date.now()),
-    String(Date.now()),
-    String(src.last_activity_at || src.updated_at || Date.now()),
-    String(src.is_playground || 0),
-    sqlNullable(src.source_mode),
-    src.is_background_automation === null || src.is_background_automation === undefined || src.is_background_automation === '' ? 'NULL' : String(src.is_background_automation),
-    sqlNullable(src.mode),
-    sqlNullable(src.model),
-    sqlNullable(src.expert_id),
-    sqlNullable(src.expert_locale),
-    sqlNullable(src.expert_runtime_identity),
-    sqlNullable(src.expert_marketplace),
-    sqlNullable(src.permission_mode),
-    src.use_sandbox_cli === null || src.use_sandbox_cli === undefined || src.use_sandbox_cli === '' ? 'NULL' : String(src.use_sandbox_cli),
-    sqlNullable(src.project_id),
+    newId,
+    src.cwd || '',
+    targetUid,
+    src.title || '',
+    src.custom_title || '',
+    src.status || 'Pending',
+    Number(src.created_at || Date.now()),
+    Date.now(),
+    Number(src.last_activity_at || src.updated_at || Date.now()),
+    Number(src.is_playground || 0),
+    src.source_mode || null,
+    src.is_background_automation === null || src.is_background_automation === undefined || src.is_background_automation === '' ? null : Number(src.is_background_automation),
+    src.mode || null,
+    src.model || null,
+    src.expert_id || null,
+    src.expert_locale || null,
+    src.expert_runtime_identity || null,
+    src.expert_marketplace || null,
+    src.permission_mode || null,
+    src.use_sandbox_cli === null || src.use_sandbox_cli === undefined || src.use_sandbox_cli === '' ? null : Number(src.use_sandbox_cli),
+    src.project_id || null,
   ];
-  await sqliteRun('INSERT INTO sessions (' + SESSION_COPY_COLUMNS.join(',') + ') VALUES (' + vals.join(',') + ');');
+  await sqliteRun(
+    'INSERT INTO sessions (' + SESSION_COPY_COLUMNS.join(',') + ') VALUES (' + sqlPlaceholders(vals) + ');',
+    vals
+  );
 }
 
 async function copySessionRecord(src, targetUid, options = {}) {
@@ -2579,7 +2535,10 @@ async function copySessionRecord(src, targetUid, options = {}) {
   if (sourceUid && lineageId) {
     const mapping = getAutoCopyMapping(DATA_DIR, lineageId, targetUid);
     if (mapping && mapping.targetId) {
-      const existing = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id = ' + sqlQuote(mapping.targetId) + ' AND deleted_at IS NULL LIMIT 1;');
+      const existing = await sqliteQuery(
+        'SELECT id, user_id FROM sessions WHERE id = ? AND deleted_at IS NULL LIMIT 1;',
+        [mapping.targetId]
+      );
       if (existing.length && String(existing[0].user_id || '') === String(targetUid)) {
         const files = copySessionFiles(wbHome, src.id, mapping.targetId);
         addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, mapping.targetId);
@@ -2627,7 +2586,8 @@ async function buildAutoCopyPlan(sourceUid, targetUid) {
   if (!rules.sessionIds.length && !rules.workspaces.length) return [];
   const rows = await sqliteQuery(
     'SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id ' +
-    'FROM sessions WHERE deleted_at IS NULL AND user_id = ' + sqlQuote(source) + ' ORDER BY created_at DESC;'
+    'FROM sessions WHERE deleted_at IS NULL AND user_id = ? ORDER BY created_at DESC;',
+    [source]
   );
   const sessionSet = new Set(rules.sessionIds);
   const workspaceSet = new Set(rules.workspaces.map(canonicalWorkspace));
@@ -4758,10 +4718,11 @@ function handleApi(req, res) {
     const range = url.searchParams.get('range') || '7d';
     const rangeMs = sessionRangeMs(range);
     const clauses = ["deleted_at IS NULL"];
-    if (uid) clauses.push("user_id = '" + uid.replace(/'/g, "''") + "'");
-    if (rangeMs) clauses.push('COALESCE(last_activity_at, updated_at, created_at) >= ' + rangeMs);
+    const params = [];
+    if (uid) { clauses.push('user_id = ?'); params.push(uid); }
+    if (rangeMs) { clauses.push('COALESCE(last_activity_at, updated_at, created_at) >= ?'); params.push(rangeMs); }
     // 时间筛选和排序按最近活动/修改时间；旧记录缺字段时回退到创建时间。
-    return sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, project_id FROM sessions WHERE " + clauses.join(' AND ') + " ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, created_at DESC;")
+    return sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, project_id FROM sessions WHERE " + clauses.join(' AND ') + " ORDER BY COALESCE(last_activity_at, updated_at, created_at) DESC, created_at DESC;", params)
       .then((rows) => {
         const rulesByUid = {};
         rows.forEach((row) => {
@@ -4965,7 +4926,10 @@ function handleApi(req, res) {
         const key = String(body.key || '').trim();
         if (!uid || !key) return json(res, 400, { ok: false, error: '缺少自动复制规则参数' });
         if (kind === 'session') {
-          const rows = await sqliteQuery('SELECT user_id FROM sessions WHERE id = ' + sqlQuote(key) + ' AND deleted_at IS NULL LIMIT 1;');
+          const rows = await sqliteQuery(
+            'SELECT user_id FROM sessions WHERE id = ? AND deleted_at IS NULL LIMIT 1;',
+            [key]
+          );
           if (!rows.length || String(rows[0].user_id || '') !== uid) return json(res, 404, { ok: false, error: '会话不存在或不属于该账号' });
         }
         const rules = setAutoCopyRule(DATA_DIR, { uid, kind, key, enabled: body.enabled !== false });
@@ -4983,14 +4947,18 @@ function handleApi(req, res) {
   // 复制会话：POST /api/sessions/copy { ids, targetUid }（保留原会话，复制记录+消息文件到目标账号）
   if (req.method === 'POST' && p === '/api/sessions/copy') {
     return readBody(req).then(async (body) => {
-      const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string') : [];
+      let ids;
+      try { ids = normalizeSessionIdBatch(body && body.ids); }
+      catch (e) { return json(res, 400, { ok: false, error: e.message }); }
       const targetUid = (body.targetUid || '').trim();
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
       if (!targetUid) return json(res, 400, { ok: false, error: '未指定目标账号' });
       try {
-        const esc = ids.map((i) => "'" + String(i).replace(/'/g, "''") + "'").join(',');
         // 1) 取出源会话（含 cwd 用于定位消息文件）
-        const srcRows = await sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id FROM sessions WHERE id IN (" + esc + ") AND deleted_at IS NULL;");
+        const srcRows = await sqliteQuery(
+          "SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id FROM sessions WHERE id IN (" + sqlPlaceholders(ids) + ") AND deleted_at IS NULL;",
+          ids
+        );
         if (!srcRows.length) return json(res, 404, { ok: false, error: '源会话不存在' });
         let copied = 0;
         for (const src of srcRows) {
@@ -5006,14 +4974,22 @@ function handleApi(req, res) {
   // 迁移会话：POST /api/sessions/migrate { ids, targetUid }
   if (req.method === 'POST' && p === '/api/sessions/migrate') {
     return readBody(req).then(async (body) => {
-      const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string') : [];
+      let ids;
+      try { ids = normalizeSessionIdBatch(body && body.ids); }
+      catch (e) { return json(res, 400, { ok: false, error: e.message }); }
       const targetUid = (body.targetUid || '').trim();
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
       if (!targetUid) return json(res, 400, { ok: false, error: '未指定目标账号' });
       try {
-        const esc = ids.map((i) => sqlQuote(i)).join(',');
-        const before = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + esc + ') AND deleted_at IS NULL;');
-        await sqliteRun("UPDATE sessions SET user_id = " + sqlQuote(targetUid) + ", updated_at = " + Date.now() + " WHERE id IN (" + esc + ");");
+        const placeholders = sqlPlaceholders(ids);
+        const before = await sqliteQuery(
+          'SELECT id, user_id FROM sessions WHERE id IN (' + placeholders + ') AND deleted_at IS NULL;',
+          ids
+        );
+        await sqliteRun(
+          "UPDATE sessions SET user_id = ?, updated_at = ? WHERE id IN (" + placeholders + ");",
+          [targetUid, Date.now(), ...ids]
+        );
         let rulesMoved = 0;
         for (const row of before) {
           if (String(row.user_id || '') === targetUid) continue;
@@ -5033,12 +5009,14 @@ function handleApi(req, res) {
   // 删除会话（真实删除）：POST /api/sessions/delete { ids }——删除 DB 记录 + 该账号下全部会话文件（不可恢复）
   if (req.method === 'POST' && p === '/api/sessions/delete') {
     return readBody(req).then(async (body) => {
-      const ids = Array.isArray(body.ids) ? body.ids : [];
+      let ids;
+      try { ids = normalizeSessionIdBatch(body && body.ids); }
+      catch (e) { return json(res, 400, { ok: false, error: e.message }); }
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
       if (!ids.every(isValidSessionId)) return json(res, 400, { ok: false, error: '包含无效的会话 ID' });
       try {
-        const esc = ids.map((i) => sqlQuote(i)).join(',');
-        const before = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + esc + ');');
+        const placeholders = sqlPlaceholders(ids);
+        const before = await sqliteQuery('SELECT id, user_id FROM sessions WHERE id IN (' + placeholders + ');', ids);
         const matchedIds = matchedSessionIds(ids, before);
         const matchedSet = new Set(matchedIds);
         const matchedRows = before.filter((row) => matchedSet.has(String(row.id || '')));
@@ -5057,8 +5035,10 @@ function handleApi(req, res) {
         }
         // 2) 最后真实删除 DB 记录（非软删）。若此步失败，重复请求可安全重试。
         if (matchedIds.length) {
-          const matchedEsc = matchedIds.map((i) => sqlQuote(i)).join(',');
-          await sqliteRun("DELETE FROM sessions WHERE id IN (" + matchedEsc + ");");
+          await sqliteRun(
+            "DELETE FROM sessions WHERE id IN (" + sqlPlaceholders(matchedIds) + ");",
+            matchedIds
+          );
         }
         log(`[sessions-delete] 已真实删除 ${matchedIds.length} 个会话（DB + ${filesRemoved} 项文件）`);
         return json(res, 200, { ok: true, deleted: matchedIds.length, requested: ids.length, filesRemoved, rulesRemoved });
@@ -5070,10 +5050,14 @@ function handleApi(req, res) {
   // 恢复会话：POST /api/sessions/restore { ids }
   if (req.method === 'POST' && p === '/api/sessions/restore') {
     return readBody(req).then((body) => {
-      const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string') : [];
+      let ids;
+      try { ids = normalizeSessionIdBatch(body && body.ids); }
+      catch (e) { return json(res, 400, { ok: false, error: e.message }); }
       if (!ids.length) return json(res, 400, { ok: false, error: '未选择会话' });
-      const esc = ids.map((i) => "'" + String(i).replace(/'/g, "''") + "'").join(',');
-      return sqliteRun("UPDATE sessions SET deleted_at = NULL, updated_at = " + Date.now() + " WHERE id IN (" + esc + ");")
+      return sqliteRun(
+        "UPDATE sessions SET deleted_at = NULL, updated_at = ? WHERE id IN (" + sqlPlaceholders(ids) + ");",
+        [Date.now(), ...ids]
+      )
         .then(() => json(res, 200, { ok: true, restored: ids.length }))
         .catch((e) => json(res, 500, { ok: false, error: e.message }));
     });

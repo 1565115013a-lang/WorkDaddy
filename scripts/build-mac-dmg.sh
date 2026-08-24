@@ -43,7 +43,7 @@ chmod 755 "$APP/Contents/MacOS/launcher"
 echo "==> launcher 可执行位已保证: $(stat -f '%Sp' "$APP/Contents/MacOS/launcher")"
 
 # 2) 只覆盖前端代码（保留壳的其余一切：launcher/Info.plist/builtin/node_modules/theme-audit.js）
-for f in daemon.js inject.js theme-patches.js credit-segments.js credit-resource-queries.js lib.js profiles.js cdp-targets.js sentry-report.js install.sh relaunch-with-cdp.sh uninstall.sh apply-update.sh; do
+for f in daemon.js session-db.js inject.js theme-patches.js credit-segments.js credit-resource-queries.js lib.js profiles.js cdp-targets.js sentry-report.js install.sh relaunch-with-cdp.sh uninstall.sh apply-update.sh; do
   [ -f "scripts/$f" ] && cp "scripts/$f" "$APP/Contents/Resources/scripts/$f"
 done
 # 恢复这些文件的壳权限（与 1.0.3 壳内一致：sh/lib/daemon 755，inject/theme-patches 644）
@@ -54,7 +54,8 @@ chmod 755 "$APP/Contents/Resources/scripts/daemon.js" \
   "$APP/Contents/Resources/scripts/relaunch-with-cdp.sh" \
   "$APP/Contents/Resources/scripts/uninstall.sh" \
   "$APP/Contents/Resources/scripts/apply-update.sh"
-chmod 644 "$APP/Contents/Resources/scripts/inject.js" \
+chmod 644 "$APP/Contents/Resources/scripts/session-db.js" \
+  "$APP/Contents/Resources/scripts/inject.js" \
   "$APP/Contents/Resources/scripts/theme-patches.js"
 echo "==> 前端代码已覆盖（权限按壳原样）"
 
