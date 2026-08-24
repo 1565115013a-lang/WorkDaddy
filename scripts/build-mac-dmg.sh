@@ -90,7 +90,7 @@ cat > "$STAGE/安装失败自主解决提示词.txt" <<'EOF'
 WorkDaddy macOS 安装失败自助修复
 ============================
 
-你是 WorkDaddy 故障修复 agent。仅在用户明确授权的范围内排查、修复和上报。
+你是 WorkDaddy 的故障修复 agent。用户已经无法正常安装或启动 WorkDaddy，请在用户明确授权的范围内完成排查和修复。任何诊断上报都是可选的外部操作，必须另行取得用户对本次报告的明确同意。
 
 一、准备与排查
 
@@ -115,12 +115,15 @@ WorkDaddy macOS 安装失败自助修复
 
 在源码根目录写 WORKDADDY_FIX_REPORT.md。报告硬上限 3500 字符，最多包含：问题/根因、修改文件及目的、测试汇总、用户下一步。每项用短句；只引用一条脱敏错误，不附完整日志、命令输出、账号数据或凭据。
 
-四、自动上报
+四、可选诊断上报（必须由用户明确同意）
 
-测试通过后执行：
-node scripts/sentry-report.js --stage agent-fix --level info --message-file WORKDADDY_FIX_REPORT.md --tags-json '{"source":"workbuddy-agent","status":"fixed","platform":"macos"}'
+默认不要执行诊断上报，也不要替用户设置遥测环境变量。只有用户明确同意、已经自行设置 `WORKDADDY_TELEMETRY=1`，并且修复通过测试后，才可执行：
 
-命令必须输出 JSON。sent=true 表示已发送，queued=true 表示已进入本地重试队列。测试未通过不得标记 fixed，应使用 status=unresolved 并写明阻塞原因。上报前再次确认报告不超过 3500 字符且不含敏感数据。
+   node scripts/sentry-report.js --stage agent-fix --level info --message-file WORKDADDY_FIX_REPORT.md --tags-json '{"source":"workbuddy-agent","status":"fixed","platform":"macos"}'
+
+命令输出必须是 JSON。看到 disabled=true 表示遥测未启用、没有发送，这是正常结果；看到 sent=true 表示已发送；看到 queued=true 表示网络暂时不可用，报告已写入 WorkDaddy 的 telemetry/outbox，后续会在遥测保持启用时重试。不要把 token、账号备份、数据库或完整日志放进 WORKDADDY_FIX_REPORT.md。
+
+如果测试仍未通过，不得伪造 fixed 状态；仅在用户明确同意上报时，才可以改用 status=unresolved，并在报告中写清楚阻塞原因。
 EOF
 rm -f "$OUT"
 hdiutil create -volname "$PACKAGE_APP_NAME" -srcfolder "$STAGE" -ov -format UDZO -imagekey zlib-level=9 "$OUT" >/dev/null
