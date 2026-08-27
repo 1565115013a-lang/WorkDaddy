@@ -7177,6 +7177,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return '<div class="wbs-credit-bar" role="img" aria-label="积分到期分布">' + cells + '</div>';
     }
 
+    // 「今日已用」用量行：值未知（null）时不渲染；剩余积分已在卡片上方展示，这里不再重复显示累计用量。
+    function creditUsageHtml(account) {
+      if (!account) return '';
+      var todayUsed = account.todayUsed === null || account.todayUsed === undefined ? null : Number(account.todayUsed);
+      if (todayUsed === null) return '';
+      return '<div class="wbs-credit-usage">' +
+        '<span class="wbs-cu-item"><span class="wbs-cu-key">今日已用</span><b>' + fmtCredits(todayUsed) + '</b></span>' +
+        '</div>';
+    }
+
     function creditBlockHtml(credits, segments, account) {
       if (isIdentityExpired(account)) return '';
       var checkin = checkinHtml(account);
@@ -7191,6 +7201,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (credits === null) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-na">-</span></div></div>';
       return '<div class="wbs-credit-block">' +
         '<div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-total">' + CREDIT_ICON + '<b>' + fmtCredits(credits) + '</b></span></div>' +
+        creditUsageHtml(account) +
         creditBarHtml(credits, segments) +
         '</div>';
     }
@@ -7551,8 +7562,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             var credits = r && typeof r.credits === 'number' && isFinite(r.credits) ? r.credits : null;
             var segments = r && Array.isArray(r.segments) ? r.segments : [];
             var unlimited = !!(r && r.unlimited);
+            var todayUsed = r && r.todayUsed !== null && r.todayUsed !== undefined ? Number(r.todayUsed) : null;
+            var used = r && r.totalDosage !== null && r.totalDosage !== undefined ? Number(r.totalDosage) : null;
             for (var i = 0; i < state.accounts.length; i++) {
-              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = credits; state.accounts[i].creditSegments = segments; state.accounts[i].creditUnlimited = unlimited; break; }
+              if (state.accounts[i].uid === a.uid) {
+                state.accounts[i].credits = credits;
+                state.accounts[i].creditSegments = segments;
+                state.accounts[i].creditUnlimited = unlimited;
+                state.accounts[i].todayUsed = todayUsed;
+                state.accounts[i].used = used;
+                break;
+              }
             }
             updateCreditCell(a.uid, credits, segments);
           })
@@ -7895,6 +7915,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-credit-tooltip{display:none;position:fixed;z-index:2147483647;min-width:170px;max-width:260px;padding:8px 10px;border-radius:7px;background:#151518;color:#fff;font-size:11px;font-weight:500;line-height:1.55;white-space:pre-line;box-shadow:0 8px 22px rgba(0,0,0,.28);pointer-events:none}',
     '.wbs-credit-empty{height:5px;border-radius:0;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent);color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:5px;text-align:center}',
     '.wbs-credit-hint{color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:1.4;margin-top:2px}',
+    '.wbs-credit-usage{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:2px;color:var(--wb-icon-tertiary,#999);font-size:12px;line-height:1.4}',
+    '.wbs-credit-usage .wbs-cu-item{display:inline-flex;align-items:center;gap:4px;min-width:0;font-variant-numeric:tabular-nums}',
+    '.wbs-credit-usage b{color:var(--wb-color-text-primary,#1f1f1f);font-weight:600}',
     '.wbs-credit-icon{width:14px;height:14px;vertical-align:middle;flex-shrink:0}',
     '.wbs-credit-loading{color:var(--wb-icon-tertiary,#999);font-size:12px}',
     '.wbs-credit-na{color:var(--wb-icon-tertiary,#999);font-size:12px}',

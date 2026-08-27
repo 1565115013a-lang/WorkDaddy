@@ -97,6 +97,8 @@ const {
   checkinDisplayValue,
 } = require('./lib.js');
 const { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS } = require('./credit-segments.js');
+const { updateDailyBaseline, pruneBaselines } = require('./credit-usage.js');
+const { fetchTodayUsage } = require('./credit-request-usage.js');
 const { buildCreditResourceBody } = require('./credit-resource-queries.js');
 const {
   captureException,
@@ -197,8 +199,12 @@ const DATA_DIR = defaultDataDir();
 // 1.0.49：主题 CDP 应用增加异常回读/重试，失败主题不再覆盖已保存主题。
 // 1.0.18：主题应用在页面刷新/切换期间自动重连 CDP，并补充失败诊断。
 // 1.1.0：Windows launcher 固定传递 profile UI 端口；显式端口冲突时不再递增到相邻 profile。
-const DAEMON_VERSION = '1.1.1';
-const DAEMON_BUILD_ID = 'release-1.1.1-20260827-windows-privilege-path-fixes';
+// 1.1.1：积分卡新增「今日已用」（跨天基线 = 当日观测到的最大剩余 − 当前剩余）与「已用」（TotalDosage）。
+//        /api/credits 新增 todayUsed 字段；基线缓存存于 credit-daily-baseline.json，30 天自动清理。
+// 1.1.2：今日已用改为调用官方 /billing/meter/get-user-request-usage 精确汇总（按 requestTime 过滤今日
+//        credit 求和，无跨天盲区）；接口失败时回退到本地基线法。新模块 scripts/credit-request-usage.js。
+const DAEMON_VERSION = '1.1.2';
+const DAEMON_BUILD_ID = 'release-1.1.2-20260827-credit-today-used-official';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -2124,6 +2130,55 @@ function todayStr(d) {
   d = d || new Date();
   const z = (n) => String(n).padStart(2, '0');
   return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate());
+}
+
+// 今日已用积分：基于「当日观测到的最大剩余值」做基线，跨天自动重置。
+// 取最大剩余而非最早值，是因为当日可能发生签到/充值等增发，用最大剩余可避免
+// 把今日已用算成负值或偏大。缺点（面板关闭 + 跨天期间消耗）无法精确覆盖，仅做近似。
+const CREDIT_BASELINE_FILE = path.join(DATA_DIR, 'credit-daily-baseline.json');
+const CREDIT_BASELINE_RETAIN_DAYS = 30; // 只保留近 30 天，避免缓存无限增长
+
+function loadCreditBaselines() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CREDIT_BASELINE_FILE, 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveCreditBaselines(cache) {
+  try {
+    fs.writeFileSync(CREDIT_BASELINE_FILE, JSON.stringify(cache, null, 2));
+  } catch (e) {
+    log('[credits] 写入今日已用基线缓存失败: ' + e.message);
+  }
+}
+
+/**
+ * 计算并更新某账号的「今日已用积分」。
+ * @param {string} uid 账号 uid
+ * @param {number|null} credits 当前剩余积分；null（企业不限量/查询失败）时不记账
+ * @returns {number|null} 今日已用积分；无法计算时返回 null
+ */
+function todayUsedFor(uid, credits) {
+  const today = todayStr();
+  const cache = loadCreditBaselines();
+  const updated = updateDailyBaseline(cache, uid, today, credits);
+  saveCreditBaselines(updated.cache);
+  return updated.todayUsed;
+}
+
+// 定期清理过期的基线记录（在 /api/credits 成功路径之外惰性触发，避免每次请求都读盘）
+let creditBaselineLastPrune = 0;
+function maybePruneCreditBaselines() {
+  const now = Date.now();
+  if (now - creditBaselineLastPrune < 6 * 3600 * 1000) return;
+  creditBaselineLastPrune = now;
+  const today = todayStr();
+  const cache = loadCreditBaselines();
+  const pruned = pruneBaselines(cache, today, CREDIT_BASELINE_RETAIN_DAYS);
+  if (pruned.changed) saveCreditBaselines(pruned.cache);
 }
 
 function loadCheckinCache() {
@@ -5300,12 +5355,25 @@ function handleApi(req, res) {
         const tk = j.auth && j.auth.accessToken;
         if (!tk) return json(res, 400, { ok: false, error: '备份中无 accessToken' });
         const r = await fetchCredits(tk, j.account);
+        // 今日已用：优先用官方 get-user-request-usage 精确汇总（按 requestTime 过滤今日 credit 求和）；
+        // 接口失败时回退到本地基线法（当日观测到的最大剩余 − 当前剩余，跨天自动重置）。
+        const apiHost = PROFILE.apiHost || 'https://www.workbuddy.cn';
+        const usage = await fetchTodayUsage({ accessToken: tk, apiHost });
+        let todayUsed;
+        if (usage.ok) {
+          todayUsed = usage.todayUsed;
+        } else {
+          todayUsed = todayUsedFor(uid, r.credits);
+          maybePruneCreditBaselines();
+        }
         return json(res, 200, {
           ok: true,
           uid,
           credits: r.credits,
           count: r.count,
           totalDosage: r.totalDosage,
+          todayUsed,
+          todayUsedFallback: usage.ok ? false : true,
           meterCredits: r.meterCredits,
           packageCredits: r.packageCredits,
           meterError: r.meterError,
