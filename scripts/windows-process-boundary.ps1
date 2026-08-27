@@ -245,10 +245,19 @@ function Get-UniqueNodeProcessForScript {
     [int]$ExpectedParentProcessId = 0
   )
   $matches = @()
+  $scriptName = [IO.Path]::GetFileName($ExpectedScript)
+  if ([string]::IsNullOrWhiteSpace($scriptName) -or
+      $scriptName.IndexOfAny([char[]]@([char]0, [char]10, [char]13, [char]39)) -ge 0) {
+    throw '目标 Node 入口脚本名称无效'
+  }
+  $scriptName = $scriptName.Replace("'", "''")
   $currentSessionId = [int](Get-Process -Id $PID -ErrorAction Stop).SessionId
+  # 先让 CIM 在服务端按可信脚本名筛选，避免同会话中无关的受保护 Node
+  # 进程（命令行/路径不可读）阻断当前 profile 的精确身份验证。
+  $commandHint = " AND CommandLine LIKE '%$scriptName%'"
   $filter = if ($ExpectedParentProcessId -gt 0) {
-    "Name = 'node.exe' AND SessionId = $currentSessionId AND ParentProcessId = $ExpectedParentProcessId"
-  } else { "Name = 'node.exe' AND SessionId = $currentSessionId" }
+    "Name = 'node.exe' AND SessionId = $currentSessionId AND ParentProcessId = $ExpectedParentProcessId$commandHint"
+  } else { "Name = 'node.exe' AND SessionId = $currentSessionId$commandHint" }
   $rows = @(Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop)
   foreach ($row in $rows) {
     if ([string]$row.Name -ine 'node.exe' -or
@@ -360,20 +369,51 @@ function Stop-VerifiedWorkDaddyLifecycle {
   # 子进程，避免无关或其他会话中不可读取命令行的 Node 阻断当前 profile。
   # PID 文件缺失或 stale 时仍扫描完整 Node 列表，证明没有未跟踪实例。
   $watchdog = $null
+  $pidFilePid = $watchdogPid
   if ($pidFileExists) {
-    $pidCandidate = Get-StrictProcessRecord -ProcessId $watchdogPid
+    $pidCandidate = $null
+    $pidProbeError = $null
+    try {
+      $pidCandidate = Get-StrictProcessRecord -ProcessId $watchdogPid
+    } catch {
+      # A stale PID can be reused by an unrelated/protected process whose CIM
+      # identity is incomplete. Recover only when a separately enumerated,
+      # exact watchdog proves the current profile still owns the lifecycle.
+      $pidProbeError = $_
+    }
     if ($null -ne $pidCandidate) {
       $watchdog = Assert-NodeProcessIdentity -Process $pidCandidate -ExpectedPid $watchdogPid -ExpectedScript $ExpectedWatchdogScript
     } else {
-      $watchdog = Get-UniqueNodeProcessForScript -ExpectedScript $ExpectedWatchdogScript
-      if ($null -ne $watchdog) {
-        throw 'watchdog.pid 指向不存在的 PID，但发现了另一个精确 watchdog 进程'
+      $replacementWatchdog = Get-UniqueNodeProcessForScript -ExpectedScript $ExpectedWatchdogScript
+      if ($null -ne $replacementWatchdog) {
+        $currentPidText = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction Stop).Trim()
+        if ($currentPidText -cne [string]$pidFilePid) {
+          throw 'watchdog.pid 在修复前发生变化'
+        }
+        [IO.File]::WriteAllText(
+          $pidFile,
+          [string]$replacementWatchdog.ProcessId,
+          (New-Object Text.UTF8Encoding($false)))
+        $watchdogPid = [int]$replacementWatchdog.ProcessId
+        $watchdog = $replacementWatchdog
+      } elseif ($null -ne $pidProbeError) {
+        throw $pidProbeError
       }
-      $staleWatchdogPidFile = $true
+      if ($null -ne $watchdog) {
+        # The PID file was stale/reused; the exact replacement above is now
+        # the only lifecycle candidate and has been persisted atomically enough
+        # for the subsequent identity re-checks.
+      } elseif ($null -eq $pidCandidate) {
+        $staleWatchdogPidFile = $true
+      }
     }
   } else {
     $watchdog = Get-UniqueNodeProcessForScript -ExpectedScript $ExpectedWatchdogScript
   }
+
+  # Stop the verified watchdog before taking the daemon/listener snapshot. This
+  # prevents its restart loop from changing the listener PID mid-validation.
+  if ($null -ne $watchdog) { Stop-VerifiedProcess -Process $watchdog }
 
   $listenerPid = Get-UniqueListeningProcessId -Port $Port
   $daemon = if ($null -ne $watchdog) {
@@ -391,7 +431,6 @@ function Stop-VerifiedWorkDaddyLifecycle {
   }
 
   # 所有候选先完成身份验证；外来监听进程不会导致任何 WorkDaddy 进程被提前终止。
-  if ($null -ne $watchdog) { Stop-VerifiedProcess -Process $watchdog }
   if ($null -ne $daemon) {
     $currentListenerPid = Get-UniqueListeningProcessId -Port $Port
     # watchdog 退出后 daemon 可能自行退出并先释放端口；只有被其他 PID

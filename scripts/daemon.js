@@ -29,17 +29,17 @@ const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 const {
   assertSameProcessIdentity,
-  assertStandardWindowsPrivilege,
+  detectWindowsPrivilege,
   buildNativeProcessQuery,
   filterVerifiedWindowsProcesses,
   parseCimProcessResult,
   resolveWindowsExecutable,
   sameWindowsPath,
   selectRunningProfileBinary,
-  selectUniqueDiscoveredBinary,
+  selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
 const DAEMON_PRIVILEGE = process.platform === 'win32'
-  ? assertStandardWindowsPrivilege()
+  ? detectWindowsPrivilege()
   : 'standard';
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
@@ -197,8 +197,8 @@ const DATA_DIR = defaultDataDir();
 // 1.0.49：主题 CDP 应用增加异常回读/重试，失败主题不再覆盖已保存主题。
 // 1.0.18：主题应用在页面刷新/切换期间自动重连 CDP，并补充失败诊断。
 // 1.1.0：Windows launcher 固定传递 profile UI 端口；显式端口冲突时不再递增到相邻 profile。
-const DAEMON_VERSION = '1.1.0';
-const DAEMON_BUILD_ID = 'release-1.1.0-20260827-cross-platform-queue-settings-fix';
+const DAEMON_VERSION = '1.1.1';
+const DAEMON_BUILD_ID = 'release-1.1.1-20260827-windows-privilege-path-fixes';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -1749,7 +1749,10 @@ function resolveWorkBuddyBinary() {
     '}',
   ].join('; ');
   for (const candidate of psCmd(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) addCandidate(candidate);
-  const selected = selectUniqueDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  const selected = selectPreferredDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  if (discovered.length > 1) {
+    log('检测到多个 dormant WorkBuddy 安装目录，按发现优先级选择: ' + selected);
+  }
   return selected ? (wbBinaryCache = selected) : null;
 }
 
@@ -3131,7 +3134,7 @@ function replaceFileWithRetry(file, content, mode) {
   const tmp = `${file}.wbs-tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   fs.writeFileSync(tmp, content, 'utf8');
   if (mode !== undefined) fs.chmodSync(tmp, mode);
-  const maxAttempts = process.platform === 'win32' ? 15 : 1;
+  const maxAttempts = process.platform === 'win32' ? 80 : 1;
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -3140,10 +3143,17 @@ function replaceFileWithRetry(file, content, mode) {
     } catch (error) {
       lastError = error;
       const retryable = process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error && error.code);
-      if (!retryable || attempt === maxAttempts) throw error;
-      sleepSync(75);
+      if (!retryable || attempt === maxAttempts) break;
+      // A stale read-only attribute can surface as EPERM independently of a
+      // sharing violation. Clearing it is limited to this known config file;
+      // the atomic rename remains the only successful write path.
+      if (attempt === 1 && error && error.code === 'EPERM') {
+        try { fs.chmodSync(file, 0o666); } catch (_) {}
+      }
+      sleepSync(Math.min(250, 50 + attempt * 10));
     }
   }
+  try { fs.unlinkSync(tmp); } catch (_) {}
   throw lastError;
 }
 

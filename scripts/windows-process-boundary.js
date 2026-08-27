@@ -10,7 +10,7 @@ const ALLOWED_WORKBUDDY_PROCESS_NAMES = new Set([
   'codebuddy.exe',
 ]);
 
-function assertStandardWindowsPrivilege(run = spawnSync) {
+function detectWindowsPrivilege(run = spawnSync) {
   const command = "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)";
   let result;
   try {
@@ -29,8 +29,14 @@ function assertStandardWindowsPrivilege(run = spawnSync) {
   }
   const value = String(result.stdout || '').trim().toLowerCase();
   if (value === 'false') return 'standard';
-  if (value === 'true') throw new Error('拒绝以管理员或 elevated 权限运行 WorkDaddy');
+  if (value === 'true') return 'elevated';
   throw new Error('无法确认 Windows 进程是否为普通用户权限');
+}
+
+function assertStandardWindowsPrivilege(run = spawnSync) {
+  const privilege = detectWindowsPrivilege(run);
+  if (privilege !== 'standard') throw new Error('拒绝以管理员或 elevated 权限运行 WorkDaddy');
+  return privilege;
 }
 
 function validateProcessRecord(row, options = {}) {
@@ -165,7 +171,9 @@ function filterVerifiedWindowsProcesses(expectedBinary, processes, realpath = fs
     let executable;
     try {
       executable = resolveWindowsExecutable(process.ExecutablePath, realpath);
-    } catch (_) {
+    } catch (error) {
+      // A process can disappear between CIM enumeration and realpath.
+      if (error && error.code === 'ENOENT') continue;
       throw new Error(`Cannot verify executable path for PID ${process.ProcessId}`);
     }
     if (path.win32.basename(executable).toLowerCase() !== name) {
@@ -189,7 +197,11 @@ function selectRunningProfileBinary(profileNames, processes, realpath = fs.realp
     const process = validateProcessRecord(item);
     const name = process.Name.toLowerCase();
     if (!names.has(name)) continue;
-    const executable = resolveWindowsExecutable(process.ExecutablePath, realpath);
+    let executable;
+    try { executable = resolveWindowsExecutable(process.ExecutablePath, realpath); } catch (error) {
+      if (error && error.code === 'ENOENT') continue;
+      throw error;
+    }
     if (path.win32.basename(executable).toLowerCase() !== name) {
       throw new Error(`Executable name does not match CIM Name for PID ${process.ProcessId}`);
     }
@@ -203,7 +215,11 @@ function selectUniqueDiscoveredBinary(profileNames, candidates, realpath = fs.re
   const names = profileNames instanceof Set ? profileNames : new Set(profileNames || []);
   const binaries = new Map();
   for (const candidate of Array.isArray(candidates) ? candidates : []) {
-    const executable = resolveWindowsExecutable(candidate, realpath);
+    let executable;
+    try { executable = resolveWindowsExecutable(candidate, realpath); } catch (error) {
+      if (error && error.code === 'ENOENT') continue;
+      throw error;
+    }
     if (!names.has(path.win32.basename(executable).toLowerCase())) continue;
     binaries.set(executable.toLowerCase(), executable);
   }
@@ -213,14 +229,46 @@ function selectUniqueDiscoveredBinary(profileNames, candidates, realpath = fs.re
   return binaries.size ? Array.from(binaries.values())[0] : null;
 }
 
+// Discovery order is a priority order in the callers: explicit profile path,
+// registry entries, conventional installs, then bounded scans. Dormant copies
+// should not make startup fail when the first valid candidate is unambiguous.
+function selectPreferredDiscoveredBinary(profileNames, candidates, realpath = fs.realpathSync.native) {
+  const names = profileNames instanceof Set ? profileNames : new Set(profileNames || []);
+  const seen = new Map();
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    let executable;
+    try { executable = resolveWindowsExecutable(candidate, realpath); } catch (error) {
+      if (error && error.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!names.has(path.win32.basename(executable).toLowerCase())) continue;
+    const key = executable.toLowerCase();
+    if (!seen.has(key)) seen.set(key, executable);
+  }
+  return seen.size ? Array.from(seen.values())[0] : null;
+}
+
 function filterVerifiedNodeProcesses(expectedNode, expectedScript, processes, realpath = fs.realpathSync.native) {
-  const node = resolveWindowsExecutable(expectedNode, realpath);
-  const script = resolveWindowsExecutable(expectedScript, realpath);
+  let node;
+  let script;
+  try {
+    node = resolveWindowsExecutable(expectedNode, realpath);
+    script = resolveWindowsExecutable(expectedScript, realpath);
+  } catch (error) {
+    // Stale installs and in-flight updates can remove the expected runtime or
+    // script after discovery. There is no verified process to return then.
+    if (error && error.code === 'ENOENT') return [];
+    throw error;
+  }
   const verified = [];
   for (const item of Array.isArray(processes) ? processes : []) {
     const process = validateProcessRecord(item, { requireCommandLine: true, requireNativeArguments: true });
     if (process.Name.toLowerCase() !== 'node.exe') continue;
-    const executable = resolveWindowsExecutable(process.ExecutablePath, realpath);
+    let executable;
+    try { executable = resolveWindowsExecutable(process.ExecutablePath, realpath); } catch (error) {
+      if (error && error.code === 'ENOENT') continue;
+      throw error;
+    }
     if (!sameWindowsFilePath(executable, node)) continue;
     const args = process.Arguments;
     let entryIndex = 1;
@@ -257,7 +305,12 @@ function assertDaemonTerminationIdentity(options) {
   if (!status || typeof status !== 'object') throw new Error('daemon status is missing');
   const profileId = status.profile && status.profile.id;
   if (profileId !== options.expectedProfileId) throw new Error('daemon profile mismatch');
-  if (status.privilege !== 'standard') throw new Error('daemon privilege is not standard');
+  if (status.privilege !== 'standard' && status.privilege !== 'elevated') {
+    throw new Error('daemon privilege is invalid');
+  }
+  if (options.expectedPrivilege && status.privilege !== options.expectedPrivilege) {
+    throw new Error(`daemon privilege mismatch: expected ${options.expectedPrivilege}, got ${status.privilege}`);
+  }
   const pid = status.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('daemon status PID is invalid');
   const listenerPids = Array.from(new Set((options.listenerPids || []).map(Number)));
@@ -282,6 +335,7 @@ module.exports = {
   assertDaemonServiceIdentity,
   assertDaemonTerminationIdentity,
   assertSameProcessIdentity,
+  detectWindowsPrivilege,
   assertStandardWindowsPrivilege,
   assertVerifiedNodeProcess,
   buildNativeProcessQuery,
@@ -291,6 +345,7 @@ module.exports = {
   resolveWindowsExecutable,
   sameWindowsPath,
   selectRunningProfileBinary,
+  selectPreferredDiscoveredBinary,
   selectUniqueDiscoveredBinary,
   selectVerifiedProcessPids,
 };

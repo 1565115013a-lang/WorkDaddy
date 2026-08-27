@@ -25,8 +25,10 @@ const nativeProcess = (process, args) => ({
   Arguments: args,
 });
 
-test('privilege probe accepts only an explicit standard-user result', () => {
+test('privilege probe distinguishes standard and elevated modes', () => {
   const fake = (result) => () => result;
+  assert.equal(boundary.detectWindowsPrivilege(fake({ status: 0, stdout: 'False\r\n' })), 'standard');
+  assert.equal(boundary.detectWindowsPrivilege(fake({ status: 0, stdout: 'True\r\n' })), 'elevated');
   assert.equal(boundary.assertStandardWindowsPrivilege(fake({ status: 0, stdout: 'False\r\n' })), 'standard');
   assert.throws(() => boundary.assertStandardWindowsPrivilege(fake({ status: 0, stdout: 'True\r\n' })), /管理员|elevated/i);
   assert.throws(() => boundary.assertStandardWindowsPrivilege(fake({ status: 0, stdout: '' })), /确认|determine/i);
@@ -110,6 +112,31 @@ test('disk discovery rejects duplicate current-profile installations', () => {
   );
 });
 
+test('dormant duplicate installations use discovery priority while missing paths are ignored', () => {
+  const resolveMissing = (value) => {
+    if (String(value).includes('missing')) {
+      const error = new Error('not found');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return path.win32.normalize(value);
+  };
+  assert.equal(
+    boundary.selectPreferredDiscoveredBinary(
+      new Set(['workbuddy.exe']),
+      ['C:\\missing\\WorkBuddy.exe', 'D:\\Preferred\\WorkBuddy.exe', 'E:\\Old\\WorkBuddy.exe'],
+      resolveMissing
+    ),
+    path.win32.normalize('D:\\Preferred\\WorkBuddy.exe')
+  );
+  assert.deepEqual(
+    boundary.filterVerifiedNodeProcesses(
+      'C:\\missing\\node.exe', 'C:\\missing\\daemon.js', [], resolveMissing
+    ),
+    []
+  );
+});
+
 test('daemon status identity binds metadata, listener PID, node path, and script path', () => {
   const expectedNode = 'C:\\Node\\node.exe';
   const expectedScript = 'C:\\WorkDaddy\\scripts\\daemon.js';
@@ -120,25 +147,33 @@ test('daemon status identity binds metadata, listener PID, node path, and script
   const status = { version: '1.0.14', buildId: 'build-a', profile: { id: 'workbuddy-cn' }, privilege: 'standard', pid: 301 };
   const input = {
     status,
-    expectedVersion: '1.0.14', expectedBuildId: 'build-a', expectedProfileId: 'workbuddy-cn',
+    expectedVersion: '1.0.14', expectedBuildId: 'build-a', expectedProfileId: 'workbuddy-cn', expectedPrivilege: 'standard',
     listenerPids: [301], nodeProcesses: [process], expectedNode, expectedScript, realpath: resolveWindows,
   };
   assert.equal(boundary.assertDaemonServiceIdentity(input).ProcessId, 301);
+  assert.equal(
+    boundary.assertDaemonServiceIdentity({
+      ...input,
+      expectedPrivilege: 'elevated',
+      status: { ...status, privilege: 'elevated' },
+    }).ProcessId,
+    301
+  );
   assert.throws(() => boundary.assertDaemonServiceIdentity({ ...input, status: { ...status, buildId: 'old' } }), /build/i);
   assert.throws(() => boundary.assertDaemonServiceIdentity({ ...input, listenerPids: [999] }), /listener|监听|PID/i);
   assert.throws(() => boundary.assertDaemonServiceIdentity({ ...input, status: { ...status, privilege: 'elevated' } }), /privilege|权限/i);
   assert.throws(() => boundary.assertDaemonServiceIdentity({ ...input, status: { ...status, pid: '301' } }), /PID/i);
 });
 
-test('Windows entry points fail closed and expose a standard daemon identity', () => {
+test('Windows entry points detect and expose a matching daemon privilege mode', () => {
   assert.equal(fs.existsSync(path.join(scriptsDir, 'win-inject-helper.js')), false);
-  assert.match(launcherSource, /assertStandardWindowsPrivilege/);
-  assert.match(watchdogSource, /assertStandardWindowsPrivilege/);
-  assert.match(daemonSource, /assertStandardWindowsPrivilege/);
+  assert.match(launcherSource, /detectWindowsPrivilege/);
+  assert.match(watchdogSource, /detectWindowsPrivilege/);
+  assert.match(daemonSource, /detectWindowsPrivilege/);
   assert.match(daemonSource, /privilege:\s*DAEMON_PRIVILEGE/);
   assert.match(daemonSource, /pid:\s*process\.pid/);
   assert.match(launcherSource, /assertDaemonServiceIdentity/);
-  const privilegeProbe = launcherSource.indexOf('assertStandardWindowsPrivilege();');
+  const privilegeProbe = launcherSource.indexOf('detectWindowsPrivilege();');
   const telemetryImport = launcherSource.indexOf('const { captureMessage');
   assert.ok(privilegeProbe >= 0 && telemetryImport > privilegeProbe);
   const privilegeFailure = launcherSource.slice(privilegeProbe, telemetryImport);
@@ -164,6 +199,7 @@ test('Windows entry points fail closed and expose a standard daemon identity', (
   assert.match(watchdogSource, /if \(state\.kind === 'stale'\) \{[\s\S]*removePidFileIf\(state\.pid\)/);
   assert.match(launcherSource, /if \(watchdog\.kind === 'stale'\) \{[\s\S]*removeWatchdogPidIf\(watchdog\.pid\)/);
   assert.match(launcherSource, /queryNodeProcesses\(nodeBin, \[pid\]\)/);
+  assert.match(launcherSource, /allowLowerPrivilege/);
   assert.match(watchdogSource, /ExecutablePath -ieq/);
   assert.doesNotMatch(launcherSource + daemonSource, /Start-Process[^\n]*-Verb\s+RunAs/i);
   assert.doesNotMatch(installerSource, /请以管理员身份运行/);

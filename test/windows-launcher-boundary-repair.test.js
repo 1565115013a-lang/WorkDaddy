@@ -113,9 +113,13 @@ test('lifecycle entry matching rejects unexpected trailing arguments', () => {
 test('launcher enumerates exact lifecycle entries and never kills process trees', () => {
   assert.doesNotMatch(launcherSource, /taskkill[^\r\n]*['"]\/T['"]/i);
   assert.doesNotMatch(launcherSource, /includeTree/);
-  assert.match(launcherSource, /queryNodeProcesses\(nodeBin\)/);
+  assert.match(launcherSource, /queryNodeProcesses\(nodeBin/);
   assert.match(launcherSource, /uniqueNodeProcess\(nodeBin, WATCHDOG_SCRIPT\)/);
   assert.match(launcherSource, /uniqueNodeProcess\(nodeBin, DAEMON_SCRIPT\)/);
+  assert.match(launcherSource, /queryNodeProcesses\(nodeBin, null, path\.basename\(expectedScript\)\)/);
+  assert.match(launcherSource, /watchdog\.pid 已从陈旧 PID=/);
+  assert.match(launcherSource, /普通权限 launcher 复用现有服务/);
+  assert.match(launcherSource, /exactDaemonStatus\(nodeBin, status, true\)/);
   assert.match(launcherSource, /assertSameProcessIdentity/);
   assert.match(launcherSource, /requireCurrentOwner:\s*true/);
   for (const source of [launcherSource, daemonSource, watchdogSource]) {
@@ -142,6 +146,7 @@ test('daemon termination authorization is bound to current profile status and li
   const input = {
     status: { pid: 716, profile: { id: 'workbuddy-cn' }, privilege: 'standard' },
     expectedProfileId: 'workbuddy-cn',
+    expectedPrivilege: 'standard',
     listenerPids: [716],
     expectedNode: node,
     expectedScript: script,
@@ -216,6 +221,16 @@ test('Windows launcher and watchdog recover a PID file whose process is gone', (
   assert.match(watchdogSource, /existing\.kind === 'stale'[\s\S]*removePidFileIf\(existing\.pid\)/);
 });
 
+test('Windows launcher reconciles a reused PID file to an exact watchdog', () => {
+  const stateSource = launcherSource.slice(
+    launcherSource.indexOf('function watchdogState'),
+    launcherSource.indexOf('function validateDaemonProcess')
+  );
+  assert.match(stateSource, /queryNodeProcesses\(nodeBin, \[pid\], path\.basename\(WATCHDOG_SCRIPT\)\)/);
+  assert.match(stateSource, /if \(exact\) \{[\s\S]*fs\.writeFileSync\(WATCHDOG_PID_FILE, String\(exact\.ProcessId\)/);
+  assert.match(stateSource, /watchdog\.pid 在修复前发生变化/);
+});
+
 test('Windows process queries are scoped to the selected Node runtime', () => {
   assert.match(launcherSource, /ExecutablePath -ieq/);
   assert.match(watchdogSource, /ExecutablePath -ieq/);
@@ -262,7 +277,7 @@ test('Windows cold-start guards an already running WorkBuddy and sends a native 
 });
 
 test('Windows daemon repairs only missing cwd directories with stored session payloads', () => {
-  assert.match(daemonSource, /const DAEMON_VERSION = '1\.1\.0'/);
+  assert.match(daemonSource, /const DAEMON_VERSION = '1\.1\.1'/);
   assert.match(daemonSource, /function sessionPayloadExists\(wbHome, sessionId\)/);
   assert.match(daemonSource, /function createDirectoryNoFollow\(directory\)/);
   assert.match(daemonSource, /repairMissingSessionWorkspaces\(\)\.catch/);

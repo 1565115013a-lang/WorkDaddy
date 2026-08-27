@@ -11,7 +11,7 @@ const scriptsDir = path.join(root, 'scripts');
 const helperPath = path.join(scriptsDir, 'windows-process-boundary.ps1');
 const lifecycleScripts = ['install-win.ps1', 'uninstall-win.ps1', 'apply-update.ps1'];
 
-test('PowerShell lifecycle scripts reject elevation before side effects', () => {
+test('PowerShell lifecycle scripts detect privilege mode before side effects', () => {
   for (const name of lifecycleScripts) {
     const source = fs.readFileSync(path.join(scriptsDir, name), 'utf8');
     const probe = source.indexOf('IsInRole');
@@ -78,6 +78,11 @@ test('PowerShell source validates owner, exact launcher token, PID, and listener
   assert.match(helper, /\[string\]\$Status\.version -cne \$ExpectedVersion/);
   assert.match(helper, /Get-UniqueNodeProcessForScript -ExpectedScript \$ExpectedWatchdogScript/);
   assert.match(helper, /Get-UniqueNodeProcessForScript -ExpectedScript \$ExpectedDaemonScript -ExpectedParentProcessId/);
+  assert.match(helper, /CommandLine LIKE '%\$scriptName%'/);
+  assert.match(helper, /目标 Node 入口脚本名称无效/);
+  assert.match(helper, /pidProbeError/);
+  assert.match(helper, /replacementWatchdog/);
+  assert.match(helper, /Stop the verified watchdog before taking the daemon\/listener snapshot/);
   assert.match(helper, /Stop-VerifiedProcess/);
   assert.match(helper, /function Stop-VerifiedWorkBuddyProcesses/);
   assert.match(helper, /多个 WorkBuddy 安装正在运行/);

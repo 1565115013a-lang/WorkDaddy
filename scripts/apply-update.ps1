@@ -14,12 +14,9 @@ try {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-  if ($isElevated -ne $false) {
-    [Console]::Error.WriteLine('拒绝以管理员权限运行 WorkDaddy 更新脚本；请使用普通用户终端。')
-    exit 5
-  }
+  $env:WBSWITCH_PRIVILEGE_MODE = if ($isElevated) { 'elevated' } else { 'standard' }
 } catch {
-  [Console]::Error.WriteLine('无法确认当前 PowerShell 为普通用户权限；更新已停止。')
+  [Console]::Error.WriteLine('无法确认当前 PowerShell 的 Windows 权限模式；更新已停止。')
   exit 5
 }
 

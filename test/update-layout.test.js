@@ -388,9 +388,11 @@ test('daemon settings writes tolerate transient Windows file locks', () => {
   assert.ok(helperStart >= 0 && helperEnd > helperStart, 'atomic replacement helper must exist');
   const helper = daemon.slice(helperStart, helperEnd);
   assert.match(helper, /\.wbs-tmp-\$\{process\.pid\}-\$\{Date\.now\(\)\}-\$\{crypto\.randomBytes\(/);
-  assert.match(helper, /process\.platform === 'win32' \? 15 : 1/);
+  assert.match(helper, /process\.platform === 'win32' \? 80 : 1/);
   assert.match(helper, /\['EPERM', 'EACCES', 'EBUSY'\]/);
-  assert.match(helper, /sleepSync\(75\)/);
+  assert.match(helper, /sleepSync\(Math\.min\(250, 50 \+ attempt \* 10\)\)/);
+  assert.match(helper, /chmodSync\(file, 0o666\)/);
+  assert.match(helper, /unlinkSync\(tmp\)/);
   assert.doesNotMatch(helper, /unlinkSync\(file\)|rmSync\(file\)/);
 
   const settingsStart = daemon.indexOf('function writeWorkbuddySettings(');
@@ -567,6 +569,9 @@ test('Windows Setup stops a verified lifecycle before replacing bundled Node', (
   assert.match(installer, /ExtractTemporaryFile\('windows-process-boundary\.ps1'\)/);
   assert.match(installer, /ewWaitUntilTerminated/);
   assert.match(prepare, /Stop-VerifiedWorkDaddyLifecycle/);
+  assert.match(prepare, /\$privilege = if \(\$principal\.IsInRole/);
+  assert.doesNotMatch(prepare, /Refusing to prepare WorkDaddy installation with elevated privileges/);
+  assert.match(installer, /ResultCode = 5/);
   assert.match(prepare, /WorkDaddy-prepare-install\.log/);
   assert.match(prepare, /-ExpectedWatchdogScript \(Join-Path \$AppDir 'scripts\\watchdog\.js'\)/);
   assert.match(verify, /prepare-win-install\.ps1/);
