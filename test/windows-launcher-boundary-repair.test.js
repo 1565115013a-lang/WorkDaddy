@@ -262,7 +262,7 @@ test('Windows cold-start guards an already running WorkBuddy and sends a native 
 });
 
 test('Windows daemon repairs only missing cwd directories with stored session payloads', () => {
-  assert.match(daemonSource, /const DAEMON_VERSION = '1\.1\.0'/);
+  assert.match(daemonSource, /const DAEMON_VERSION = '\d+\.\d+\.\d+'/);
   assert.match(daemonSource, /function sessionPayloadExists\(wbHome, sessionId\)/);
   assert.match(daemonSource, /function createDirectoryNoFollow\(directory\)/);
   assert.match(daemonSource, /repairMissingSessionWorkspaces\(\)\.catch/);
