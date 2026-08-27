@@ -205,21 +205,23 @@ function listModelBackups(dataDir) {
     const backupId = name.slice(0, -5);
     try {
       const { record } = readModelBackup(dataDir, backupId);
-      const summary = sanitizeModel(record.model, { revealKey: true });
-      records.push({ backupId, createdAt: record.createdAt || null, ...summary });
+      const model = record.model;
+      const id = typeof model.id === 'string' ? model.id.trim() : '';
+      const summary = sanitizeModel(model, { revealKey: true });
+      records.push({ backupId, createdAt: record.createdAt || null, ...summary, id });
     } catch (_) {
       // Ignore damaged files in the list; an explicit enable/delete still reports an error.
     }
   }
   records.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-  const groups = {};
+  const groups = new Map();
   for (const record of records) {
+    // 分组严格依据原始模型配置的 id（模型名），不能使用用户自定义 name。
     const key = record.id || '(未命名模型)';
-    // 组名用模型名（id）：组内每个备份的自定义 name 可能不同，只有模型名一致
-    if (!groups[key]) groups[key] = { id: key, name: key, items: [] };
-    groups[key].items.push(record);
+    if (!groups.has(key)) groups.set(key, { id: key, items: [] });
+    groups.get(key).items.push(record);
   }
-  return Object.values(groups);
+  return Array.from(groups.values());
 }
 
 function listOfficialModels(file = workbuddyModelsFile()) {
@@ -286,13 +288,15 @@ function editModelBackup(dataDir, backupId, patch) {
   const { record } = readModelBackup(dataDir, backupId);
   const input = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
   const model = Object.assign({}, record.model);
-  for (const field of ['name', 'url', 'apiKey']) {
+  // 模型名对应配置里的 id（例如 deepseek-v4-flash），name 是用户自定义的显示名称；两者都允许编辑。
+  for (const field of ['id', 'name', 'url', 'apiKey']) {
     if (!Object.prototype.hasOwnProperty.call(input, field)) continue;
     if (typeof input[field] !== 'string' || input[field].length > 20000) throw new Error(`模型${field}格式无效`);
     model[field] = input[field];
   }
   const modelId = String(model.id || model.name || '').trim();
   if (!modelId) throw new Error('模型备份缺少 id/name，无法保存');
+  model.id = modelId;
   if (!String(model.name || '').trim()) model.name = modelId;
   const updated = Object.assign({}, record, { model });
   writeModelBackup(dataDir, updated);
@@ -394,7 +398,9 @@ function canonicalWorkspace(cwd) {
   value = path.posix.normalize(value);
   if (value === '.') return '';
   if (value.length > 1) value = value.replace(/\/+$/, '');
-  return IS_WIN ? value.toLowerCase() : value;
+  // Windows filesystem matching is case-insensitive, but this key is also
+  // displayed to users and must retain WorkBuddy's original path spelling.
+  return value;
 }
 
 function ensureAutoCopyMeta(meta) {
@@ -531,6 +537,27 @@ function getAutoCopySession(dataDir, uid, sessionId) {
   return { lineageId: lineageId || null, enabled: !!(lineage && lineage.enabled !== false) };
 }
 
+// Return all persisted session ids for one account in a lineage.  A lineage
+// should have at most one live session per uid, but keeping the full list lets
+// the copier repair stale mappings without creating another row.
+function getAutoCopySessionMembers(dataDir, lineageId, uid) {
+  const config = readAutoCopyConfig(dataDir);
+  const lineage = config.sessions[String(lineageId || '')];
+  if (!lineage || !Array.isArray(lineage.members)) return [];
+  const targetUid = uid === undefined || uid === null ? null : String(uid);
+  const seen = new Set();
+  const result = [];
+  for (const member of lineage.members) {
+    if (!member || (targetUid !== null && String(member.uid || '') !== targetUid)) continue;
+    const id = String(member.id || '').trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  }
+  return result;
+}
+
 function ensureAutoCopySession(dataDir, uid, sessionId) {
   const meta = readMeta(dataDir);
   const config = ensureAutoCopyMeta(meta);
@@ -565,6 +592,29 @@ function addAutoCopySessionMember(dataDir, lineageId, uid, sessionId) {
   }
   config.sessionIndex[sourceUid][id] = String(lineageId);
   addLineageMember(lineage, sourceUid, id);
+  writeMeta(dataDir, meta);
+  return true;
+}
+
+// Remove only one member from a lineage.  Unlike removeAutoCopySession this
+// intentionally leaves the lineage and other account members intact.
+function removeAutoCopySessionMember(dataDir, lineageId, uid, sessionId) {
+  const meta = readMeta(dataDir);
+  const config = ensureAutoCopyMeta(meta);
+  const id = String(lineageId || '').trim();
+  const sourceUid = String(uid || '').trim();
+  const sessionIdValue = String(sessionId || '').trim();
+  const lineage = config.sessions[id];
+  if (!lineage || !sourceUid || !sessionIdValue) return false;
+  const before = Array.isArray(lineage.members) ? lineage.members.length : 0;
+  lineage.members = (lineage.members || []).filter((member) => !(member && String(member.uid || '') === sourceUid && String(member.id || '') === sessionIdValue));
+  if (config.sessionIndex[sourceUid] && config.sessionIndex[sourceUid][sessionIdValue] === id) {
+    delete config.sessionIndex[sourceUid][sessionIdValue];
+    if (!Object.keys(config.sessionIndex[sourceUid]).length) delete config.sessionIndex[sourceUid];
+  }
+  const mappingKey = autoCopyRuleKey(id, sourceUid);
+  if (config.copies[mappingKey] && String(config.copies[mappingKey].targetId || '') === sessionIdValue) delete config.copies[mappingKey];
+  if (before === lineage.members.length) return false;
   writeMeta(dataDir, meta);
   return true;
 }
@@ -872,6 +922,8 @@ function listAccounts(dataDir) {
         item.nickname = acct.nickname || '';
         item.phone = acct.phoneNumber || '';
         item.uin = acct.uin || '';
+        item.type = typeof acct.type === 'string' ? acct.type : '';
+        item.enterpriseName = typeof acct.enterpriseName === 'string' ? acct.enterpriseName.trim() : '';
       }
       if (j.auth) {
         item.tokenExpiresAt = j.auth.expiresAt || null;
@@ -995,8 +1047,10 @@ module.exports = {
   getAutoCopyRules,
   setAutoCopyRule,
   getAutoCopySession,
+  getAutoCopySessionMembers,
   ensureAutoCopySession,
   addAutoCopySessionMember,
+  removeAutoCopySessionMember,
   moveAutoCopySession,
   removeAutoCopySession,
   removeAutoCopyAccount,

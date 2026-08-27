@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const { extractCreditSegments, sortCreditSegments, mergeCreditSegments } = require('../scripts/credit-segments.js');
+const { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS } = require('../scripts/credit-segments.js');
 const { buildCreditResourceBody } = require('../scripts/credit-resource-queries.js');
 
 test('extracts each expiring account as an independent credit segment', () => {
@@ -74,4 +74,44 @@ test('daemon calls the v2 all-resource billing endpoint', () => {
   const daemon = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'daemon.js'), 'utf8');
   assert.match(daemon, /\/v2\/billing\/meter\/get-user-resource/);
   assert.doesNotMatch(daemon, /fetch\(`\$\{apiHost\}\/billing\/meter\/get-user-resource/);
+});
+
+test('parses enterprise usage: remaining = limitNum - credit, cycleResetTime carried', () => {
+  const parsed = parseEnterpriseUsage({ code: 0, data: { credit: 1500, limitNum: 2000, cycleResetTime: '2026-09-01 00:00:00' } }, '企业配额');
+  assert.equal(parsed.unlimited, false);
+  assert.equal(parsed.credits, 500);
+  assert.equal(parsed.total, 2000);
+  assert.equal(parsed.count, 1);
+  assert.equal(parsed.cycleResetTime, new Date('2026-09-01 00:00:00').getTime());
+  assert.equal(parsed.segments.length, 1);
+  assert.equal(parsed.segments[0].remaining, 500);
+  assert.equal(parsed.segments[0].total, 2000);
+  assert.equal(parsed.segments[0].source, '企业配额');
+});
+
+test('parses unlimited enterprise usage (limitNum === -1) without a numeric balance', () => {
+  const parsed = parseEnterpriseUsage({ data: { credit: 0, limitNum: -1, cycleResetTime: '' } }, '企业配额');
+  assert.equal(parsed.unlimited, true);
+  assert.equal(parsed.credits, 0);
+  assert.equal(parsed.total, 0);
+  assert.deepEqual(parsed.segments, []);
+});
+
+test('rejects malformed enterprise usage payloads', () => {
+  assert.equal(parseEnterpriseUsage(null, 'x'), null);
+  assert.equal(parseEnterpriseUsage({}, 'x'), null);
+  assert.equal(parseEnterpriseUsage({ data: { credit: 'abc', limitNum: 'oops' } }, 'x'), null);
+});
+
+test('enterprise editions match the official ENTERPRISE_EDITIONS set', () => {
+  assert.deepEqual(ENTERPRISE_EDITIONS, ['ultimate', 'exclusive']);
+});
+
+test('daemon branches to the enterprise endpoint for enterprise accounts', () => {
+  const daemon = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'daemon.js'), 'utf8');
+  assert.match(daemon, /\/v2\/billing\/meter\/get-enterprise-user-usage/);
+  assert.match(daemon, /ENTERPRISE_EDITIONS/);
+  assert.match(daemon, /x-enterprise-id/);
+  assert.match(daemon, /x-tenant-id/);
+  assert.match(daemon, /parseEnterpriseUsage/);
 });

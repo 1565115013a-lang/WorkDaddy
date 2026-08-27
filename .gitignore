@@ -6,7 +6,7 @@ node_modules/
 npm-debug.log*
 
 # 构建产物与安装包（GitHub Release Assets 单独上传，不入库）
-/WorkDaddy.app/
+WorkDaddy.app
 /release/
 
 # 本地运行数据与日志

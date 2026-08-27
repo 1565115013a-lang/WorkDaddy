@@ -29,10 +29,69 @@ const SHARED_DATA_DIR = IS_WIN
 const DATA_DIR = process.env.WBSWITCH_DATA_DIR || (PROFILE_ID === 'workbuddy-cn'
   ? SHARED_DATA_DIR : path.join(SHARED_DATA_DIR, 'profiles', PROFILE_ID));
 const OUTBOX_DIR = path.join(DATA_DIR, 'telemetry', 'outbox');
+const TELEMETRY_SETTINGS_FILE = path.join(DATA_DIR, 'telemetry-settings.json');
 const MAX_OUTBOX_FILES = 50;
 const MAX_FLUSH_FILES = 1;
 const REQUEST_TIMEOUT_MS = 3000;
 const MAX_TEXT = 6000;
+const FORCE_SEND_ATTEMPTS = 6;
+const FORCE_SEND_DELAYS_MS = [250, 500, 1000, 2000, 3000];
+
+function telemetrySettingsPath(env = process.env) {
+  const dataDir = String(env.WBSWITCH_DATA_DIR || DATA_DIR);
+  return path.join(dataDir, path.basename(TELEMETRY_SETTINGS_FILE));
+}
+
+function telemetryEnvironmentOverride(env = process.env) {
+  const value = String(env.WORKDADDY_TELEMETRY || '').trim();
+  if (value === '1') return true;
+  if (value === '0') return false;
+  return null;
+}
+
+function readTelemetrySetting(env = process.env) {
+  const override = telemetryEnvironmentOverride(env);
+  if (override !== null) return override;
+  try {
+    const value = JSON.parse(fs.readFileSync(telemetrySettingsPath(env), 'utf8'));
+    if (value && typeof value.enabled === 'boolean') return value.enabled;
+  } catch (_) {}
+  return true;
+}
+
+function telemetryEnabled(env = process.env) {
+  return readTelemetrySetting(env);
+}
+
+function setTelemetryEnabled(enabled, env = process.env) {
+  if (typeof enabled !== 'boolean') throw new TypeError('telemetry enabled must be boolean');
+  const file = telemetrySettingsPath(env);
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const temp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(temp, JSON.stringify({ enabled, updatedAt: new Date().toISOString() }) + '\n', { mode: 0o600 });
+  try { fs.chmodSync(temp, 0o600); } catch (_) {}
+  try {
+    fs.renameSync(temp, file);
+  } catch (error) {
+    // Windows refuses to rename over an existing destination. The setting is
+    // small and non-sensitive, so overwrite it only after the atomic attempt.
+    if (error && (error.code === 'EEXIST' || error.code === 'EPERM' || error.code === 'ENOTEMPTY')) {
+      try {
+        fs.copyFileSync(temp, file);
+        try { fs.chmodSync(file, 0o600); } catch (_) {}
+        fs.unlinkSync(temp);
+      } catch (replaceError) {
+        try { fs.unlinkSync(temp); } catch (_) {}
+        throw replaceError;
+      }
+    } else {
+      try { fs.unlinkSync(temp); } catch (_) {}
+      throw error;
+    }
+  }
+  return enabled;
+}
 
 function readVersion() {
   try {
@@ -134,7 +193,7 @@ function queueEvent(event) {
 }
 
 async function flushOutbox() {
-  if (process.env.WORKDADDY_TELEMETRY === '0') return;
+  if (!telemetryEnabled()) return;
   let files;
   try { files = fs.readdirSync(OUTBOX_DIR).filter((name) => name.endsWith('.json')).sort(); } catch (_) { return; }
   for (const name of files.slice(0, MAX_FLUSH_FILES)) {
@@ -185,15 +244,32 @@ function makeEvent({ stage, message, level = 'error', tags = {}, extra = {}, exc
   return event;
 }
 
-async function captureEvent(event) {
-  if (process.env.WORKDADDY_TELEMETRY === '0') return { disabled: true };
-  await flushOutbox();
+async function sendEventWithRetry(event, attempts = 1) {
+  const maxAttempts = Math.max(1, Math.min(FORCE_SEND_ATTEMPTS, Number(attempts) || 1));
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      await sendEvent(event);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, FORCE_SEND_DELAYS_MS[attempt] || 3000));
+      }
+    }
+  }
+  throw lastError || new Error('Sentry 上报失败');
+}
+
+async function captureEvent(event, { force = false, attempts = 1 } = {}) {
+  if (!force && !telemetryEnabled()) return { disabled: true };
+  if (!force) await flushOutbox();
   try {
-    await sendEvent(event);
+    await sendEventWithRetry(event, force ? attempts : 1);
     return { sent: true, eventId: event.event_id };
-  } catch (_) {
+  } catch (error) {
     queueEvent(event);
-    return { queued: true, eventId: event.event_id };
+    return { queued: true, sent: false, eventId: event.event_id, error: redactText(error && error.message) };
   }
 }
 
@@ -213,6 +289,8 @@ function parseArgs(argv) {
     if (!arg.startsWith('--')) continue;
     const key = arg.slice(2);
     if (key === 'dry-run') { args.dryRun = true; continue; }
+    if (key === 'force-send') { args.forceSend = true; continue; }
+    if (key === 'require-sent') { args.requireSent = true; continue; }
     args[key] = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : '';
   }
   return args;
@@ -233,12 +311,28 @@ async function cli() {
     process.stdout.write(JSON.stringify(event, null, 2) + '\n');
     return;
   }
-  const result = await captureEvent(event);
+  const result = await captureEvent(event, {
+    force: !!(args.forceSend || args.requireSent),
+    attempts: args.requireSent ? FORCE_SEND_ATTEMPTS : 1,
+  });
   process.stdout.write(JSON.stringify(result) + '\n');
+  if (args.requireSent && result.sent !== true) process.exitCode = 1;
 }
 
-module.exports = { captureMessage, captureException, flushOutbox, makeEvent };
+module.exports = {
+  captureMessage,
+  captureException,
+  flushOutbox,
+  makeEvent,
+  readTelemetrySetting,
+  setTelemetryEnabled,
+  telemetryEnvironmentOverride,
+  telemetryEnabled,
+};
 
 if (require.main === module) {
-  cli().catch(() => { process.exitCode = 0; });
+  cli().catch((error) => {
+    try { process.stderr.write(redactText(error && error.message) + '\n'); } catch (_) {}
+    process.exitCode = 1;
+  });
 }

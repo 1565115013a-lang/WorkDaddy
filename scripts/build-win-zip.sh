@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
-# WorkDaddy Windows 发布包打包脚本（在 macOS/Linux 上运行即可产出 Windows zip）
-# 产出：release/windows/WorkDaddy-<profile>-<ver>-win64.zip（只发布 WorkDaddy / WorkDaddy AI）
+# WorkDaddy Windows 安装暂存脚本（在 macOS/Linux/Windows Git Bash 上运行）
+# 产出的是供 build-win-installer.ps1 消费的临时 ZIP；Windows 正式发行只交付 Setup.exe，
+# 安装器完成后会删除该暂存 ZIP，旧 ZIP 仅由更新器兼容读取历史版本。
 # 可选：内置 node_modules/ws（面板 DevTools 代理依赖；无则代理功能降级，其余功能不受影响）
 set -euo pipefail
+
+# Git Bash on a clean Windows machine may expose a Microsoft Store python3
+# stub that exits without running Python.  Accept an explicit interpreter and
+# otherwise select the first candidate that can execute a tiny import check.
+PYTHON_BIN="${WORKDADDY_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys' >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$PYTHON_BIN" ]; then
+  echo "错误：缺少可用 Python（可设置 WORKDADDY_PYTHON 指向 python.exe）" >&2
+  exit 2
+fi
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
@@ -40,6 +58,34 @@ fi
 echo "==> profile: ${PROFILE}"
 echo "==> 版本: ${VERSION}"
 echo "==> 产物: ${OUT}"
+
+# 发行包必须自带固定 Node 运行时；不能把 WorkBuddy 的私有运行时目录当成用户环境依赖。
+# 版本、下载地址和校验值与 Dream Skin 的 Windows 打包策略一致，允许通过
+# WORKDADDY_NODE_ARCHIVE 指向预下载压缩包以支持离线/受限网络构建。
+NODE_VERSION="${WORKDADDY_NODE_VERSION:-22.23.1}"
+NODE_ARCHIVE="node-v${NODE_VERSION}-win-x64.zip"
+NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
+NODE_SHA256="7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29"
+NODE_CACHE="${WORKDADDY_NODE_CACHE:-$DIR/release/.cache}"
+mkdir -p "$NODE_CACHE"
+NODE_ARCHIVE_PATH="${WORKDADDY_NODE_ARCHIVE:-$NODE_CACHE/$NODE_ARCHIVE}"
+if [ ! -f "$NODE_ARCHIVE_PATH" ]; then
+  echo "==> 下载 Node.js v${NODE_VERSION} Windows x64 运行时"
+  curl --fail --location --retry 3 --retry-delay 2 --silent --show-error "$NODE_URL" -o "$NODE_ARCHIVE_PATH"
+fi
+if command -v shasum >/dev/null 2>&1; then
+  NODE_ACTUAL_SHA256="$(shasum -a 256 "$NODE_ARCHIVE_PATH" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  NODE_ACTUAL_SHA256="$(sha256sum "$NODE_ARCHIVE_PATH" | awk '{print $1}')"
+else
+  echo "错误：缺少 shasum/sha256sum，无法验证 Node.js 运行时" >&2
+  exit 2
+fi
+if [ "$NODE_ACTUAL_SHA256" != "$NODE_SHA256" ]; then
+  echo "错误：Node.js 运行时 SHA-256 不匹配，期望 ${NODE_SHA256}，实际 ${NODE_ACTUAL_SHA256}" >&2
+  exit 2
+fi
+echo "==> Node.js 运行时校验通过: ${NODE_ARCHIVE}"
 
 # 1) 内置 ws（面板 DevTools 代理需要）；已存在则跳过
 if [ ! -d scripts/node_modules/ws ]; then
@@ -79,13 +125,58 @@ if [ -f "$DIR/安装失败自主解决提示词.txt" ]; then
 fi
 # 3.2) scripts\ 本体（含 node_modules/ws、builtin）
 cp -R scripts "$STAGE/scripts"
+# Windows cmd.exe expects CRLF in batch files.  Normalise every staged .cmd
+# after copying so a source edit made on macOS cannot leave a mixed-ending
+# launcher that silently stops before invoking Node.
+"$PYTHON_BIN" - "$(winpath "$STAGE")" <<'PY'
+import os
+import sys
+
+stage = sys.argv[1]
+for root, _, files in os.walk(stage):
+    for name in files:
+        if not name.lower().endswith('.cmd'):
+            continue
+        path = os.path.join(root, name)
+        with open(path, 'rb') as f:
+            text = f.read().decode('utf-8-sig')
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write(text.replace('\n', '\r\n'))
+PY
+# 3.2b) 只提取 Node 可执行文件和许可证，避免把完整开发压缩包放进用户包。
+"$PYTHON_BIN" - "$(winpath "$NODE_ARCHIVE_PATH")" "$(winpath "$STAGE/scripts/runtime/node")" <<'PY'
+import os
+import sys
+import zipfile
+
+archive_path, destination = sys.argv[1:]
+with zipfile.ZipFile(archive_path) as archive:
+    names = archive.namelist()
+    root = next((name.split('/')[0] for name in names if name.endswith('/node.exe')), None)
+    if not root:
+        raise SystemExit('Node.js archive missing node.exe')
+    os.makedirs(destination, exist_ok=True)
+    for entry_name, output_name in ((f'{root}/node.exe', 'node.exe'), (f'{root}/LICENSE', 'LICENSE')):
+        try:
+            info = archive.getinfo(entry_name)
+        except KeyError:
+            raise SystemExit(f'Node.js archive missing {entry_name}')
+        if info.file_size <= 0:
+            raise SystemExit(f'Node.js archive entry is empty: {entry_name}')
+        with archive.open(info) as source, open(os.path.join(destination, output_name), 'wb') as target:
+            target.write(source.read())
+PY
+test -s "$STAGE/scripts/runtime/node/node.exe"
+test -s "$STAGE/scripts/runtime/node/LICENSE"
+echo "==> 内置 Node.js: scripts/runtime/node/node.exe"
 # 3.2a) 打包期 profile 替换（统一用 python3，mac/win 均可用）：
 #       1) win-launcher.js 默认 profile
 #       2) 三个 ps1 仅替换 param 默认值处的占位符（[string]$Profile = '...'），
 #          绝不能全局替换 __WBS_DEFAULT_PROFILE__ —— 否则判断条件
 #          $Profile -eq '__WBS_DEFAULT_PROFILE__' 会被替换成 $Profile -eq 'workbuddy-ai'，
 #          让 AI 包默认 profile 自身触发"回退到 workbuddy-cn"，桌面快捷方式名/安装目录全部错乱。
-PROFILE="$PROFILE" BUILD_VERSION="$VERSION" python3 - "$(winpath "$STAGE/scripts")" <<'PY'
+PROFILE="$PROFILE" BUILD_VERSION="$VERSION" "$PYTHON_BIN" - "$(winpath "$STAGE/scripts")" <<'PY'
 import os
 import re
 import sys
@@ -174,7 +265,7 @@ find "$STAGE" -name '.DS_Store' -delete 2>/dev/null || true
 #        数据目录 %APPDATA%\WorkDaddy、WorkDaddy.ico 不随包变，保持原样。）
 if [ "$PROFILE" = "workbuddy-ai" ]; then
   echo "==> AI 包品牌化：cmd 描述 / 桌面图标 / 安装目录名 → WorkDaddy AI"
-  python3 - "$(winpath "$STAGE")" <<'PY'
+"$PYTHON_BIN" - "$(winpath "$STAGE")" <<'PY'
 import os
 import sys
 
@@ -184,13 +275,16 @@ def patch(path, pairs):
     p = os.path.join(stage, path)
     if not os.path.exists(p):
         return
-    with open(p, 'r', encoding='utf-8') as f:
-        s = f.read()
+    with open(p, 'rb') as f:
+        raw = f.read()
+    has_bom = raw.startswith(b'\xef\xbb\xbf')
+    s = raw.decode('utf-8-sig')
     for old, new in pairs:
         if old in s:
             s = s.replace(old, new)
-    with open(p, 'w', encoding='utf-8', newline='') as f:
-        f.write(s)
+    encoded = s.encode('utf-8')
+    with open(p, 'wb') as f:
+        f.write((b'\xef\xbb\xbf' if has_bom else b'') + encoded)
 
 # zip 根两个入口 cmd
 patch('Install-WorkDaddy.cmd', [
@@ -241,8 +335,8 @@ echo "==> 非 ASCII 文件名守护通过（仅包含批准的故障排查提示
 # 3.4) 打包：优先使用 Python zipfile，确保中文提示词写入 UTF-8 文件名标记。
 #      macOS 自带 zip 会把中文文件名按本地代码页写入，Windows/Python 解压后会出现乱码。
 #      没有 Python 且需要中文提示词时直接失败，避免生成名字损坏的发布包。
-if command -v python3 >/dev/null 2>&1; then
-  python3 - "$(winpath "$STAGE")" "$(winpath "$DIR/$OUT")" <<'PY'
+if [ -n "$PYTHON_BIN" ]; then
+  "$PYTHON_BIN" - "$(winpath "$STAGE")" "$(winpath "$DIR/$OUT")" <<'PY'
 import os
 import sys
 import zipfile
@@ -262,7 +356,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(source, arcname)
 PY
 elif [ -f "$STAGE/安装失败自主解决提示词.txt" ]; then
-  echo "==> ERROR: 包含中文故障排查提示词，但当前环境没有 python3，无法生成 UTF-8 ZIP。"
+  echo "==> ERROR: 包含中文故障排查提示词，但当前环境没有可用 Python，无法生成 UTF-8 ZIP。"
   rm -rf "$STAGE" 2>/dev/null || true
   exit 4
 elif command -v zip >/dev/null 2>&1; then
@@ -280,8 +374,5 @@ if [ -d "$BUILTIN_SRC" ] && [ -d scripts/builtin ]; then
   rm -rf scripts/builtin 2>/dev/null || true
 fi
 
-echo "==> 完成: $(ls -lh "$OUT" | awk '{print $5}')"
-echo ""
-echo "在 Windows 上：解压 zip 后，在顶层直接双击 Install-WorkDaddy.cmd 一键安装（自动建桌面图标并清理旧自启）；"
-echo "日常启动双击 Start-WorkDaddy.cmd 或桌面 WorkDaddy 图标。"
-echo "每 6 小时自动检查更新（GitHub Releases 需同时上传 .dmg 与 -win64.zip 两个资产，Windows 自动静默升级）。"
+echo "==> 安装暂存包完成: $(ls -lh "$OUT" | awk '{print $5}')"
+echo "==> 下一步由 build-win-installer.ps1 生成 Setup.exe；正式发行不保留该 ZIP。"

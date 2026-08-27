@@ -6,7 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const repoRoot = path.resolve(__dirname, '..');
-const read = (name) => fs.readFileSync(path.join(repoRoot, 'scripts', name), 'utf8');
+const read = (name) => fs.readFileSync(path.join(repoRoot, 'scripts', name), 'utf8').replace(/\r\n/g, '\n');
 const lib = require(path.join(repoRoot, 'scripts', 'lib.js'));
 
 test('Windows updater launches the installed scripts launcher', () => {
@@ -15,6 +15,33 @@ test('Windows updater launches the installed scripts launcher', () => {
   assert.match(script, /Join-Path\s+\$AppDir\s+'scripts\\launcher-hidden\.vbs'/);
   assert.match(script, /Start-Process[\s\S]*-ErrorAction Stop/);
   assert.match(script, /Invoke-RestMethod[\s\S]*\/api\/status/);
+});
+
+test('Windows updater prefers profile Setup.exe and keeps ZIP compatibility', () => {
+  const daemon = read('daemon.js');
+  const update = read('apply-update.ps1');
+  assert.match(daemon, /profileSetup/);
+  assert.match(daemon, /profileZip/);
+  assert.ok(daemon.indexOf('profileSetup.test') < daemon.indexOf('profileZip.test'), 'Setup.exe must win when both assets exist');
+  assert.match(daemon, /assetName.*\.exe/);
+  assert.match(daemon, /packageExt/);
+  assert.match(update, /Alias\('SrcZip'\)/);
+  assert.match(update, /GetExtension\(\$SrcPackage\).*\.exe/);
+  assert.match(update, /VERYSILENT.*SUPPRESSMSGBOXES.*NORESTART/);
+  assert.match(update, /Setup\.exe 已退出/);
+});
+
+test('theme apply retries CDP evaluation and persists the selection only after success', () => {
+  const daemon = read('daemon.js');
+  const routeStart = daemon.indexOf("p === '/api/theme-apply'");
+  const routeEnd = daemon.indexOf("p === '/api/theme-save'", routeStart);
+  const route = daemon.slice(routeStart, routeEnd);
+  assert.match(daemon, /Runtime\.evaluate 未返回主题结果/);
+  assert.match(daemon, /await cdpActivatePage\(\)/);
+  assert.match(daemon, /await connectCdp\(\)/);
+  assert.match(daemon, /r\.exceptionDetails/);
+  assert.match(route, /applyThemeByCdp\(id\)/);
+  assert.ok(route.indexOf("fs.writeFileSync(path.join(DATA_DIR, 'current-theme.json')") > route.indexOf('.then((info)'), 'failed theme must not be persisted');
 });
 
 test('Windows updater keeps an apply-update VBS bridge in the package and has a runtime fallback', () => {
@@ -64,24 +91,36 @@ test('update progress hides zero-rate and unknown-ETA placeholder text', () => {
 test('Windows updater stops the watchdog before waiting for the API port', () => {
   const script = read('apply-update.ps1');
   const stop = script.indexOf('function Stop-WatchdogAndPort');
-  const wait = script.indexOf('for ($wait = 0; $wait -lt 15; $wait++)');
+  const wait = script.indexOf('Invoke-RestMethod');
   assert.notEqual(stop, -1);
   assert.notEqual(wait, -1);
   assert.ok(stop < wait, 'watchdog shutdown must precede the port wait');
+  assert.match(script, /Stop-VerifiedWorkDaddyLifecycle/);
 });
 
 test('Windows install and update release a locked launcher before replacing it', () => {
   const install = read('install-win.ps1');
   const update = read('apply-update.ps1');
-  assert.match(install, /FileShare\]\s*::None/);
+  const boundary = read('windows-process-boundary.ps1');
+  assert.match(boundary, /FileShare\]\s*::None/);
   assert.match(install, /launcher\.cmd/);
-  assert.match(install, /Get-CimInstance\s+Win32_Process/);
-  assert.match(install, /taskkill \/F \/T \/PID/);
-  assert.ok(install.indexOf('Release-LockedLauncher') < install.indexOf('robocopy $SrcDir $targetScripts'), 'install must release launcher before robocopy');
-  assert.match(update, /FileShare\]\s*::None/);
+  assert.match(boundary, /Get-CimInstance\s+Win32_Process/);
+  assert.match(boundary, /Test-ExactCmdLauncherCommandLine/);
+  assert.doesNotMatch(boundary, /taskkill[^\r\n]*\/T\b/i);
+  assert.ok(install.indexOf('Release-VerifiedLauncherLock') < install.indexOf('robocopy $SrcDir $targetScripts'), 'install must release launcher before robocopy');
   assert.match(update, /launcher\.cmd/);
-  assert.match(update, /Get-CimInstance\s+Win32_Process/);
-  assert.ok(update.indexOf('Release-LockedLauncher') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must release launcher before moving the old app');
+  assert.ok(update.indexOf('Release-VerifiedLauncherLock') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must release launcher before moving the old app');
+});
+
+test('Windows updater stops the verified WorkBuddy process before replacing its installation directory', () => {
+  const update = read('apply-update.ps1');
+  const boundary = read('windows-process-boundary.ps1');
+  assert.match(boundary, /function Stop-VerifiedWorkBuddyProcesses/);
+  assert.match(boundary, /WorkBuddyAI\)\\\.exe/);
+  assert.match(boundary, /多个 WorkBuddy 安装正在运行/);
+  assert.match(update, /function Stop-WorkBuddyForUpdate/);
+  assert.ok(update.indexOf('Stop-WorkBuddyForUpdate') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must stop WorkBuddy before moving the app directory');
+  assert.match(update, /Stop-WorkBuddyForUpdate\b/);
 });
 
 test('macOS updater stops the daemon before waiting for the API port', () => {
@@ -160,7 +199,7 @@ test('seamless login refreshes the running WorkBuddy session', () => {
 
 test('CDP startup supports a persisted fallback port instead of hardcoding 9222', () => {
   const daemon = read('daemon.js');
-  const macLauncher = fs.readFileSync(path.join(repoRoot, 'WorkDaddy.app', 'Contents', 'MacOS', 'launcher'), 'utf8');
+  const macLauncher = read('relaunch-with-cdp.sh');
   const winLauncher = read('win-launcher.js');
   assert.match(daemon, /cdp-port\.json/);
   assert.match(daemon, /findAvailableCdpPort/);
@@ -187,12 +226,66 @@ test('Windows launcher keeps local port probing and profile CDP candidates defin
   assert.match(launcher, /function isLocalPortAvailable\(port\)/);
   assert.match(launcher, /server\.listen\(\{ host: HOST, port \}/);
   assert.match(launcher, /改用备用端口重试/);
-  assert.match(launcher, /for \(let port = 9222; port <= 9232; port\+\+\)/);
-  assert.match(launcher, /add\(9333\)/);
+  assert.match(launcher, /const profilePorts = PROFILE_CDP_PORTS\[PROFILE\.id\]/);
+  assert.match(launcher, /profilePorts\.includes\(savedPort\)/);
+  assert.match(launcher, /for \(const port of profilePorts\) add\(port\)/);
   assert.match(launcher, /function daemonRunning\(\)\s*\{\s*return portOpen\(UI_PORT\);/);
   assert.match(launcher, /'workbuddy-cn': \[9222/);
   assert.match(launcher, /'workbuddy-ai': \[9223/);
   assert.match(launcher, /isTargetForProfile\(target, PROFILE\)/);
+});
+
+test('Windows launcher propagates the WorkBuddy AI UI port to child processes', { skip: process.platform !== 'win32' }, () => {
+  const launcherPath = path.join(repoRoot, 'scripts', 'win-launcher.js');
+  const probe = [
+    "process.env.WBSWITCH_PROFILE = 'workbuddy-ai';",
+    'delete process.env.WBSWITCH_PORT;',
+    `require(${JSON.stringify(launcherPath)});`,
+    "process.stdout.write(process.env.WBSWITCH_PORT || '');",
+  ].join(' ');
+  const result = childProcess.spawnSync(process.execPath, ['-e', probe], {
+    encoding: 'utf8',
+    env: { ...process.env },
+    timeout: 15000,
+    windowsHide: true,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.stdout, '47833');
+});
+
+test('Windows launcher rejects a persisted sibling-profile CDP port', { skip: process.platform !== 'win32' }, () => {
+  const launcherPath = path.join(repoRoot, 'scripts', 'win-launcher.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-cdp-profile-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'cdp-port.json'), JSON.stringify({ port: 9223 }));
+    const probe = [
+      "process.env.WBSWITCH_PROFILE = 'workbuddy-cn';",
+      `process.env.WBSWITCH_DATA_DIR = ${JSON.stringify(dir)};`,
+      'delete process.env.WBSWITCH_CDP_PORT;',
+      `const launcher = require(${JSON.stringify(launcherPath)});`,
+      'process.stdout.write(JSON.stringify(launcher.cdpPortCandidates()));',
+    ].join(' ');
+    const result = childProcess.spawnSync(process.execPath, ['-e', probe], {
+      encoding: 'utf8',
+      env: { ...process.env },
+      timeout: 15000,
+      windowsHide: true,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const ports = JSON.parse(result.stdout);
+    assert.deepEqual(ports, [9222, 9226, 9227, 9228, 9229, 9230, 9231, 9232]);
+    assert.equal(ports.includes(9223), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('explicit daemon UI ports never fall through into another profile port', () => {
+  const daemon = read('daemon.js');
+  assert.match(daemon, /const ALLOW_UI_PORT_FALLBACK = !process\.env\.WBSWITCH_PORT/);
+  assert.match(daemon, /e\.code === 'EADDRINUSE' && ALLOW_UI_PORT_FALLBACK && attempt < 7/);
 });
 
 test('Windows launcher does not report success when manual injection is not mounted', () => {
@@ -200,8 +293,32 @@ test('Windows launcher does not report success when manual injection is not moun
   const launcher = read('win-launcher.js');
   assert.match(daemon, /注入后未检测到 WorkDaddy 组件/);
   assert.match(daemon, /mounted: !!\(info && info\.mounted\)/);
-  assert.match(launcher, /payload\.mounted !== true/);
+  assert.match(launcher, /payload\.mounted === true/);
+  assert.match(launcher, /pending:\s*true/);
   assert.match(launcher, /WorkDaddy 组件注入失败/);
+});
+
+test('Windows launcher treats delayed renderer injection as background work', () => {
+  const launcher = read('win-launcher.js');
+  const daemon = read('daemon.js');
+  const batch = read('launcher.cmd');
+  assert.match(launcher, /INJECT_REQUEST_TIMEOUT_MS\s*=\s*5000/);
+  assert.match(launcher, /INJECT_MAX_ATTEMPTS\s*=\s*6/);
+  assert.match(launcher, /INJECT_RETRY_DELAY_MS\s*=\s*1000/);
+  assert.match(launcher, /async function injectNowOrPending/);
+  assert.match(launcher, /后台正在注入组件/);
+  assert.match(launcher, /injectNowOrPending\(\)/);
+  assert.match(daemon, /manualInjectPromise/);
+  assert.match(daemon, /injectWidgetManual\(\)/);
+  assert.match(batch, /if "%EXIT_CODE%"=="0" \([\s\S]*exit \/b 0/);
+});
+
+test('Windows launcher gives cold-start instances time before changing CDP ports', () => {
+  const launcher = read('win-launcher.js');
+  assert.match(launcher, /const CDP_PORT_RETRY_GRACE_MS\s*=\s*15000/);
+  assert.match(launcher, /Date\.now\(\) - launchStartedAt >= CDP_PORT_RETRY_GRACE_MS/);
+  assert.match(launcher, /const hasProcessWithoutArg = diagnostics\.length > 0 && !diagnostics\.some\(\(p\) => p\.hasCdpArg\)/);
+  assert.doesNotMatch(launcher, /diagnostics\.every\(\(p\) => p\.hasCommandLine\)/);
 });
 
 test('macOS updater validates a cached/downloaded DMG before mounting it', () => {
@@ -213,10 +330,11 @@ test('macOS updater validates a cached/downloaded DMG before mounting it', () =>
   assert.match(daemon, /Content-Type|content-type/);
 });
 
-test('Windows launcher covers both WorkBuddy images and records exit diagnostics', () => {
+test('Windows launcher scopes process discovery to the active profile and records exit diagnostics', () => {
   const launcher = read('win-launcher.js');
-  assert.match(launcher, /WorkBuddy\.exe/);
-  assert.match(launcher, /WorkBuddyAI\.exe/);
+  assert.match(launcher, /PROFILE\.id === 'workbuddy-ai' \? \['workbuddyai\.exe'\]/);
+  assert.match(launcher, /PROFILE\.id === 'workbuddy-cn' \? \['workbuddy\.exe'\]/);
+  assert.doesNotMatch(launcher, /\$names=@\("WorkBuddy\.exe","CodeBuddy\.exe","WorkBuddyAI\.exe"\)/);
   assert.match(launcher, /\[exit\]/);
   assert.match(launcher, /taskkill=/);
   assert.match(launcher, /tasklistProcessIds/);
@@ -239,6 +357,15 @@ test('release scripts package only WorkDaddy and WorkDaddy AI', () => {
   assert.match(installer, /\$lnkPath\s*=\s*Join-Path\s+\$desktopDir\s+\(\$productName\s+\+\s+'\.lnk'\)/);
 });
 
+test('Windows installer writes through the console API for PowerShell 5.1 compatibility', () => {
+  const installer = read('install-win.ps1');
+  const entry = read('install-win.cmd');
+  assert.match(installer, /\[Console\]::WriteLine/);
+  assert.doesNotMatch(installer, /\bWrite-Host\b/);
+  assert.match(entry, /\[Console\]::WriteLine/);
+  assert.doesNotMatch(entry, /\bWrite-Host\b/);
+});
+
 test('release scripts synchronize daemon version and build id', () => {
   const daemon = read('daemon.js');
   const win = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
@@ -254,6 +381,28 @@ test('release scripts synchronize daemon version and build id', () => {
   assert.match(mac, /产物 daemon\.js 的版本或 Build ID/);
 });
 
+test('daemon settings writes tolerate transient Windows file locks', () => {
+  const daemon = read('daemon.js');
+  const helperStart = daemon.indexOf('function replaceFileWithRetry(');
+  const helperEnd = daemon.indexOf('\n}\n\nfunction writeWorkbuddySettings', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'atomic replacement helper must exist');
+  const helper = daemon.slice(helperStart, helperEnd);
+  assert.match(helper, /\.wbs-tmp-\$\{process\.pid\}-\$\{Date\.now\(\)\}-\$\{crypto\.randomBytes\(/);
+  assert.match(helper, /process\.platform === 'win32' \? 15 : 1/);
+  assert.match(helper, /\['EPERM', 'EACCES', 'EBUSY'\]/);
+  assert.match(helper, /sleepSync\(75\)/);
+  assert.doesNotMatch(helper, /unlinkSync\(file\)|rmSync\(file\)/);
+
+  const settingsStart = daemon.indexOf('function writeWorkbuddySettings(');
+  const settingsEnd = daemon.indexOf('\n}\n\nfunction buildAskRuleBlock', settingsStart);
+  const appStart = daemon.indexOf('function writeAppConfig(');
+  const appEnd = daemon.indexOf('\n}\nfunction acBlock', appStart);
+  assert.match(daemon.slice(settingsStart, settingsEnd), /replaceFileWithRetry\(file/);
+  assert.match(daemon.slice(appStart, appEnd), /replaceFileWithRetry\(file/);
+  assert.doesNotMatch(daemon.slice(settingsStart, settingsEnd), /file \+ '\\.wbs-tmp'/);
+  assert.doesNotMatch(daemon.slice(appStart, appEnd), /file \+ '\\.wbs-tmp'/);
+});
+
 test('Windows launcher verifies the real WorkBuddy process tree and launch arguments', () => {
   const launcher = read('win-launcher.js');
   assert.match(launcher, /Get-CimInstance Win32_Process/);
@@ -266,11 +415,12 @@ test('Windows launcher verifies the real WorkBuddy process tree and launch argum
   assert.match(launcher, /processes: processDiagnostics\(wb\)/);
 });
 
-test('Windows launcher escalates a PID-only WorkBuddy exit fallback', () => {
+test('Windows launcher refuses elevated or image-name exit fallbacks', () => {
   const launcher = read('win-launcher.js');
-  assert.match(launcher, /tasklistProcessIds\(targetNames\)/);
-  assert.match(launcher, /Start-Process[\s\S]*taskkill\.exe[\s\S]*-Verb RunAs/);
-  assert.match(launcher, /remainingPids|剩余 PID|tasklistPids/);
+  assert.doesNotMatch(launcher, /Start-Process[\s\S]*taskkill\.exe[\s\S]*-Verb RunAs/);
+  assert.doesNotMatch(launcher, /taskkill[^\n]*\/IM/);
+  assert.doesNotMatch(launcher, /['"]\/T['"]/);
+  assert.match(launcher, /请手动关闭该程序/);
 });
 
 test('daemon JSON responses are idempotent after headers or body were sent', () => {
@@ -334,6 +484,116 @@ test('Windows release package includes the troubleshooting prompt as UTF-8', () 
   assert.match(build, /ZIP_DEFLATED/);
 });
 
+test('WorkDaddy AI branding preserves CRLF in Windows command files', { skip: process.platform !== 'win32' }, () => {
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  const branding = build.match(/if \[ "\$PROFILE" = "workbuddy-ai" \]; then[\s\S]*?<<'PY'\r?\n([\s\S]*?)\r?\nPY\r?\nfi/);
+  assert.ok(branding, 'AI branding Python block is missing');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-ai-branding-'));
+  const scriptsDir = path.join(dir, 'scripts');
+  const verify = path.join(scriptsDir, 'verify-win.cmd');
+  try {
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.writeFileSync(verify, Buffer.from([
+      '@echo off',
+      'rem WorkDaddy Windows 安装包自检',
+      'echo WorkDaddy 安装包自检',
+      '',
+    ].join('\r\n'), 'utf8'));
+
+    const result = childProcess.spawnSync('python', ['-', dir], {
+      input: branding[1],
+      encoding: 'utf8',
+      timeout: 10000,
+      windowsHide: true,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+
+    const branded = fs.readFileSync(verify, 'utf8');
+    assert.match(branded, /WorkDaddy AI Windows 安装包自检/);
+    assert.equal(branded.replace(/\r\n/g, '').includes('\n'), false, 'branding introduced bare LF line endings');
+    assert.equal(branded.replace(/\r\n/g, '').includes('\r'), false, 'branding introduced bare CR line endings');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Windows release packages bundle a pinned Node runtime and build a user-level Setup.exe', () => {
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-installer.ps1'), 'utf8');
+  const iss = fs.readFileSync(path.join(repoRoot, 'scripts', 'win', 'workdaddy.iss'), 'utf8');
+  const workflow = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'build-win.yml'), 'utf8');
+  const launcher = read('launcher.cmd');
+  assert.match(build, /NODE_VERSION=.*22\.23\.1/);
+  assert.match(build, /NODE_SHA256=.*7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29/);
+  assert.match(build, /runtime\/node\/node\.exe/);
+  assert.match(build, /(?:python3|PYTHON_BIN).*NODE_ARCHIVE_PATH/);
+  assert.match(build, /CRLF/);
+  assert.match(installer, /Expand-Archive/);
+  assert.match(installer, /\[string\]\$Version/);
+  assert.match(installer, /ZIP 内部 daemon 版本/);
+  assert.match(installer, /bundled Node runtime/);
+  assert.match(workflow, /WORKDADDY_BUILD_VERSION:/);
+  assert.match(workflow, /-Version \$\{\{ steps\.ver\.outputs\.version \}\}/);
+  assert.match(iss, /PrivilegesRequired=lowest/);
+  assert.match(iss, /runtime|scripts\\\*/i);
+  assert.match(iss, /install-win\.ps1/);
+  assert.match(workflow, /(?:Install Inno Setup|安装 Inno Setup)/);
+  assert.match(workflow, /build-win-installer\.ps1/);
+  assert.match(workflow, /release\/windows\/WorkDaddy-Setup-\*\.exe/);
+  assert.match(launcher, /runtime\\node\\node\.exe/);
+});
+
+test('Windows release publishes Setup.exe only and removes temporary ZIP staging', () => {
+  const workflow = fs.readFileSync(path.join(repoRoot, '.github', 'workflows', 'build-win.yml'), 'utf8');
+  const installer = read('build-win-installer.ps1');
+  const guide = fs.readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf8');
+  assert.match(workflow, /仅 Setup\.exe/);
+  assert.doesNotMatch(workflow, /release\/windows\/WorkDaddy-\*-win64\.zip/);
+  assert.match(workflow, /确认仅保留 Setup\.exe 发行产物/);
+  assert.match(installer, /ZIP is only an internal staging input/);
+  assert.match(installer, /Remove-Item -LiteralPath \$zipPath/);
+  assert.match(guide, /Windows releases are `Setup\.exe` only/);
+  assert.match(guide, /temporary staging/);
+});
+
+test('Windows Setup stops a verified lifecycle before replacing bundled Node', () => {
+  const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'win', 'workdaddy.iss'), 'utf8');
+  const prepare = fs.readFileSync(path.join(repoRoot, 'scripts', 'prepare-win-install.ps1'), 'utf8');
+  const verify = fs.readFileSync(path.join(repoRoot, 'scripts', 'verify-win.cmd'), 'utf8');
+  assert.match(installer, /function PrepareToInstall\(var NeedsRestart: Boolean\): String/);
+  assert.match(installer, /ExtractTemporaryFile\('prepare-win-install\.ps1'\)/);
+  assert.match(installer, /ExtractTemporaryFile\('windows-process-boundary\.ps1'\)/);
+  assert.match(installer, /ewWaitUntilTerminated/);
+  assert.match(prepare, /Stop-VerifiedWorkDaddyLifecycle/);
+  assert.match(prepare, /WorkDaddy-prepare-install\.log/);
+  assert.match(prepare, /-ExpectedWatchdogScript \(Join-Path \$AppDir 'scripts\\watchdog\.js'\)/);
+  assert.match(verify, /prepare-win-install\.ps1/);
+});
+
+test('macOS release staging includes the troubleshooting prompt', () => {
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
+  assert.match(build, /STAGE\/安装失败自主解决提示词\.txt/);
+  assert.match(build, /cat > "\$STAGE\/安装失败自主解决提示词\.txt"/);
+});
+
+test('macOS package launcher keeps WorkBuddy CN and AI CDP ports profile-specific', () => {
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
+  assert.match(build, /profile CDP/);
+  assert.ok(build.includes("WorkBuddy[[:space:]]*AI|WorkBuddyAI"));
+  assert.match(build, /workbuddy-cn\)/);
+  assert.match(build, /workbuddy-ai\)/);
+});
+
+test('macOS package launcher returns focus to the target WorkBuddy and separates AI identity', () => {
+  const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
+  assert.match(build, /activate_target_app\(\)/);
+  assert.match(build, /tell application.*APP_NAME.*activate/);
+  assert.match(build, /com\.workdaddy\.ai\.launcher/);
+  assert.match(build, /manual inject result:[\s\S]*activate_target_app/);
+});
+
 test('troubleshooting prompts keep Sentry reports short and omit raw logs', () => {
   const prompt = fs.readFileSync(path.join(repoRoot, '安装失败自主解决提示词.txt'), 'utf8');
   const macBuild = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
@@ -359,7 +619,8 @@ test('session ranges use last-modified time and preserve standard WorkBuddy work
   const inject = read('inject.js');
   assert.match(daemon, /COALESCE\(last_activity_at, updated_at, created_at\) >=/);
   assert.match(daemon, /ORDER BY COALESCE\(last_activity_at, updated_at, created_at\) DESC/);
-  assert.match(inject, /sessionsState\.list = \(\(d && d\.sessions\) \|\| \[\]\)\.filter\(function \(s\) \{ return !isTaskSessionRecordUI\(s\.cwd\); \}\)/);
+  assert.match(inject, /sessionsState\.list = \(\(d && d\.sessions\) \|\| \[\]\);/);
+  assert.match(inject, /if \(isTaskSessionRecordUI\(s\)\) \{ tasks\.push\(s\); return; \}/);
   assert.match(inject, /fmtHumanTime\(s\.last_activity_at \|\| s\.updated_at \|\| s\.created_at\)/);
 });
 
@@ -417,6 +678,27 @@ test('account cards keep the compact three-row layout', () => {
   assert.doesNotMatch(script, /wbs-checkin-cell/);
 });
 
+test('quick-phrase layering does not reposition WorkBuddy native chat toolbar', () => {
+  const script = read('inject.js');
+  assert.match(script, /\.wbs-explore-inline\.wbs-stash-inline-inline\{position:relative;z-index:99999\}/);
+  assert.match(script, /\.wbs-explore-pop\{[^}]*z-index:2147483647/);
+  assert.doesNotMatch(script, /_chatMessageBottomToolbarWrapper_\}\{position:relative;z-index:68/);
+  assert.doesNotMatch(script, /_chatMessageBottomToolbar_\}\{position:relative;z-index:69/);
+  assert.doesNotMatch(script, /_chatMessageBottomToolbarItem_\}\{position:relative;z-index:70/);
+});
+
+test('auto-continue restores a missing prompt block without disabling the monitor', () => {
+  const script = read('inject.js');
+  assert.match(script, /prompt-block-lost-restore/);
+  assert.match(script, /body: JSON\.stringify\(\{ enabled: true \}\)/);
+  assert.doesNotMatch(script, /prompt-block-lost-disable/);
+});
+
+test('auto-continue keeps the three-second terminal settle window', () => {
+  const script = read('inject.js');
+  assert.match(script, /var AC_FB_SETTLE_MS = 3000/);
+});
+
 test('robot button decorations remain visible alongside the eye states', () => {
   const script = read('inject.js');
   assert.match(script, /wbs-fab-antenna/);
@@ -444,6 +726,15 @@ test('WorkBuddy AI welcome composer keeps the robot at the window bottom-right',
   assert.match(script, /PROFILE_ID === 'workbuddy-ai'/);
   assert.match(script, /_topRightSlotStandalone_\"\] > div:nth-child\(1\) > div:nth-child\(2\)/);
   assert.match(script, /aiHomeComposerCorner/);
+});
+
+test('WorkBuddy AI chat composer anchors the robot when the queue is absent', () => {
+  const script = read('inject.js');
+  assert.match(script, /if \(!target && WBS_PROFILE_IS_AI\)/);
+  assert.match(script, /\.conversation-input-area \.conversation-input \.cr-input-box \.cr-input-container/);
+  assert.match(script, /\.conversation-input-area \.cr-input-container/);
+  assert.match(script, /var air = aiInput\.getBoundingClientRect\(\)/);
+  assert.match(script, /if \(!target\) \{\s*var ma = document\.querySelector\('\[class\*="_input-area-container_"\]/);
 });
 
 test('installers disable login auto-start and clean prior registrations', () => {
@@ -484,10 +775,25 @@ test('update notes keep the full release text inside the panel scroll area', () 
   assert.match(script, /\.wbs-update-notes\{[^}]*overflow:visible/);
 });
 
+test('auto-continue and session controls are available on Windows and macOS', () => {
+  const inject = read('inject.js');
+  const daemon = read('daemon.js');
+  assert.match(inject, /id="wbs-ac-row"/);
+  assert.match(inject, /var acRow = enhancePane && enhancePane\.querySelector\('\#wbs-ac-row'\)/);
+  assert.match(inject, /var AC_SUPPORTED = true/);
+  assert.doesNotMatch(inject, /WBS_PLATFORM !== 'win32'/);
+  assert.doesNotMatch(inject, /WBS_PLATFORM === 'win32'\) \{/);
+  assert.match(daemon, /platformSupported: true/);
+  assert.doesNotMatch(daemon, /const enabled = !IS_WIN/);
+  assert.doesNotMatch(daemon, /if \(IS_WIN\) return readAutoContinueState/);
+  assert.match(inject, /id="wbs-sess-stash"/);
+  assert.match(inject, /id="wbs-sess-phrase"/);
+});
+
 test('session listing does not hide standard timestamped WorkBuddy workspaces', () => {
   const inject = read('inject.js');
   const daemon = read('daemon.js');
-  assert.match(inject, /function isTaskSessionRecordUI\(cwd\)\s*\{[\s\S]*return false;/);
+  assert.match(inject, /function isTaskSessionRecordUI\(s\)\s*\{[\s\S]*return !!\(s && Number\(s\.is_playground\) === 1\);/);
   assert.match(daemon, /function isTaskSessionRecord\(cwd\)\s*\{[\s\S]*return false;/);
   assert.doesNotMatch(inject, /WorkBuddy\\\\\]\\d\{4\}/);
   assert.doesNotMatch(daemon, /WorkBuddy\\\\\]\\d\{4\}/);
@@ -547,6 +853,14 @@ test('updaters reject an artifact whose internal daemon version disagrees with i
   assert.match(win, /新版 daemon 实际版本/);
 });
 
+test('Windows update runtime must match the packaged daemon version even without a semver ZIP name', () => {
+  const win = read('apply-update.ps1');
+  assert.match(win, /-ExpectedVersion \$sourceDaemonVersion/);
+  assert.match(win, /running daemon version=\$runningVersion expected=\$sourceDaemonVersion/);
+  assert.match(win, /if \(\$runningVersion -ne \$sourceDaemonVersion\)/);
+  assert.doesNotMatch(win, /if \(-not \[string\]::IsNullOrWhiteSpace\(\$packageVersion\) -and \$runningVersion -ne/);
+});
+
 test('sensitive local API routes require an injected token and do not expose wildcard CORS', () => {
   const daemon = read('daemon.js');
   const inject = read('inject.js');
@@ -604,12 +918,13 @@ test('zero credits omit the empty-state label', () => {
 test('auto-copy rules persist sessions and canonical workspace keys without leaking account metadata', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-auto-copy-'));
   try {
+    const expectedWorkspace = '/Users/example/project';
     lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'session', key: 'session-1', enabled: true });
     lib.setAutoCopyRule(dir, { uid: 'source-a', kind: 'workspace', key: '/Users/example/project/', enabled: true });
     let rules = lib.getAutoCopyRules(dir, 'source-a');
     assert.deepEqual(rules.sessionIds, ['session-1']);
-    assert.deepEqual(rules.workspaces, ['/Users/example/project']);
-    assert.equal(lib.canonicalWorkspace('/Users/example/project/'), '/Users/example/project');
+    assert.deepEqual(rules.workspaces, [expectedWorkspace]);
+    assert.equal(lib.canonicalWorkspace('/Users/example/project/'), expectedWorkspace);
 
     const lineageId = lib.getAutoCopySession(dir, 'source-a', 'session-1').lineageId;
     lib.setAutoCopyMapping(dir, lineageId, 'target-b', { targetId: 'copied-1', status: 'copied' });
@@ -628,12 +943,17 @@ test('auto-copy rules persist sessions and canonical workspace keys without leak
   }
 });
 
-test('automatic session copy has a status endpoint, idempotency mapping, and no task-level marker', () => {
+test('automatic session copy includes workspace-only rules when the initial plan is empty', () => {
   const daemon = read('daemon.js');
   const inject = read('inject.js');
   assert.match(daemon, /POST' && p === '\/api\/sessions\/auto-copy'/);
   assert.match(daemon, /GET' && p === '\/api\/sessions\/auto-copy\/status'/);
   assert.match(daemon, /getAutoCopyMapping\(DATA_DIR, lineageId, targetUid\)/);
+  assert.match(daemon, /getAutoCopySessionMembers\(DATA_DIR, lineageId, targetUid\)/);
+  assert.match(daemon, /const canonicalId = candidates\[0\]\.id/);
+  assert.match(daemon, /const sourceRules = sourceUid \? getAutoCopyRules\(DATA_DIR, sourceUid\)/);
+  assert.match(daemon, /hasSourceAutoCopyRules/);
+  assert.match(daemon, /hasPendingAutoCopyTo\(uid\)/);
   assert.match(daemon, /startAutoCopyJob\(sourceUid, uid, autoCopyPlan\)/);
   assert.match(inject, /data-auto-kind="' \+ kind \+ '"/);
   assert.match(inject, /autoCopyButton\('workspace'/);
@@ -671,6 +991,20 @@ test('session summary counts effective sessions and models tab only exposes sani
   assert.match(inject, /data-model-edit=/);
   assert.match(inject, /wbs-model-check-all/);
   assert.match(inject, /wbs-model-edit-eye/);
+  assert.match(inject, /自定义名称.*wbs-model-edit-name/);
+  assert.match(inject, /模型名.*wbs-model-edit-id/);
+  assert.doesNotMatch(inject, /模型名（id）|自定义名称（name）/);
+  assert.match(inject, /id\.value = item\.id \|\| item\.name/);
+  assert.match(inject, /name\.value = item\.name \|\| item\.id/);
+  assert.match(inject, /var patch = \{ id: id\.value, name: name\.value, url: url\.value \};/);
+  assert.match(inject, /wbs-model-group-title.*esc\(group\.id \|\|/);
+  assert.doesNotMatch(inject, /wbs-model-group-title.*esc\(group\.name \|\|/);
+  assert.match(read('lib.js'), /模型名对应配置里的 id/);
+  assert.match(read('lib.js'), /分组严格依据原始模型配置的 id/);
+  assert.match(read('lib.js'), /const id = typeof model\.id === 'string'/);
+  assert.match(read('lib.js'), /new Map\(\)/);
+  assert.match(read('lib.js'), /groups\.get\(key\)\.items\.push/);
+  assert.match(read('lib.js'), /\['id', 'name', 'url', 'apiKey'\]/);
   assert.match(inject, /小贴士.*解决 WorkBuddy 不支持多个同名模型的问题/);
   assert.match(inject, /data-model-tab="official">当前模型/);
   assert.match(inject, /data-model-tab="mine">备选模型/);

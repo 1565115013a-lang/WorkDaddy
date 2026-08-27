@@ -402,4 +402,11 @@ module.exports = [
     desc: 'chat widget 预览 iframe 背景改透明（用户要求）：widget 容器内的 iframe 在深色下自带黑底（元素级背景），改透明让外层毛玻璃透出；iframe 内部文档自带黑底由 inject.js 同源注入兜底（跨域内部无法用 CSS 触达）',
     css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetRendererWrapper_"] iframe,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetContainer_"] iframe,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_widgetRendererWrapper_"] iframe[class*="chromeless"]{background:transparent !important;background-color:transparent !important;border:none !important;box-shadow:none !important;}',
   },
+  {
+    id: 'patch-81',
+    desc: '消息队列项左侧「拖拽图标」（prompt-ico/prompt-icon）在有暂存提示词时透明但仍占位，导致文字左侧空白：整体隐藏不占位（用户要求）',
+    css: '.cb-message-queue-item-left .prompt-ico,.cb-message-queue-item-left .prompt-icon{display:none !important;width:0 !important;margin:0 !important;}',
+  },
+  /* 原 patch-82（AI 端快捷短语弹层 z-index 抬升）已移入 inject.js 常驻样式：
+     theme-patches 仅在非默认主题时注入，默认浅色主题下会失效；层级修复不依赖主题，随注入脚本常驻更可靠。 */
 ];

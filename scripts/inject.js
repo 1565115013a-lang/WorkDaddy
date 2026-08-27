@@ -68,8 +68,184 @@ function classifySessionHealth(snapshot) {
   return { status: 'settling', confidence: 'low', reason: 'no-completion-evidence' };
 }
 
+// Auto-Continue must not treat a renderer/provider-lost marker as proof of failure.
+// WorkBuddy's normal assistant action row is positive completion evidence; only an
+// explicit error or visibly truncated reply should cause an automatic follow-up.
+function classifyAutoContinueReply(snapshot) {
+  var s = snapshot || {};
+  if (!s.observed || s.busy || s.manualStop) {
+    return { trigger: false, reason: s.manualStop ? 'manual-stop' : 'not-idle' };
+  }
+  if (s.error || s.networkFailure) {
+    return { trigger: true, reason: s.networkFailure ? 'network-failure' : 'error-ui' };
+  }
+  if (s.completionMarker || s.hasCompletionActions) {
+    return { trigger: false, reason: s.completionMarker ? 'completion-marker' : 'completion-actions' };
+  }
+  if (s.looksTruncated) return { trigger: true, reason: 'truncated-reply' };
+  return { trigger: false, reason: 'no-incomplete-evidence' };
+}
+
+// WorkBuddy 新版 ConversationController 把会话运行态与消息时间线放在 store 中。
+// 这里保持为纯函数：终局 complete/terminal 等价于旧 DOM 的助手操作区；
+// 空闲后仍未 complete 的助手消息才是结构化的“回复中断”证据。
+function classifyAutoContinueControllerSnapshot(snapshot) {
+  var s = snapshot || {};
+  return classifyAutoContinueReply({
+    observed: !!s.assistantId,
+    busy: !!s.busy,
+    manualStop: !!s.manualStop,
+    error: !!s.error,
+    networkFailure: !!s.networkFailure,
+    completionMarker: !!s.completionMarker,
+    hasCompletionActions: !!(s.complete || s.terminal),
+    looksTruncated: !!s.assistantId && !s.busy && !s.complete && !s.terminal,
+  });
+}
+
+function autoContinueMessageText(message) {
+  var blocks = message && Array.isArray(message.content) ? message.content : [];
+  return blocks.filter(function (block) {
+    return block && (block.type === 'text' || block.type === 'markdown') && typeof block.text === 'string';
+  }).map(function (block) { return block.text; }).join('\n');
+}
+
+function autoContinueControllerCompleted(snapshot) {
+  var s = snapshot || {};
+  return s.terminalKnown ? !!s.terminal : !!s.complete;
+}
+
+function selectAutoContinueAssistant(messageState) {
+  var state = messageState || {};
+  var messages = Array.isArray(state.messages) ? state.messages : [];
+  var streamingMessageId = state.streamingMessageId == null ? '' : String(state.streamingMessageId);
+  var streamingRequestId = state.streamingRequestId == null ? '' : String(state.streamingRequestId);
+  if (streamingMessageId || streamingRequestId) {
+    for (var si = messages.length - 1; si >= 0; si--) {
+      var streaming = messages[si];
+      if (!streaming || streaming.messageType !== 'assistant') continue;
+      if ((streamingMessageId && String(streaming.id || '') === streamingMessageId) ||
+          (streamingRequestId && String(streaming.requestId || '') === streamingRequestId)) return streaming;
+    }
+  }
+  for (var mi = messages.length - 1; mi >= 0; mi--) {
+    var message = messages[mi];
+    if (!message || message.messageType !== 'assistant') continue;
+    var id = String(message.id || message.requestId || '');
+    if (/^timeline:/.test(id)) continue; // context-compaction 等时间线合成项不是一次助手回复
+    return message;
+  }
+  return null;
+}
+
+function normalizeQueueText(value) {
+  var parts = [];
+  if (Array.isArray(value)) {
+    value.forEach(function (block) {
+      if (block && typeof block.text === 'string' && block.text) parts.push(block.text);
+    });
+  } else if (value && typeof value === 'object' && Array.isArray(value.contentBlocks)) {
+    return normalizeQueueText(value.contentBlocks);
+  } else if (typeof value === 'string') {
+    parts.push(value);
+  }
+  return parts.join('\n').replace(/\s+/g, ' ').trim();
+}
+
+// Queue ids are the only authoritative identity. Text is an exact fallback for
+// older renderers that did not expose ids; substring matching is deliberately
+// forbidden because ordinary prompts commonly contain a stashed prompt.
+function isStashQueueItem(item, stashIds, stashTexts) {
+  var it = item || {};
+  var ids = Array.isArray(stashIds) ? stashIds.map(String) : [];
+  var id = it.id == null ? '' : String(it.id);
+  if (ids.length) return !!id && ids.indexOf(id) >= 0;
+  var text = normalizeQueueText(it.contentBlocks || it.blocks || it.content);
+  if (!text) return false;
+  var texts = Array.isArray(stashTexts) ? stashTexts : [];
+  return texts.some(function (stashText) {
+    return normalizeQueueText(stashText) === text;
+  });
+}
+
+function stashContentSignature(content) {
+  var c = content || {};
+  var items = Array.isArray(c.items) ? c.items.map(function (item) {
+    return [item && item.type || '', item && item.uri || '', item && item.name || ''].join(':');
+  }).join('|') : '';
+  return normalizeQueueText(c.text || '') + '||' + items;
+}
+
+function stashContentMatches(expected, current) {
+  return !!expected && !!current && stashContentSignature(expected) === stashContentSignature(current);
+}
+
+// WorkBuddy AI 的会话 id 在侧栏 conversation-item 上；用户/助手消息的 req-* id
+// 只是消息请求 id，不能用于队列 RPC。选择态目前落在卡片子节点的 _selected_* class，
+// 同时兼容 aria-selected/active，避免依赖某个构建生成的完整 hash class。
+function resolveWorkBuddyAiConversationId(candidates) {
+  var list = Array.isArray(candidates) ? candidates : [];
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i] || {};
+    var classes = String(item.className || '') + ' ' + String(item.childClassName || '');
+    if (item.ariaSelected === true || item.ariaSelected === 'true' ||
+        /(^|\s)active(\s|$)/.test(classes) || /_selected_/.test(classes)) {
+      var id = String(item.conversationId || '').trim();
+      if (id) return id;
+    }
+  }
+  return null;
+}
+
+function workBuddyAiDraftStorageKey(sessionId) {
+  var id = String(sessionId || '').trim();
+  return id ? 'cb-draft:' + id : null;
+}
+
+function isWorkBuddyAiComposerStore(store, sessionId) {
+  try {
+    if (!store || typeof store !== 'object' || !store.api ||
+        typeof store.api.clear !== 'function' || typeof store.api.setBlocks !== 'function' ||
+        typeof store.api.getDraft !== 'function' || typeof store.getSnapshot !== 'function') return false;
+    var snapshot = store.getSnapshot();
+    return !!snapshot && String(snapshot.activeSessionId || '') === String(sessionId || '');
+  } catch (_) {
+    return false;
+  }
+}
+
+// WorkDaddy AI 新版移除面板主题入口后，首次打开面板时把旧版可能遗留的
+// WorkDaddy 主题恢复为官方浅色。key 固定且带迁移版本，确保只执行一次。
+function workBuddyAiThemeMigrationKey(profileId) {
+  return String(profileId || '') === 'workbuddy-ai'
+    ? 'workdaddy:theme-migration:workbuddy-ai:official-light:v1'
+    : null;
+}
+
+function shouldMigrateWorkBuddyAiTheme(profileId, markerValue) {
+  var key = workBuddyAiThemeMigrationKey(profileId);
+  return !!key && markerValue !== '1';
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { createBuildLifecycle: createBuildLifecycle, classifySessionHealth: classifySessionHealth };
+  module.exports = {
+    createBuildLifecycle: createBuildLifecycle,
+    classifySessionHealth: classifySessionHealth,
+    classifyAutoContinueReply: classifyAutoContinueReply,
+    classifyAutoContinueControllerSnapshot: classifyAutoContinueControllerSnapshot,
+    autoContinueMessageText: autoContinueMessageText,
+    autoContinueControllerCompleted: autoContinueControllerCompleted,
+    selectAutoContinueAssistant: selectAutoContinueAssistant,
+    normalizeQueueText: normalizeQueueText,
+    isStashQueueItem: isStashQueueItem,
+    stashContentSignature: stashContentSignature,
+    stashContentMatches: stashContentMatches,
+    resolveWorkBuddyAiConversationId: resolveWorkBuddyAiConversationId,
+    workBuddyAiDraftStorageKey: workBuddyAiDraftStorageKey,
+    isWorkBuddyAiComposerStore: isWorkBuddyAiComposerStore,
+    workBuddyAiThemeMigrationKey: workBuddyAiThemeMigrationKey,
+    shouldMigrateWorkBuddyAiTheme: shouldMigrateWorkBuddyAiTheme,
+  };
 }
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 (function () {
@@ -79,7 +255,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   (function () {
     var n;
     if ((n = document.querySelector('.wbs-root'))) n.remove();
-    var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn');
+    var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn, .wbs-explore-inline');
     for (var i = 0; i < st.length; i++) st[i].remove();
     var ss = document.querySelectorAll('#wbs-style');
     for (var j = 0; j < ss.length; j++) ss[j].remove();
@@ -95,6 +271,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     try { delete window.__wbsWidget; } catch (e) { window.__wbsWidget = null; }
     try { delete window.__wbsDiag; } catch (e) { window.__wbsDiag = null; }
     try { delete window.__wbsThemeAudit; } catch (e) { window.__wbsThemeAudit = null; }
+    // 队列 adapter 缓存必须一并清除：旧 shim（包装方法齐全但指向失效/错误对象）若不删，
+    // findWbsAdapter 的缓存校验会直接复用旧 shim，导致「修好代码重注入后仍跑旧逻辑」。
+    try { delete window.__wbsAdapter; } catch (e) { window.__wbsAdapter = null; }
   })();
   // ===== 顶部红色角标已移除（用户要求）；仅保留 console 标记 =====
   try { console.log('[WBS] inject.js 已执行于', location.href, 'body=', !!document.body); } catch (_) {}
@@ -103,8 +282,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   var PROFILE_ID = '__WBS_PROFILE__';
   var CAPS = __WBS_CAPS__;
   var WBS_API_TOKEN = '__WBS_API_TOKEN__';
+  var WBS_DIAGNOSTICS_ENABLED = __WBS_DIAGNOSTICS_ENABLED__;
+  var WBS_PLATFORM = '__WBS_PLATFORM__'; // 注入时替换为 process.platform（如 'darwin'/'win32'）
+  // WorkBuddy 基于 Electron，持续会话模块在 macOS/Windows 使用同一套 CDP 逻辑。
+  var AC_SUPPORTED = true;
   // 面板品牌名跟随 profile：workbuddy-ai 显示 WorkDaddy AI，其余显示 WorkDaddy
   var WBS_BRAND = PROFILE_ID === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy';
+  // 客户端类型判断（WorkDaddy vs WorkDaddy AI，UI/功能区分的主依据，详见 AGENTS.md「客户端类型判断」）：
+  //  - workbuddy-ai（WorkBuddy AI 客户端）= WorkDaddy AI：输入框右下角两个插件按钮内联进
+  //    cr-input-toolbar__right（输入框右下角按钮组父容器）的最左侧（其他按钮左边）。
+  //  - 其余 profile（WorkBuddy 客户端）= WorkDaddy：两个插件按钮保持既有摆放方式不变。
+  var WBS_PROFILE_IS_AI = PROFILE_ID === 'workbuddy-ai';
 
   // ===== 全局错误钩子：捕获渲染进程不可捕获的 error / unhandledrejection，把完整消息+栈
   // 打到 daemon 日志。渲染进程级崩溃（如 An object could not be cloned）虽非 try/catch 能拦，
@@ -121,9 +309,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } catch (_) {}
       var line = '[wbscrash] ' + kind + ': ' + msg + (stack ? '\n' + stack : '');
       try { console.error(line); } catch (_) {}
-      try {
-        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
-      } catch (_) {}
+      if (WBS_DIAGNOSTICS_ENABLED) {
+        try {
+          fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
+        } catch (_) {}
+      }
     }
     window.addEventListener('error', function (ev) { wbsReportErr('error', ev); });
     window.addEventListener('unhandledrejection', function (ev) { wbsReportErr('unhandledrejection', ev); });
@@ -171,6 +361,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>' +
     '<polyline points="16 17 21 12 16 7"/>' +
     '<line x1="21" y1="12" x2="9" y2="12"/></svg>';
+  // 当前使用中角标：回复/右转箭头（用户指定图形，颜色跟随昵称文字色）
+  var CUR_MARK_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">' +
+    '<path fill="currentColor" d="M4.472 4.75c-.597 0-1.293.166-1.862.519c-.58.358-1.11.974-1.11 1.856v9.75c0 .882.53 1.497 1.11 1.856c.57.353 1.265.519 1.862.519H14.77a2.75 2.75 0 0 0 1.92-.781l5.35-5.216a1.75 1.75 0 0 0 0-2.506l-5.35-5.216a2.75 2.75 0 0 0-1.92-.781z"/></svg>';
   // 积分余额图标：AI 四芒星线条矢量（无背景色，currentColor 跟随文字色）
   var CREDIT_ICON =
     '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
@@ -195,6 +389,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '<circle cx="5.5" cy="5.5" r="1.5" fill="currentColor"/>' +
     '</svg>';
 
+  // 探索菜单按钮图标（对话气泡矢量图，fill 跟随按钮文字色；尺寸与暂存按钮图标一致 16）
+  var EXPLORE_SVG =
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">' +
+    '<path fill="currentColor" d="M19 3a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7.333L4 21.5c-.824.618-2 .03-2-1V6a3 3 0 0 1 3-3h14Zm-8 9H8a1 1 0 1 0 0 2h3a1 1 0 1 0 0-2Zm5-4H8a1 1 0 0 0-.117 1.993L8 10h8a1 1 0 0 0 .117-1.993L16 8Z"/></svg>';
+  var EXPLORE_PREMIUM_SVG =
+    '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>';
+  var EXPLORE_CHECK_SVG =
+    '<svg viewBox="0 0 20 20" width="15" height="15" fill="currentColor"><path d="M16.707 5.293a1 1 0 0 1 0 1.414l-8 8a1 1 0 0 1-1.414 0l-4-4a1 1 0 0 1 1.414-1.414L8 12.586l7.293-7.293a1 1 0 0 1 1.414 0z" clip-rule="evenodd" fill-rule="evenodd"/></svg>';
+  var EXPLORE_LOCK_SVG =
+    '<svg viewBox="0 0 20 20" width="15" height="15" fill="currentColor"><path d="M5 9V7a5 5 0 0 1 10 0v2a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2zm8-2v2H7V7a3 3 0 1 1 6 0z" clip-rule="evenodd" fill-rule="evenodd"/></svg>';
+
   // 今日签到状态展示：账号卡片底部与积分余额并列显示
   function isIdentityExpired(a) {
     if (!a) return false;
@@ -209,6 +414,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     return false;
   }
+
+  function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function escAttr(t) { return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 
   function checkinHtml(a) {
     // 国际版不开放签到活动：积分卡上的签到标签整体不展示（CN 版保留完整逻辑）
@@ -225,13 +433,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     if (c.ok) return '<span class="wbs-ck wbs-checkin-tag ok">今日已签到✓</span>';
     // 认证类错误（401/未授权）统一显示友好文案（daemon 已产出，缓存残留旧文案时兜底）
     if (/401|Unauthorized|未授权|登录身份过期/.test(msg)) msg = '登录身份过期';
-    return '<span class="wbs-ck wbs-checkin-tag fail">' + msg + '</span>';
+    return '<span class="wbs-ck wbs-checkin-tag fail">' + esc(msg) + '</span>';
   }
 
-  function el(tag, cls, html) {
+  function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) n.className = cls;
-    if (html !== undefined) n.innerHTML = html;
+    if (text !== undefined) n.textContent = String(text);
     return n;
   }
 
@@ -457,13 +665,35 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       capturedAt: new Date().toISOString(),
     };
   }
-  // 尽量拿到当前会话 id（URL / 侧边栏激活项 / 标题兜底）
+  function getWorkBuddyAiSelectedConversationId() {
+    if (!WBS_PROFILE_IS_AI) return null;
+    try {
+      var nodes = document.querySelectorAll('.conversation-item[data-conversation-id]');
+      var candidates = [];
+      for (var i = 0; i < nodes.length; i++) {
+        var child = nodes[i].firstElementChild;
+        candidates.push({
+          conversationId: nodes[i].getAttribute('data-conversation-id'),
+          ariaSelected: nodes[i].getAttribute('aria-selected') || (child && child.getAttribute('aria-selected')),
+          className: nodes[i].className,
+          childClassName: child && child.className,
+        });
+      }
+      return resolveWorkBuddyAiConversationId(candidates);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 尽量拿到当前会话 id（URL / WorkBuddy AI 选中侧栏项 / 通用激活项 / 标题兜底）
   function getConversationId() {
     try {
       var u = new URL(location.href);
       var q = u.searchParams.get('conversationId') || u.searchParams.get('conversation_id');
       if (q) return q;
     } catch (_) {}
+    var aiId = getWorkBuddyAiSelectedConversationId();
+    if (aiId) return aiId;
     var sel = document.querySelector('[data-conversation-id].active,[data-conversation-id][aria-selected="true"],.conversation-item.active,[data-conversation-id][class*="active"],.conv-item.active,[class*="conversation"][class*="active"]');
     if (sel) {
       var id = sel.getAttribute('data-conversation-id') || sel.getAttribute('data-id');
@@ -533,7 +763,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     function toast(msg, isErr, targetRoot) {
       if (!alive) return;
-      var t = el('div', 'wbs-toast' + (isErr ? ' err' : ''), msg);
+      var t = el('div', 'wbs-toast' + (isErr ? ' err' : ''));
+      t.textContent = String(msg == null ? '' : msg);
       (targetRoot || document.body).appendChild(t);
       setBuildTimeout(function () {
         t.classList.add('out');
@@ -622,7 +853,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           return { node: node, previousNode: previousNode, hasAssistant: true, assistantTextLength: text.length, hasCompletionActions: true, completionMarker: /<!--\s*WBS_DONE\s*-->|\bWBS_DONE\b/i.test(text), looksTruncated: false, streaming: streaming };
         }
       }
-      var looksTruncated = /(\.\.\.|…|正在$|等待$|调用$|执行$|结果如下[:：]?$|[,，:：]$)/.test(text);
+      var looksTruncated = /(\.\.\.|…|正在$|等待$|调用$|执行$|结果如下[:：]?$)/.test(text);
       return { node: node, previousNode: previousNode, hasAssistant: true, assistantTextLength: text.length, hasCompletionActions: false, completionMarker: /<!--\s*WBS_DONE\s*-->|\bWBS_DONE\b/i.test(text), looksTruncated: looksTruncated, streaming: streaming };
     }
 
@@ -836,7 +1067,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     document.body.appendChild(root);
 
     // 不同客户端只开放明确支持的能力；保留统一面板结构可避免模式切换时布局抖动。
-    if (!CAPS.theme) {
+    // WorkDaddy AI 新版本不再暴露 WorkDaddy 主题入口；普通 WorkDaddy 仍按
+    // 原有 CAPS.theme 能力决定是否显示主题页。
+    if (!CAPS.theme || WBS_PROFILE_IS_AI) {
       var themeTab = root.querySelector('[data-tab="theme"]');
       var themePane = root.querySelector('[data-pane="theme"]');
       if (themeTab) themeTab.remove();
@@ -869,7 +1102,315 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     stashBtn.setAttribute('tabindex', '0');
     stashBtn.title = '暂存提示词';
     stashBtn.innerHTML = '<span class="wbs-stash-ico">' + STASH_SVG + '</span><span class="wbs-stash-txt">暂存提示词</span>';
+    // 防输入框失焦：点击按钮时不把焦点从输入框抢走（退格/打字持续有效）
+    stashBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
     if (!CAPS.stashPrompt) stashBtn.style.display = 'none';
+
+    // 探索菜单按钮：复用暂存提示词按钮的样式类（同款圆钮），hover 不变宽；悬浮弹出菜单
+    var exploreBtn = document.createElement('div');
+    exploreBtn.className = 'wbs-stash-inline wbs-explore-inline';
+    exploreBtn.setAttribute('role', 'button');
+    exploreBtn.setAttribute('tabindex', '0');
+    exploreBtn.addEventListener('mousedown', function (e) { e.preventDefault(); }); // 防输入框失焦
+    exploreBtn.innerHTML =
+      '<span class="wbs-explore-ico">' + EXPLORE_SVG + '</span>' +
+      '<div class="wbs-explore-pop" role="tooltip">' +
+      '<div class="wbs-explore-card">' +
+      '<div class="wbs-explore-list" id="wbs-explore-list"></div>' +
+      '<div class="wbs-explore-foot">' +
+      '<span class="wbs-explore-send-txt">点击后发送</span>' +
+      '<a class="wbs-explore-edit" href="#" onclick="return false">编辑 →</a>' +
+      '</div>' +
+      '</div>' +
+      '</div>';
+    var exploreSendTxt = exploreBtn.querySelector('.wbs-explore-send-txt');
+    if (exploreSendTxt) {
+      exploreSendTxt.addEventListener('click', function (e) {
+        e.stopPropagation();
+        acMenuClose();
+        api('/api/auto-continue-send-current', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        }).then(function (d) {
+          if (!d || !d.ok) toast('发送失败: ' + ((d && d.error) || 'daemon 未确认'), true, root);
+        }).catch(function (e2) { toast('发送失败: ' + (e2.message || e2), true, root); });
+      });
+    }
+    var exploreEditBtn = exploreBtn.querySelector('.wbs-explore-edit');
+    if (exploreEditBtn) {
+      exploreEditBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        acMenuClose();
+        // 唤起 WorkDaddy 面板并聚焦「增强」页（快捷短语管理区）
+        try {
+          if (!state.open) setOpen(true);
+          setTimeout(function () {
+            var t = root && root.querySelector('.wbs-tab[data-tab="enhance"]');
+            if (t) t.click();
+            setTimeout(function () {
+              var area = enhancePane && enhancePane.querySelector('#wbs-qp-area');
+              if (area && area.scrollIntoView) { try { area.scrollIntoView({ block: 'nearest' }); } catch (_) {} }
+            }, 200);
+          }, 80);
+        } catch (e2) {
+          toast('打开面板失败: ' + (e2.message || e2), true, root);
+        }
+      });
+    }
+    // 面板关闭/重开：点击选项（发送/编辑/任意项）后关闭面板；重新进入按钮区恢复 hover 可展示
+    function acMenuClose() {
+      exploreBtn.classList.add('wbs-menu-closed');
+    }
+    exploreBtn.addEventListener('mouseenter', function () { exploreBtn.classList.remove('wbs-menu-closed'); });
+    exploreBtn.addEventListener('mouseleave', function () { exploreBtn.classList.remove('wbs-menu-closed'); });
+    if (isWelcomePage()) exploreBtn.style.display = 'none'; // 欢迎页无操作栏，定位没意义；其余情况由 syncStash 常驻显示
+
+    /* ———— 会话模块（session）：暂存提示词 & 快捷短语 ————
+     * 状态持久化在 daemon（~/.workbuddy/settings.json 的 wbs.session 域）。
+     * stash 按钮显隐受「暂存提示词」开关影响；explore 按钮与面板选项受「快捷短语」开关/列表影响。 */
+    var sessState = { stash: true, phrase: true, phrases: [], qpBatch: false, qpSel: {} };
+    var sessLastExploreSig = ''; // 面板选项渲染签名（内容未变不重建保留 tooltip 状态）
+    var sessLastQpSig = ''; // 增强页列表渲染签名（内容/批量模式/选中集未变不重建）
+    function applySessionModule(d) {
+      if (!d || !d.ok) return;
+      sessState.stash = !!d.stashEnabled;
+      sessState.phrase = !!d.phraseEnabled;
+      sessState.phrases = Array.isArray(d.phrases) ? d.phrases : [];
+      // 同步 UI：两个开关 + 快捷短语列表区显隐
+      var pane0 = enhancePane;
+      var swS = pane0 && pane0.querySelector('#wbs-sess-stash');
+      var swP = pane0 && pane0.querySelector('#wbs-sess-phrase');
+      var area = pane0 && pane0.querySelector('#wbs-qp-area');
+      if (swS) swS.checked = !!sessState.stash;
+      if (swP) swP.checked = !!sessState.phrase;
+      if (area) area.style.display = sessState.phrase ? '' : 'none';
+      renderQpList();
+      renderExploreOptions();
+      syncStash(); // 刷新输入框两个按钮的显隐（受开关影响）
+    }
+    function syncSessionModule() {
+      api('/api/session-module').then(function (d) {
+        if (d && d.ok) applySessionModule(d);
+      }).catch(function () {});
+    }
+    /** 开关切换：写 daemon 并回应用户界（设置失败回滚 UI 状态） */
+    function setSessionSwitchWire(name, el) {
+      var v = !!el.checked;
+      api('/api/session-module-set', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: name, enabled: v }),
+      }).then(function (d) {
+        if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认');
+        applySessionModule(d);
+      }).catch(function (e) {
+        toast('设置失败: ' + (e.message || e), true, root);
+        syncSessionModule();
+      });
+    }
+    /** 增强页快捷短语列表渲染（含批量模式） */
+    function renderQpList() {
+      var pane1 = enhancePane;
+      var listEl = pane1 && pane1.querySelector('#wbs-qp-list');
+      if (!listEl) return;
+      var phrases = sessState.phrases || [];
+      // 签名去重：内容/批量模式/选中集无变化则不重建 DOM（防 hover 闪烁与 checkbox 抖动）
+      var sig = (sessState.qpBatch ? 'B' : 'b') + '|' +
+        Object.keys(sessState.qpSel).sort().join(',') + '|' +
+        (phrases.length ? phrases.map(function (p) { return p.id + ':' + p.text; }).join('|') : 'empty');
+      if (sig === sessLastQpSig) return;
+      sessLastQpSig = sig;
+      var barEl = pane1.querySelector('#wbs-qp-batchbar');
+      var countEl = pane1.querySelector('#wbs-qp-batch-count');
+      var batchBtn = pane1.querySelector('#wbs-qp-batch');
+      var allBtn = pane1.querySelector('#wbs-qp-checkall');
+      if (barEl) barEl.style.display = sessState.qpBatch ? 'inline-flex' : 'none';
+      if (batchBtn) batchBtn.style.display = (sessState.qpBatch || !phrases.length) ? 'none' : '';
+      if (countEl) countEl.textContent = '已选 ' + Object.keys(sessState.qpSel).length;
+      if (allBtn) allBtn.textContent = (sessState.qpBatch && phrases.length && Object.keys(sessState.qpSel).length === phrases.length) ? '取消全选' : '全选';
+      if (!phrases.length) {
+        listEl.innerHTML = '<div class="wbs-qp-empty">暂无快捷短语，点击「+ 新增」添加</div>';
+        return;
+      }
+      var html = '';
+      for (var i = 0; i < phrases.length; i++) {
+        var ph = phrases[i];
+        var checked = sessState.qpSel[ph.id] ? ' checked' : '';
+        var cb = sessState.qpBatch ? '<input type="checkbox" class="wbs-qp-check" data-id="' + escAttr(ph.id) + '"' + checked + '>' : '';
+        html +=
+          '<div class="wbs-qp-row" data-id="' + escAttr(ph.id) + '">' +
+          cb +
+          '<span class="wbs-qp-text" title="' + escAttr(ph.text) + '">' + esc(ph.text) + '</span>' +
+          '<span class="wbs-qp-actions">' +
+          '<button type="button" class="wbs-qp-icon-btn" data-qp-edit="' + escAttr(ph.id) + '" title="编辑">' + MODEL_EDIT_SVG + '</button>' +
+          '<button type="button" class="wbs-qp-icon-btn wbs-qp-del" data-qp-del="' + escAttr(ph.id) + '" title="删除">' + TRASH_SVG + '</button>' +
+          '</span>' +
+          '</div>';
+      }
+      listEl.innerHTML = html;
+      var checks = listEl.querySelectorAll('.wbs-qp-check');
+      for (var c = 0; c < checks.length; c++) {
+        checks[c].addEventListener('change', function () {
+          var qid = this.getAttribute('data-id');
+          if (this.checked) sessState.qpSel[qid] = 1;
+          else delete sessState.qpSel[qid];
+          renderQpList();
+        });
+      }
+      var edits = listEl.querySelectorAll('[data-qp-edit]');
+      for (var e2 = 0; e2 < edits.length; e2++) {
+        edits[e2].addEventListener('click', function (ev) { ev.stopPropagation(); openQpEdit(this.getAttribute('data-qp-edit')); });
+      }
+      var dels = listEl.querySelectorAll('[data-qp-del]');
+      for (var d2 = 0; d2 < dels.length; d2++) {
+        dels[d2].addEventListener('click', function (ev) { ev.stopPropagation(); confirmQpDelete([this.getAttribute('data-qp-del')]); });
+      }
+    }
+    /** 发送按钮面板选项 = 快捷短语列表；点击项经 CDP 发送该短语（替换式，发完默认关面板） */
+    function renderExploreOptions() {
+      var listHost = exploreBtn && exploreBtn.querySelector('#wbs-explore-list');
+      if (!listHost) return;
+      var phrases = sessState.phrases || [];
+      // 渲染签名去重：短语内容无变化则不重建 DOM（syncStash 高频调用会摧毁 tooltip 的显示状态/绑定 → 闪烁）
+      var sig = phrases.length ? phrases.map(function (p) { return p.id + ':' + p.text; }).join('|') : 'empty';
+      if (sig === sessLastExploreSig) return;
+      sessLastExploreSig = sig;
+      if (!phrases.length) {
+        listHost.innerHTML = '<div class="wbs-qp-empty wbs-qp-empty-menu">暂无快捷短语</div>';
+        return;
+      }
+      var html = '';
+      for (var i = 0; i < phrases.length; i++) {
+        var ph = phrases[i];
+        html += '<div class="wbs-explore-item" data-qp-send="' + escAttr(ph.id) + '">' +
+          '<span class="wbs-explore-it">' + esc(ph.text) + '</span>' +
+          '<span class="wbs-explore-tip"><span class="wbs-explore-tip-body">' + esc(ph.text) + '</span></span>' +
+          '</div>';
+      }
+      listHost.innerHTML = html;
+      var items = listHost.querySelectorAll('[data-qp-send]');
+      for (var k = 0; k < items.length; k++) {
+        (function (itemK) {
+          // tooltip 显隐由 JS 管理（mouseenter/mouseleave + 延迟隐藏），保证 选项→气泡 hover 连续，无闪烁
+          var tipK = itemK.querySelector('.wbs-explore-tip');
+          var hideTimer = null;
+          function showTip() {
+            if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+            tipK.style.opacity = '1';
+            tipK.style.visibility = 'visible';
+            tipK.style.pointerEvents = 'auto';
+          }
+          function hideTip() {
+            tipK.style.opacity = '0';
+            tipK.style.visibility = 'hidden';
+            tipK.style.pointerEvents = 'none';
+          }
+          function hideTipDelayed() {
+            if (hideTimer) clearTimeout(hideTimer);
+            hideTimer = setTimeout(hideTip, 120);
+          }
+          if (tipK) {
+            itemK.addEventListener('mouseenter', showTip);
+            itemK.addEventListener('mouseleave', hideTipDelayed);
+            tipK.addEventListener('mouseenter', function () { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } });
+            tipK.addEventListener('mouseleave', hideTipDelayed);
+          }
+          itemK.addEventListener('click', function (eve) {
+            eve.stopPropagation();
+            var pid = itemK.getAttribute('data-qp-send');
+            var ph2 = null;
+            for (var m2 = 0; m2 < sessState.phrases.length; m2++) {
+              if (sessState.phrases[m2].id === pid) { ph2 = sessState.phrases[m2]; break; }
+            }
+            if (!ph2) return;
+            acMenuClose();
+            api('/api/quick-phrase-send', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ text: ph2.text }),
+            }).then(function (d) {
+              if (!d || !d.ok) toast('发送失败: ' + ((d && d.error) || 'daemon 未确认'), true, root);
+            }).catch(function (e3) { toast('发送失败: ' + (e3.message || e3), true, root); });
+          });
+        })(items[k]);
+      }
+    }
+    /** 新增/编辑快捷短语弹窗（参考账号导出弹窗；textarea 最多 5 行 / 500 字） */
+    function openQpEdit(id) {
+      var editing = null;
+      if (id) {
+        for (var i4 = 0; i4 < sessState.phrases.length; i4++) {
+          if (sessState.phrases[i4].id === id) { editing = sessState.phrases[i4]; break; }
+        }
+      }
+      var mask = document.createElement('div');
+      mask.className = 'wbs-panel-modal-mask';
+      mask.id = 'wbs-qp-edit-modal';
+      mask.innerHTML =
+        '<div class="wbs-password-modal" role="dialog" aria-modal="true">' +
+        '<div class="wbs-login-modal-title">' + (editing ? '编辑快捷短语' : '新增快捷短语') + '</div>' +
+        '<label class="wbs-password-field"><textarea class="wbs-qp-textarea" id="wbs-qp-textarea" rows="5" placeholder="请输入快捷短语"></textarea></label>' +
+        '<div class="wbs-password-error" id="wbs-qp-error" role="alert"></div>' +
+        '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-qp-edit-cancel">取消</button>' +
+        '<button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-qp-edit-save">保存</button></div>' +
+        '</div>';
+      (panel || root).appendChild(mask);
+      var ta = mask.querySelector('#wbs-qp-textarea');
+      var err = mask.querySelector('#wbs-qp-error');
+      if (editing) ta.value = editing.text;
+      ta.focus();
+      function closeQpEdit() { if (mask.parentNode) mask.parentNode.removeChild(mask); }
+      mask.querySelector('#wbs-qp-edit-cancel').addEventListener('click', closeQpEdit);
+      mask.addEventListener('click', function (ev) { if (ev.target === mask) closeQpEdit(); });
+      mask.querySelector('#wbs-qp-edit-save').addEventListener('click', function () {
+        var text = ta.value;
+        if (!text.trim()) { err.textContent = '短语不能为空'; return; }
+        var body = editing
+          ? JSON.stringify({ id: editing.id, text: text })
+          : JSON.stringify({ text: text });
+        api(editing ? '/api/quick-phrase-update' : '/api/quick-phrase-add', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: body,
+        }).then(function (d) {
+          if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认');
+          closeQpEdit();
+          applySessionModule(d);
+        }).catch(function (e5) { err.textContent = (e5.message || e5); });
+      });
+    }
+    /** 删除二次确认弹窗（支持单选/批量） */
+    function confirmQpDelete(ids) {
+      var list = Array.isArray(ids) ? ids : [ids];
+      if (!list.length) return;
+      var mask = document.createElement('div');
+      mask.className = 'wbs-modal-mask';
+      mask.id = 'wbs-qp-del-modal';
+      mask.innerHTML =
+        '<div class="wbs-modal">' +
+        '<div class="wbs-modal-title">删除快捷短语</div>' +
+        '<div class="wbs-modal-body">确定删除' + (list.length > 1 ? '这 ' + list.length + ' 条' : '这条') + '快捷短语吗？删除后不可恢复。</div>' +
+        '<div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-qp-del-cancel">取消</button>' +
+        '<button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-qp-del-ok">删除</button></div>' +
+        '</div>';
+      (panel || root).appendChild(mask);
+      function closeQpDel() { if (mask.parentNode) mask.parentNode.removeChild(mask); }
+      mask.querySelector('#wbs-qp-del-cancel').addEventListener('click', closeQpDel);
+      mask.addEventListener('click', function (ev) { if (ev.target === mask) closeQpDel(); });
+      mask.querySelector('#wbs-qp-del-ok').addEventListener('click', function () {
+        api('/api/quick-phrase-delete', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ids: list }),
+        }).then(function (d) {
+          if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认');
+          closeQpDel();
+          if (sessState.qpBatch) { sessState.qpBatch = false; sessState.qpSel = {}; }
+          applySessionModule(d);
+        }).catch(function (e6) { toast('删除失败: ' + (e6.message || e6), true, root); closeQpDel(); });
+      });
+    }
 
     // 定位输入框操作栏（含 voice-mic-wrap 的父容器）
     function findActionRow() {
@@ -892,11 +1433,24 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       return null;
     }
-    // AI 端输入框右下角按钮组。用户 DOM 路径：
-    // ..._input-area-container_ > section._container_ > ... > div._spaceBetween_._inputBottom_ > div._item_._gapLarge_
-    // 注意 _inputBottom_ 下有两个按钮组：左侧工具组(class 含 _selector_)、右侧发送按钮组(class 含 _gapLarge_，
-    // x 更靠右)。必须命中右侧 _gapLarge_ 组，排除 _selector_ 组。
+    // AI 端输入框右下角按钮组。新布局（WorkBuddy AI teams 新界面）用户 DOM 路径：
+    // ... > div.conversation-input > div.cr-theme > div.cr-theme.cr-input-box >
+    //   div.cr-input-box__main > div.cr-input-container-wrapper > div.cr-input-container >
+    //   div.cr-input-toolbar > div.cr-input-toolbar__right
+    // cr-input-toolbar__right 即输入框右下角按钮组的父容器（上下文用量/增强/模型/发送）。
+    // WorkDaddy AI 客户端：两个插件按钮（暂存提示词、快捷短语）内联插到该容器最左侧（其他按钮左边）。
+    // 老布局兜底：..._input-area-container_ > ... > div._spaceBetween_._inputBottom_ > div._item_._gapLarge_
+    //（_inputBottom_ 下有两个按钮组：左侧工具组 class 含 _selector_、右侧发送按钮组 class 含 _gapLarge_，
+    //  必须命中右侧 _gapLarge_ 组，排除 _selector_ 组）
     function findAiToolbar() {
+      // 新布局优先（仅 WorkDaddy AI 客户端启用；普通 WorkBuddy 客户端仍保持既有摆放）
+      if (WBS_PROFILE_IS_AI) {
+        var cr = document.querySelector('div.cr-input-toolbar__right');
+        if (cr) {
+          var crR = cr.getBoundingClientRect();
+          if (crR.width > 0 && crR.height > 0) return cr;
+        }
+      }
       var cands = document.querySelectorAll(
         '[class*="_inputBottom_"] > [class*="_gapLarge_"],' +
         '[class*="_inputBottom_"] > [class*="_gap_"]:not([class*="_selector_"]),' +
@@ -945,28 +1499,78 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     // 关键：CN 端用 position: fixed 绝对定位到发送按钮坐标旁，挂在 document.body 下，
     // 不插入到操作栏 row.children 里——避开 React reconciliation 丢弃外部节点的问题。
-    // AI 端（无 voice-mic-wrap）：实测其按钮容器不清理外部插入节点，直接内联插入
-    // 操作栏右侧按钮组的第一位（用户要求的摆放方式），fixed 定位由 CSS 类覆盖为静态参与 flex。
+    // 客户端类型判断（见 AGENTS.md「客户端类型判断」）决定了摆放方式：
+    //  - WorkDaddy 普通客户端（voice-mic-wrap 存在）：固定定位，保持既有位置。
+    //  - WorkDaddy AI（workbuddy-ai，无 voice-mic-wrap）：内联插入输入框右下角按钮组
+    //    cr-input-toolbar__right 的最左侧（其他按钮左边，用户要求的摆放方式），
+    //    fixed 定位由 CSS 类覆盖为静态参与 flex。
     function insertStash() {
       // 重新注入脚本时先移除旧版按钮（避免旧 SVG 图标/样式残留）
       var oldBtn = document.querySelector('.wbs-stash-inline');
       if (oldBtn && oldBtn !== stashBtn) oldBtn.remove();
+      var oldExp = document.querySelector('.wbs-explore-inline');
+      if (oldExp && oldExp !== exploreBtn) oldExp.remove();
       var mic0 = document.querySelector('.voice-mic-wrap');
       if (!mic0) {
         var row0 = findAiToolbar();
         if (row0) {
           stashBtn.classList.add('wbs-stash-inline-inline');
+          exploreBtn.classList.add('wbs-stash-inline-inline');
+          exploreBtn.style.right = 'auto';
+          exploreBtn.style.top = 'auto';
           if (stashBtn.parentElement !== row0) row0.insertBefore(stashBtn, row0.firstChild);
+          // 探索按钮贴暂存按钮右侧
+          if (exploreBtn.parentElement !== row0) row0.insertBefore(exploreBtn, stashBtn.nextSibling);
         } else {
           // 容器暂不可用：回落到 body + fixed 定位
           stashBtn.classList.remove('wbs-stash-inline-inline');
+          exploreBtn.classList.remove('wbs-stash-inline-inline');
           if (!stashBtn.parentElement) document.body.appendChild(stashBtn);
+          if (!exploreBtn.parentElement) document.body.appendChild(exploreBtn);
           positionStash();
         }
         return;
       }
       if (!stashBtn.parentElement) document.body.appendChild(stashBtn);
+      if (!exploreBtn.parentElement) document.body.appendChild(exploreBtn);
       positionStash();
+    }
+    // 探索菜单按钮：位于暂存提示词按钮右侧（与暂存同款圆钮、发送图标，hover 悬浮菜单弹窗）
+    function positionExplore() {
+      var wr = parseFloat(stashBtn.style.right || '');
+      if (!isFinite(wr)) return;
+      exploreBtn.style.right = (wr - 38) + 'px'; // 32=按钮宽，6=gutter（贴暂存按钮右侧）
+      exploreBtn.style.top = stashBtn.style.top || '0px';
+    }
+    // 跟随主题设置按钮颜色（放弃跟随官方按钮）：浅色主题=黑底白图标；深色/WorkDaddy 主题=白底黑图标
+    var acThemeObserver = null;
+    function acIsDarkTheme() {
+      try {
+        var de = document.documentElement;
+        if (de.classList && de.classList.contains('cb-dark')) return true;
+        if (de.getAttribute && de.getAttribute('data-theme') === 'dark') return true;
+        var bd = document.body;
+        if (bd && bd.getAttribute('data-vscode-theme-name') && /dark/i.test(bd.getAttribute('data-vscode-theme-name') || '')) return true;
+        return false;
+      } catch (e) { return false; }
+    }
+    function applyThemeButtonColors() {
+      try {
+        var useWhite = acIsDarkTheme(); // 深色主题 → 白底；浅色 → 黑底
+        var bg = useWhite ? '#ffffff' : '#111111';
+        var fg = useWhite ? '#111111' : '#ffffff';
+        stashBtn.style.background = bg;
+        stashBtn.style.color = fg;
+        exploreBtn.style.background = bg;
+        exploreBtn.style.color = fg;
+      } catch (e) {}
+    }
+    function watchThemeForButtons() {
+      if (acThemeObserver || typeof MutationObserver === 'undefined') return;
+      try {
+        acThemeObserver = new MutationObserver(function () { applyThemeButtonColors(); });
+        acThemeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme'] });
+      } catch (e) {}
     }
     function positionStash() {
       // AI 端没有 voice-mic-wrap：操作栏按钮行位于输入框正下方（与输入框同祖先容器）。
@@ -1016,6 +1620,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           stashBtn.style.right = (window.innerWidth - (er0.left - gap0)) + 'px';
           stashBtn.style.top = (er0.top - 1) + 'px';
         }
+        positionExplore();
         return true;
       }
       // 锚点：操作栏最左元素（row.children[0]），定位到它的左边——整个操作栏最左。
@@ -1029,6 +1634,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 右边缘固定在 firstChild.left - gap，width 增大时左边向左伸出
       stashBtn.style.right = (window.innerWidth - (fr.left - gap)) + 'px';
       stashBtn.style.top = fr.top + 'px';
+      positionExplore();
       return true;
     }
     function removeStash() {
@@ -1056,10 +1662,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       clearTimeout(stashSyncThrottle);
       // 节流 30ms：比 120ms 响应更快（接近原生 React 按钮的体感），仍能合并快速连续触发
       stashSyncThrottle = setBuildTimeout(function () {
-        // 欢迎页强制隐藏（进入欢迎页/切回欢迎页时兜底，避免上一会话残留按钮）
-        if (isWelcomePage()) { stashBtn.style.display = 'none'; return; }
-        if (shouldShowStash()) {
-          insertStash();
+        // 欢迎页强制隐藏
+        if (isWelcomePage()) { stashBtn.style.display = 'none'; exploreBtn.style.display = 'none'; return; }
+        // 探索按钮常驻（若「快捷短语」开关开着）：不等输入框有内容，只要定位到操作栏就常显
+        insertStash();
+        exploreBtn.style.display = sessState.phrase ? 'flex' : 'none';
+        applyThemeButtonColors(); // 主题色按钮（浅色黑底白图 / 深色白底黑图）
+        renderExploreOptions(); // 面板选项 = 快捷短语列表（增删改后同步刷新）
+        // 暂存按钮：仍按输入框是否有内容显隐，且「暂存提示词」开关需开着
+        if (shouldShowStash() && sessState.stash) {
           stashBtn.style.display = 'flex';
         } else {
           stashBtn.style.display = 'none';
@@ -1122,8 +1733,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function onInputSync() { if (!alive) return; guardSessionChange(); scheduleFabPos(); syncStash(); syncQueueTags(); wrapQueueReorder(); }
     syncThemeAuditRoot();
     if (themeAudit) setBuildInterval(syncThemeAuditRoot, 1200);
-    // 暂存项暂停守护：1.2s 周期轮询，保证暂存提示词绝不被自动发送（见 guardStashedPause 注释）
-    setBuildInterval(guardStashedPause, 1200);
+    // 暂存项暂停守护：600ms 周期轮询，保证暂存提示词绝不被自动发送（见 guardStashedPause 注释）
+    setBuildInterval(guardStashedPause, 600);
     watchRow();
     watchSend();
     // 输入框输入/粘贴/中文合成结束也直接触发，覆盖 React 仅改内部状态、不动属性的情况
@@ -1204,7 +1815,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var qr = q.getBoundingClientRect();
         if (qr.height > 1 && qr.width > 1) { target = qr; solid = true; }
       }
-      // 2) 兜底：输入框主体 _mainArea（聊天页 _input-area-container 内 / 主页 wb-home-composer 内）
+      // 2) WorkBuddy AI 新版聊天输入框不再使用旧的 _input-area-container/_mainArea_ 类名，
+      // 实际可定位元素是 conversation-input-area 下的 .cr-input-container。
+      // 必须在旧的生成类名兜底之前命中它，否则无队列时机器人只能落到默认右下角。
+      if (!target && WBS_PROFILE_IS_AI) {
+        var aiInput = document.querySelector(
+          '.conversation-input-area .conversation-input .cr-input-box .cr-input-container,' +
+          ' .conversation-input-area .cr-input-container,' +
+          ' .conversation-shell__main .cr-input-container'
+        );
+        if (aiInput) {
+          var air = aiInput.getBoundingClientRect();
+          if (air.height > 1 && air.width > 1) target = air;
+        }
+      }
+      // 3) 旧版/普通 WorkBuddy 兜底：输入框主体 _mainArea（聊天页 _input-area-container 内 /
+      // 主页 wb-home-composer 内）。
       if (!target) {
         var ma = document.querySelector('[class*="_input-area-container_"] [class*="_mainArea_"]');
         if (!ma) ma = document.querySelector('.wb-home-composer [class*="_mainArea_"]');
@@ -1266,10 +1892,197 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     // ===== 暂存提示词：优先入队到 WorkBuddy 的 message queue（完整富文本 + 暂停自动发送）=====
     // 通过 React fiber 提取 adapter（含 enqueueConversationMessageQueueItem / pauseConversationMessageQueue）。
+    // 客户端差异（见 AGENTS.md「客户端类型判断」）：
+    //  - WorkDaddy 普通客户端（workbuddy-cn 等）：队列方法直接挂在 props 的 adapter 对象上，
+    //    从 voice-mic-wrap/_cbChat_/chat-container 等旧根向上走 fiber。
+    //  - WorkDaddy AI（workbuddy-ai，teams 新布局）：官方队列包装方法位于 props.adapter 的原型链，
+    //    内部负责 _notifyQueueUpdate 刷新官方队列面板；adapter.sessionsResource 只是底层透传，不能使用。
+    //    新布局已无 voice-mic-wrap/_cbChat_/chat-container 旧根 → 用 DFS 全树找 adapter，
+    //    包一层与旧接口同名的适配层；会话 id 优先 adapter 字段，再取 AI 侧栏选中项。
+    var aiOptimisticQueueIds = {};
+    function syncWorkBuddyAiQueueSnapshot(sessionId, snapshot) {
+      if (!WBS_PROFILE_IS_AI || !sessionId || !snapshot ||
+          (!Array.isArray(snapshot.items) && !snapshot.__wbsOptimistic)) return false;
+      try {
+        // WorkBuddy AI 新版队列组件订阅 ConversationController.promptQueue store，
+        // 不直接订阅 adapter._notifyQueueUpdate。把官方 RPC 返回的真实快照同步给当前会话 store。
+        var roots = [
+          document.querySelector('.cr-document[data-root-id="' + String(sessionId).replace(/"/g, '\\"') + '"]'),
+          document.querySelector('.conversation-shell'),
+          document.querySelector('#root > div'),
+        ];
+        for (var ri = 0; ri < roots.length; ri++) {
+          var el = roots[ri];
+          if (!el) continue;
+          for (var key in el) {
+            if (key.indexOf('__reactFiber$') !== 0 && key.indexOf('__reactInternalInstance') !== 0) continue;
+            var cur = el[key], seen = 0;
+            while (cur && seen++ < 500) {
+              var props = cur.memoizedProps;
+              var controller = props && props.value;
+              if (controller && controller.conversationId === sessionId && controller.promptQueue &&
+                  controller.promptQueue.interactionStore &&
+                  typeof controller.promptQueue.interactionStore.getState === 'function' &&
+                  typeof controller.promptQueue.emitQueueUpdate === 'function') {
+                var manager = controller.lifecycle && controller.lifecycle.conv && controller.lifecycle.conv.queueManager;
+                var store = controller.promptQueue.interactionStore.getState();
+                var currentItems = store && (store.promptQueue || store.items);
+                var queueItems = Array.isArray(snapshot.items) ? snapshot.items : null;
+                if (snapshot.__wbsOptimistic && Array.isArray(currentItems)) {
+                  var optimistic = {
+                    id: 'wbs-pending-' + Date.now() + '-' + Math.random().toString(16).slice(2),
+                    conversationId: sessionId,
+                    contentBlocks: snapshot.__wbsOptimistic.slice(),
+                    status: 'pending',
+                    order: currentItems.length ? Math.max.apply(null, currentItems.map(function (item) { return Number(item && item.order) || 0; })) + 1 : 0,
+                    previewText: normalizeQueueText(snapshot.__wbsOptimistic),
+                    __wbsOptimistic: true,
+                  };
+                  aiOptimisticQueueIds[sessionId] = String(optimistic.id);
+                  queueItems = currentItems.concat([optimistic]);
+                }
+                if (!Array.isArray(queueItems)) return false;
+                // AI 5.4 在 RPC 尚未完成/重连时可能返回不带 runtime/version 的空快照。
+                // 这不是“队列已清空”的确认，必须在更新 store 或 manager 镜像前直接丢弃。
+                if (queueItems.length === 0 && Array.isArray(currentItems) && currentItems.length > 0 &&
+                    snapshot.runtime == null && snapshot.version == null && snapshot.updatedAt == null) {
+                  return false;
+                }
+                if (manager && typeof manager.items === 'function') {
+                  // 新版按钮操作走 queueManager.delete/sendNow/move，完成后再由 syncFromConversation()
+                  // 读取 manager.items()。只写 promptQueue store 会导致按钮操作后被空的 manager 缓存冲回去，
+                  // 因此为当前会话维护与官方 RPC snapshot 一致的镜像，并保留原生 RPC 操作。
+                  if (manager.__wbsQueueMirrorInstalled !== 2) {
+                    // ConversationController 会跨脚本重注入存活；用版本号而不是布尔标记，
+                    // 发现旧桥接时强制覆盖，避免继续执行上一版失效的 queueManager 方法。
+                    Object.defineProperty(manager, '__wbsQueueMirrorInstalled', { value: 2, configurable: true });
+                    Object.defineProperty(manager, '__wbsQueueMirrorItems', { value: [], writable: true, configurable: true });
+                    Object.defineProperty(manager, '__wbsQueueOriginalItems', { value: manager.items, configurable: true });
+                    manager.items = function () { return manager.__wbsQueueMirrorItems.slice(); };
+                    manager.delete = function (itemId) {
+                      var adapter = window.__wbsAdapter;
+                      if (!adapter || typeof adapter.removeConversationMessageQueueItem !== 'function') {
+                        return Promise.reject(new Error('WorkBuddy AI 队列删除接口不可用'));
+                      }
+                      return Promise.resolve(adapter.removeConversationMessageQueueItem(sessionId, itemId));
+                    };
+                    manager.sendNow = function (itemId) {
+                      var adapter = window.__wbsAdapter;
+                      if (!adapter || typeof adapter.sendConversationMessageQueueItemNow !== 'function') {
+                        return Promise.reject(new Error('WorkBuddy AI 队列立即发送接口不可用'));
+                      }
+                      return Promise.resolve(adapter.sendConversationMessageQueueItemNow(sessionId, itemId));
+                    };
+                    manager.move = function (itemId, index) {
+                      var adapter = window.__wbsAdapter;
+                      var items = manager.__wbsQueueMirrorItems.slice();
+                      var from = items.findIndex(function (item) { return item && String(item.id) === String(itemId); });
+                      if (from < 0) return Promise.resolve();
+                      var targetIndex = Math.max(0, Math.min(Number(index) || 0, items.length - 1));
+                      var moved = items.splice(from, 1)[0];
+                      items.splice(targetIndex, 0, moved);
+                      var orderedIds = items.map(function (item) { return item && item.id; }).filter(Boolean);
+                      if (!adapter || typeof adapter.reorderConversationMessageQueueItems !== 'function') {
+                        return Promise.reject(new Error('WorkBuddy AI 队列排序接口不可用'));
+                      }
+                      return Promise.resolve(adapter.reorderConversationMessageQueueItems(sessionId, orderedIds));
+                    };
+                  }
+                  manager.__wbsQueueMirrorItems = queueItems.slice();
+                }
+                if (store && typeof store.setPromptQueue === 'function') {
+                  store.setPromptQueue(queueItems);
+                  controller.promptQueue.emitQueueUpdate();
+                  if (!snapshot.__wbsOptimistic) delete aiOptimisticQueueIds[sessionId];
+                  return true;
+                }
+              }
+              cur = cur.return;
+            }
+            break;
+          }
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    function dropWorkBuddyAiOptimisticItem(sessionId) {
+      if (!sessionId || !aiOptimisticQueueIds[sessionId]) return Promise.resolve();
+      var adapter = window.__wbsAdapter;
+      if (!adapter || typeof adapter.getConversationMessageQueue !== 'function') return Promise.resolve();
+      var id = aiOptimisticQueueIds[sessionId];
+      return Promise.resolve(adapter.getConversationMessageQueue(sessionId)).then(function (snapshot) {
+        if (snapshot && Array.isArray(snapshot.items)) {
+          snapshot.items = snapshot.items.filter(function (item) { return String(item && item.id) !== String(id); });
+          syncWorkBuddyAiQueueSnapshot(sessionId, snapshot);
+        }
+        delete aiOptimisticQueueIds[sessionId];
+      }).catch(function () { delete aiOptimisticQueueIds[sessionId]; });
+    }
+
+    function getWorkBuddyAiQueueSnapshot(adapter, sessionId, preferred) {
+      if (preferred && Array.isArray(preferred.items) &&
+          (preferred.items.length > 0 || preferred.runtime != null || preferred.version != null || preferred.updatedAt != null)) {
+        return Promise.resolve(preferred);
+      }
+      if (!adapter || typeof adapter.getConversationMessageQueue !== 'function') return Promise.resolve(preferred || null);
+      try {
+        return Promise.resolve(adapter.getConversationMessageQueue(sessionId)).then(function (fresh) {
+          return fresh || preferred || null;
+        });
+      } catch (e) {
+        return Promise.resolve(preferred || null);
+      }
+    }
+
     function findWbsAdapter() {
       // 缓存校验：adapter 的官方包装方法必须仍在（切账号/重挂载后旧实例可能失效，需重新查找）
       if (window.__wbsAdapter && typeof window.__wbsAdapter.enqueueConversationMessageQueueItem === 'function' &&
           typeof window.__wbsAdapter.pauseConversationMessageQueue === 'function') return window.__wbsAdapter;
+      // WorkDaddy AI（workbuddy-ai）：只包装顶层官方 adapter，确保入队/暂停后触发 _notifyQueueUpdate。
+      if (WBS_PROFILE_IS_AI) {
+        var ai = findAiSessionsAdapter();
+        if (ai) {
+          var target = ai.adapter;
+          var shim = {};
+          ['enqueueConversationMessageQueueItem', 'pauseConversationMessageQueue', 'resumeConversationMessageQueue',
+           'sendConversationMessageQueueItemNow', 'getConversationMessageQueue', 'getQueueState',
+           'activateConversationMessageQueue', 'removeConversationMessageQueueItem',
+           'reorderConversationMessageQueueItems'].forEach(function (m) {
+            if (typeof target[m] === 'function') {
+              shim[m] = function () {
+                var args = Array.prototype.slice.call(arguments);
+                var sessionId = args[0];
+                var result = target[m].apply(target, args);
+                // 所有会返回队列 snapshot 的操作都同步 UI store；无 snapshot 的查询不产生副作用。
+                return Promise.resolve(result).then(function (snapshot) {
+                  syncWorkBuddyAiQueueSnapshot(sessionId, snapshot);
+                  return snapshot;
+                });
+              };
+            }
+          });
+          // WorkBuddy AI 的 adapter.currentActiveSessionId 在当前版本为空；侧栏选中项
+          // .conversation-item[data-conversation-id] 才是队列 RPC 所需会话 id。
+          // cr-self-message/data-user-message-id 与 cr-agent/data-message-id 的 req-* 是消息 id，不能使用。
+          Object.defineProperty(shim, 'currentActiveSessionId', {
+            enumerable: true,
+            configurable: true,
+            get: function () {
+              try {
+                if (ai.adapter && ai.adapter.currentActiveSessionId) return ai.adapter.currentActiveSessionId;
+                var selectedId = getWorkBuddyAiSelectedConversationId();
+                if (selectedId) return selectedId;
+                var cd = document.querySelector('.cr-document[data-root-id]');
+                if (cd) return cd.getAttribute('data-root-id') || null;
+              } catch (e) {}
+              return null;
+            },
+          });
+          window.__wbsAdapter = shim;
+          return shim;
+        }
+      }
       var roots = [document.querySelector('.voice-mic-wrap'), document.querySelector('[class*="_cbChat_"]'), document.querySelector('.chat-container')];
       for (var ri = 0; ri < roots.length; ri++) {
         var el = roots[ri];
@@ -1298,6 +2111,184 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       return null;
     }
+    // WorkDaddy AI：DFS 渲染树找「props.adapter 带队列接口」的官方 adapter（新布局无旧根可走）。
+    // 关键（实测）：官方 adapter 是类实例，enqueue/pause/resume/send/get 等方法在**原型链**上，
+    // Object.keys 看不到但 typeof 可命中；且它的包装方法内部会 `_notifyQueueUpdate`（刷新官方面板
+    // 并返回真实快照）。因此按「typeof adapter.enqueueConversationMessageQueueItem === 'function'」
+    // 直接命中 adapter 自身即可——不要取 adapter.sessionsResource（那是底层透传：返回 null、不刷新面板）。
+    function findAiSessionsAdapter() {
+      try {
+        var el0 = document.querySelector('#root > div');
+        if (!el0) return null;
+        var stack = [el0], guardEl = 0;
+        while (stack.length && guardEl++ < 300) {
+          var el = stack.pop();
+          if (!el) continue;
+          for (var k in el) {
+            if (k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance') === 0) {
+              var cur = el[k], seen = 0;
+              while (cur && seen < 400) {
+                try {
+                  var p = cur.memoizedProps;
+                  if (p && typeof p === 'object' && p.adapter && typeof p.adapter === 'object') {
+                    // 方法在原型链：typeof 判定（勿用 Object.keys）
+                    if (typeof p.adapter.enqueueConversationMessageQueueItem === 'function' &&
+                        typeof p.adapter.pauseConversationMessageQueue === 'function') {
+                      return { adapter: p.adapter };
+                    }
+                  }
+                } catch (e) {}
+                if (!cur) break;
+                cur = cur.return; seen++;
+              }
+              break; // 每个 DOM 节点只看一次 fiber 链
+            }
+          }
+          for (var i = 0; i < el.children.length; i++) stack.push(el.children[i]);
+        }
+      } catch (e) {}
+      return null;
+    }
+    function bootstrapWorkBuddyAiQueueBridge() {
+      if (!WBS_PROFILE_IS_AI) return;
+      try {
+        var adapter = findWbsAdapter();
+        var sessionId = adapter && adapter.currentActiveSessionId;
+        if (!sessionId || typeof adapter.getConversationMessageQueue !== 'function') return;
+        Promise.resolve(adapter.getConversationMessageQueue(sessionId)).catch(function () {});
+      } catch (e) {}
+    }
+
+    // WorkBuddy AI 冷启动时 React adapter/当前会话可能还在挂载。首次点击不能把
+    // 这类“暂不可用”误判成队列故障并写入旧版本地 stash，否则官方队列准备好后
+    // 第二次点击会得到两条。这里异步等待官方 adapter + 当前会话，不阻塞渲染主线程。
+    function waitForWorkBuddyAiQueueAdapter(maxMs) {
+      if (!WBS_PROFILE_IS_AI) return Promise.reject(new Error('非 WorkBuddy AI profile'));
+      var startedAt = Date.now();
+      var limit = Number(maxMs) > 0 ? Number(maxMs) : 10000;
+      return new Promise(function (resolve, reject) {
+        function probe() {
+          if (!alive) return reject(new Error('注入组件已销毁'));
+          try {
+            var adapter = window.__wbsAdapter || findWbsAdapter();
+            var sessionId = adapter && adapter.currentActiveSessionId;
+            if (adapter && sessionId &&
+                typeof adapter.enqueueConversationMessageQueueItem === 'function' &&
+                typeof adapter.pauseConversationMessageQueue === 'function') {
+              return resolve({ adapter: adapter, sessionId: sessionId });
+            }
+          } catch (_) {}
+          if (Date.now() - startedAt >= limit) {
+            var e = new Error('WorkBuddy AI 队列尚未准备完成');
+            e.code = 'WBS_QUEUE_NOT_READY';
+            return reject(e);
+          }
+          setBuildTimeout(probe, 100);
+        }
+        probe();
+      });
+    }
+
+    // 后台预热只做只读查找，不触碰用户操作；点击路径随后直接复用缓存。
+    function warmWorkBuddyAiQueueAdapter() {
+      if (!WBS_PROFILE_IS_AI || !alive || window.__wbsAdapter) return;
+      try { findWbsAdapter(); } catch (e) {}
+    }
+    setBuildTimeout(warmWorkBuddyAiQueueAdapter, 0);
+    setBuildTimeout(warmWorkBuddyAiQueueAdapter, 120);
+    setBuildTimeout(warmWorkBuddyAiQueueAdapter, 500);
+    setBuildTimeout(warmWorkBuddyAiQueueAdapter, 1500);
+    // ConversationController/queueManager 会跨重注入存活；注入后主动只读拉一次当前队列，
+    // 立即安装或升级按钮桥接，不要求用户先再次点击“暂存提示词”。
+    setBuildTimeout(bootstrapWorkBuddyAiQueueBridge, 300);
+    setBuildTimeout(bootstrapWorkBuddyAiQueueBridge, 1200);
+
+    function writeWorkBuddyAiQueueItemToComposer(item) {
+      var editor = findComposer();
+      if (!editor) return false;
+      var blocks = item && Array.isArray(item.contentBlocks) ? item.contentBlocks : [];
+      var text = blocks.map(function (block) {
+        return block && typeof block.text === 'string' ? block.text : '';
+      }).filter(Boolean).join('\n') || (item && (item.previewText || item.label)) || '';
+      if (!text) return false;
+      try {
+        editor.focus();
+        var selection = window.getSelection();
+        var range = document.createRange();
+        range.selectNodeContents(editor);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('delete');
+        document.execCommand('insertText', false, text);
+        editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function handleWorkBuddyAiQueueActionClick(event) {
+      if (!WBS_PROFILE_IS_AI || !event || event.button > 0) return;
+      var button = event.target && event.target.closest && event.target.closest('.cb-message-queue-item-actions button.icon-btn');
+      if (!button) return;
+      var cell = button.closest('.cb-message-queue-item');
+      if (!cell) return;
+      var buttons = cell.querySelectorAll('.cb-message-queue-item-actions button.icon-btn');
+      var actionIndex = Array.prototype.indexOf.call(buttons, button);
+      if (actionIndex < 0 || actionIndex > 2) return;
+      var itemId = cell.getAttribute('data-queue-item-id');
+      var adapter = findWbsAdapter();
+      var sessionId = adapter && adapter.currentActiveSessionId;
+      if (!itemId || !sessionId) return;
+      var manager = null;
+      try {
+        var roots = [document.querySelector('.cr-document[data-root-id="' + String(sessionId).replace(/"/g, '\\"') + '"]'), document.querySelector('.conversation-shell')];
+        for (var ri = 0; ri < roots.length && !manager; ri++) {
+          var root = roots[ri];
+          if (!root) continue;
+          for (var key in root) {
+            if (key.indexOf('__reactFiber$') !== 0 && key.indexOf('__reactInternalInstance') !== 0) continue;
+            var cur = root[key], seen = 0;
+            while (cur && seen++ < 500) {
+              var props = cur.memoizedProps;
+              var controller = props && props.value;
+              if (controller && controller.conversationId === sessionId && controller.lifecycle && controller.lifecycle.conv) {
+                manager = controller.lifecycle.conv.queueManager;
+                break;
+              }
+              cur = cur.return;
+            }
+            break;
+          }
+        }
+      } catch (e) {}
+      var item = manager && typeof manager.items === 'function'
+        ? manager.items().find(function (entry) { return entry && String(entry.id) === String(itemId); })
+        : null;
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      // Optimistic rows have no server-side id yet; let the real enqueue settle
+      // before allowing send/edit/delete actions on them.
+      if (item && item.__wbsOptimistic) return;
+      var operation;
+      if (actionIndex === 0 && typeof adapter.sendConversationMessageQueueItemNow === 'function') {
+        operation = adapter.sendConversationMessageQueueItemNow(sessionId, itemId);
+      } else if (actionIndex === 1 && typeof adapter.removeConversationMessageQueueItem === 'function') {
+        operation = Promise.resolve(adapter.removeConversationMessageQueueItem(sessionId, itemId)).then(function () {
+          if (!writeWorkBuddyAiQueueItemToComposer(item)) throw new Error('WorkBuddy AI 输入框回填失败');
+        });
+      } else if (actionIndex === 2 && typeof adapter.removeConversationMessageQueueItem === 'function') {
+        operation = adapter.removeConversationMessageQueueItem(sessionId, itemId);
+      } else {
+        return;
+      }
+      Promise.resolve(operation).catch(function (error) {
+        crumb('queue-action:fail:' + actionIndex + ':' + ((error && error.message) || error));
+      });
+    }
+    if (WBS_PROFILE_IS_AI) listen(document, 'click', handleWorkBuddyAiQueueActionClick, true);
+
     // 把抓取的输入框富文本转成 contentblocks（image 补回 base64 data），原样加入 WorkBuddy 队列。
     // 【稳定性】只保留最朴素的纯对象字段，去掉 _meta/displayAsPhrase 等可能带不可克隆引用的元数据——
     // 5.3.8 在重渲染队列面板跨进程克隆该项时会因这类字段崩（An object could not be cloned）。
@@ -1331,38 +2322,94 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 【稳定性】只做幂等的标签插入/移除，绝不动 class/draggable 等 React 管理的属性——
     // 面板重渲染时我们的属性变更会与 React 的 draggable 属性互相覆盖触发 mutation 风暴（切会话卡死）。
     // 排序保持由 WorkBuddy 自身调度器决定（暂存=暂停态，不会被自动发送插队），不再做任何 reorder。
-    // 通过文本签名匹配（text blocks 拼接），入队成功后记录；按会话存储：切换会话后回来仍能认出本会话的暂存项。
+    // 通过官方 queue item id 记录；旧版无 id 时才保留完整文本精确匹配。
     var stashedBySession = {};
+    var stashedIdsBySession = {};
     function stashSigs(sessionId) {
       if (!sessionId) return [];
       var arr = stashedBySession[sessionId];
       if (!arr) { arr = []; stashedBySession[sessionId] = arr; }
       return arr;
     }
-    function recordStashQueueText(sessionId, blocks) {
-      var parts = [];
-      (blocks || []).forEach(function (b) {
-        if (b && b.type === 'text' && b.text) parts.push(b.text);
-      });
-      if (!parts.length) return;
-      var arr = stashSigs(sessionId);
-      var sig = parts.join('\n').replace(/\s+/g, ' ').trim();
-      if (sig && arr.indexOf(sig) < 0) arr.push(sig);
+    function stashIds(sessionId) {
+      if (!sessionId) return [];
+      var arr = stashedIdsBySession[sessionId];
+      if (!arr) { arr = []; stashedIdsBySession[sessionId] = arr; }
+      return arr;
+    }
+    function recordStashQueueItem(sessionId, blocks, snapshot) {
+      // Ensure the session is included in the guard loop even when the queue
+      // snapshot gives us an id and no legacy text signature is needed.
+      stashSigs(sessionId);
+      var ids = stashIds(sessionId);
+      var wanted = normalizeQueueText(blocks);
+      var items = snapshot && Array.isArray(snapshot.items) ? snapshot.items : [];
+      var candidate = null;
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        if (!item || item.id == null || ids.indexOf(String(item.id)) >= 0) continue;
+        if (wanted && normalizeQueueText(item.contentBlocks || item.blocks || item.content) === wanted) {
+          if (!candidate || (Number(item.order || 0) > Number(candidate.order || 0))) candidate = item;
+        }
+      }
+      if (candidate) {
+        ids.push(String(candidate.id));
+        return;
+      }
+      // Only use text fallback when the returned queue has no stable ids at all.
+      // Recording a signature before RPC success would make a failed stash look
+      // like a real stash and misclassify the user's next ordinary prompt.
+      if (items.length && items.some(function (item) { return item && item.id != null; })) return;
+      if (wanted) {
+        var arr = stashSigs(sessionId);
+        if (arr.indexOf(wanted) < 0) arr.push(wanted);
+      }
     }
     // 判断一个 queue item 是否为「暂存提示词」消息（按文本签名匹配，仅当前会话）
     function isStashItem(sessionId, it) {
-      var arr = stashSigs(sessionId);
-      if (!arr.length) return false;
+      var arr = stashSigs(sessionId), ids = stashIds(sessionId);
+      if (!arr.length && !ids.length) return false;
+      var domId = '';
+      try {
+        domId = it.getAttribute('data-queue-item-id') || it.getAttribute('data-item-id') || '';
+      } catch (_) {}
+      if (domId) return ids.indexOf(String(domId)) >= 0;
       var contentEl = it.querySelector('.content');
       var txt = (contentEl && (contentEl.getAttribute('title') || contentEl.textContent) || '').replace(/\s+/g, ' ').trim();
-      if (!txt) return false;
-      return arr.some(function (s) { return s && txt.indexOf(s) >= 0; });
+      if (!txt || ids.length) return false;
+      return arr.some(function (s) { return normalizeQueueText(s) === txt; });
+    }
+    function syncQueueDomIds(sessionId, snapshot) {
+      if (!snapshot || !Array.isArray(snapshot.items)) return;
+      var domItems = document.querySelectorAll('.cb-message-queue-item');
+      var byText = {};
+      snapshot.items.forEach(function (item) {
+        if (!item || item.id == null) return;
+        var text = normalizeQueueText(item.contentBlocks || item.blocks || item.content);
+        if (!text) return;
+        if (!byText[text]) byText[text] = [];
+        byText[text].push(item);
+      });
+      Object.keys(byText).forEach(function (text) {
+        byText[text].sort(function (a, b) { return Number(a.order || 0) - Number(b.order || 0); });
+      });
+      var seen = {};
+      Array.prototype.forEach.call(domItems, function (domItem) {
+        var contentEl = domItem.querySelector('.content');
+        var text = normalizeQueueText(contentEl && (contentEl.getAttribute('title') || contentEl.textContent) || '');
+        var candidates = byText[text] || [];
+        var index = seen[text] || 0;
+        seen[text] = index + 1;
+        var match = candidates[index];
+        if (match && match.id != null) domItem.setAttribute('data-queue-item-id', String(match.id));
+        else domItem.removeAttribute('data-queue-item-id');
+      });
     }
     // 同步标签（仅当前会话的暂存签名）。只做幂等 DOM 插入/移除，不改 React 属性。
     function syncQueueTags() {
       var sessionId = (window.__wbsAdapter && window.__wbsAdapter.currentActiveSessionId);
-      var arr = stashSigs(sessionId);
-      if (!alive || !arr.length) return;
+      var arr = stashSigs(sessionId), ids = stashIds(sessionId);
+      if (!alive || (!arr.length && !ids.length)) return;
       var items = document.querySelectorAll('.cb-message-queue-item');
       Array.prototype.forEach.call(items, function (it) {
         var actions = it.querySelector('.cb-message-queue-item-actions');
@@ -1398,18 +2445,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     //   · 只剩暂存 pending 项 → paused=true 挡住自动发送；
     //   · 用户点暂存项发送（sending）→ 放行该条（resume + 重放官方 sendQueueItemNow）；
     //   · 无暂存项 → 解除暂停、停止守护。
-    // 识别复用 stashedBySession（文本签名）；按会话独立守护，切换会话不影响其他会话的暂存项。
+    // 识别复用 stashedBySession/stashedIdsBySession；按会话独立守护，切换会话不影响其他会话的暂存项。
     var stashSendingSince = {}; // sid -> ts：该会话 sending 暂存项出现时间（判断是否空闲卡住）
     // 顺序合规判定：按 order 排序的 pending 项中，第一个不是暂存项（即普通项在最前）
-    function stashOrderValid(items, arr) {
-      if (!items || !arr) return true;
+    function stashOrderValid(items, sessionId) {
+      var arr = stashSigs(sessionId), ids = stashIds(sessionId);
+      if (!items || (!arr.length && !ids.length)) return true;
       var pendings = [];
       for (var i = 0; i < items.length; i++) {
         if (items[i].status === 'pending') pendings.push(items[i]);
       }
       if (!pendings.length) return true;
       pendings.sort(function (a, b) { return (a.order || 0) - (b.order || 0); });
-      return !isStashItemByContent(pendings[0], arr);
+      return !isStashQueueItem(pendings[0], ids, arr);
     }
     function guardStashedPause() {
       if (!alive) return;
@@ -1422,12 +2470,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!sids.length) return;
       for (var gi = 0; gi < sids.length; gi++) {
         (function (sid) {
-          var arr = stashSigs(sid);
-          if (!arr.length) { delete stashedBySession[sid]; return; }
+          var arr = stashSigs(sid), ids = stashIds(sid);
+          if (!arr.length && !ids.length) { delete stashedBySession[sid]; delete stashedIdsBySession[sid]; return; }
           var p;
           try { p = adapter.getConversationMessageQueue(sid); } catch (e) { return; }
           Promise.resolve(p).then(function (q) {
             if (!q || !q.items || !q.runtime) return;
+            // The DOM belongs to the currently visible conversation. A guard
+            // pass for a background session must never stamp its ids onto the
+            // active session while the user is switching conversations.
+            if (adapter.currentActiveSessionId === sid) {
+              syncQueueDomIds(sid, q);
+              syncQueueTags();
+            }
             var hasStashPending = false;
             var hasStashSending = false;
             var hasNormalPending = false;
@@ -1435,11 +2490,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             for (var k = 0; k < q.items.length; k++) {
               var it = q.items[k];
               if (it.status === 'sending') {
-                if (isStashItemByContent(it, arr)) { hasStashSending = true; if (!sendingItemId) sendingItemId = it.id; }
+                if (isStashQueueItem(it, ids, arr)) { hasStashSending = true; if (!sendingItemId) sendingItemId = it.id; }
                 continue;
               }
               if (it.status !== 'pending') continue;
-              if (isStashItemByContent(it, arr)) hasStashPending = true;
+              if (isStashQueueItem(it, ids, arr)) hasStashPending = true;
               else hasNormalPending = true;
             }
             if (hasStashSending) {
@@ -1477,7 +2532,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             if (hasNormalPending) {
               // 防御：仅当「第一个 pending 项是普通项」时放行——顺序违规时先等 enforceStashOrder 修正，本轮不 resume，
               // 避免 resume 后官方 activate 误取到排在前面的暂存项
-              if (q.runtime.paused && stashOrderValid(q.items, arr)) {
+              if (q.runtime.paused && stashOrderValid(q.items, sid)) {
                 try { adapter.resumeConversationMessageQueue(sid); crumb('guard:auto-send-resume'); } catch (e) {}
               }
               if (hasStashPending) {
@@ -1485,6 +2540,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
               } else {
                 // 普通项还在但已无本插件暂存项：交给官方正常调度，停止守护
                 delete stashedBySession[sid];
+                delete stashedIdsBySession[sid];
               }
             } else if (hasStashPending) {
               if (!q.runtime.paused) {
@@ -1499,6 +2555,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
                 try { adapter.resumeConversationMessageQueue(sid); crumb('guard:resume'); } catch (e) {}
               }
               delete stashedBySession[sid];
+              delete stashedIdsBySession[sid];
             }
           }).catch(function () {});
         })(sids[gi]);
@@ -1512,18 +2569,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // 仅当真实违规时触发 + 在途互斥 + 4s 冷却 + 会话切换保护 + 全程 try/catch 静默，失败只记录 crumb 不抛错。
     var stashReorderBusy = false;
     var stashReorderAt = 0;
-    function isStashItemByContent(it, arr) {
-      var parts = [];
-      (it.contentBlocks || []).forEach(function (b) { if (b && b.text) parts.push(b.text); });
-      var txt = parts.join('\n').replace(/\s+/g, ' ').trim();
-      if (!txt) return false;
-      for (var i = 0; i < arr.length; i++) {
-        if (arr[i] && txt.indexOf(arr[i]) >= 0) return true;
-      }
-      return false;
-    }
     function enforceStashOrder(sessionId, items, arr) {
-      if (!alive || !items || !arr || !arr.length) return;
+      var ids = stashIds(sessionId);
+      if (!alive || !items || (!arr || !arr.length) && !ids.length) return;
       if (stashReorderBusy) return;
       var now = Date.now();
       if (now - stashReorderAt < 4000) return; // 冷却：低频修正，避免 reorder RPC 风暴
@@ -1536,7 +2584,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var stashMap = {};
       var firstStashIdx = -1, lastNormalIdx = -1;
       for (var i = 0; i < sorted.length; i++) {
-        if (isStashItemByContent(sorted[i], arr)) {
+        if (isStashQueueItem(sorted[i], ids, arr)) {
           stashMap[sorted[i].id] = true;
           if (firstStashIdx < 0) firstStashIdx = i;
         } else {
@@ -1553,7 +2601,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var curSid = adapter.currentActiveSessionId;
       if (!curSid) return;
       stashReorderBusy = true;
-      crumb('order:reorder:' + sessionId);
+      crumb('order:reorder');
       Promise.resolve(adapter.reorderConversationMessageQueueItems(sessionId, orderedIds))
         .then(function () { crumb('order:ok'); })
         .catch(function (e) { crumb('order:fail'); })
@@ -1564,15 +2612,52 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     // 兼容旧调用点（onDomChange/onInputSync/setTimeout 仍调用旧函数名，改为内部转发）
     function wrapQueueReorder() { /* no-op：见 watchQueueOrder */ }
-    // 清空输入框：通过 React fiber 找到 ChatInput 的 onChange（父级 setValue）并传空内容块。
-    // 这样 React 正确更新 value 链（DOM + 父组件 store），避免 WorkBuddy 切换会话时用旧 value 恢复。
+    // WorkBuddy AI 新版输入组件将每个会话的草稿保存在 composer store，并持久化到
+    // localStorage 的 cb-draft:<conversationId>。只清 Slate/DOM 会导致切回会话时旧草稿重新水合。
+    // 这里沿当前 composer 的 fiber 向上找官方 store.api.clear()，仅接受 activeSessionId 与
+    // 暂存会话完全一致的 store；持久化键删除是官方 store 更新未同步落盘时的窄兜底。
+    function clearWorkBuddyAiComposerDraft(ed, sessionId) {
+      if (!WBS_PROFILE_IS_AI || !ed || !sessionId || !document.contains(ed)) return false;
+      var node = ed;
+      for (var up = 0; up < 20 && node; up++) {
+        var fk = Object.keys(node).find(function (k) {
+          return k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance') === 0;
+        });
+        if (fk) {
+          var cur = node[fk], seen = 0;
+          while (cur && seen < 120) {
+            var p = cur.memoizedProps;
+            var store = p && p.store;
+            if (isWorkBuddyAiComposerStore(store, sessionId)) {
+              try { store.api.clear(); } catch (_) { return false; }
+              try {
+                var draftKey = workBuddyAiDraftStorageKey(sessionId);
+                if (draftKey) localStorage.removeItem(draftKey);
+              } catch (_) {}
+              return true;
+            }
+            cur = cur.return; seen++;
+          }
+        }
+        node = node.parentElement;
+      }
+      return false;
+    }
+    // 清空输入框：WorkBuddy AI 先清官方 composer store；旧客户端仍通过 React fiber
+    // 找 Slate onChange。两端最后都用 DOM 编辑命令做显示同步兜底。
     // 【切会话守卫】入队 await 期间可能发生会话切换：此时 fiber 链可能已失效/指向旧会话，
-    // 直接调 onChange 有渲染进程风险——一律跳过（输入框留着内容，用户可见可清）。
-    function clearComposerViaOnChange() {
+    // 直接清 store/onChange 有渲染进程风险——一律跳过（输入框留着内容，用户可见可清）。
+    function clearComposerViaOnChange(expectedContent) {
       try {
         var wbsA = window.__wbsAdapter;
         if (stashSessionAtClick && wbsA && wbsA.currentActiveSessionId &&
             wbsA.currentActiveSessionId !== stashSessionAtClick) return; // 会话已切换：跳过清空
+        // The queue RPC is asynchronous. Never clear text that the user typed
+        // after clicking stash while that RPC was in flight.
+        if (expectedContent) {
+          var currentContent = getComposerContent();
+          if (!stashContentMatches(expectedContent, currentContent)) return;
+        }
         var mic = document.querySelector('.voice-mic-wrap');
         var ed = null;
         if (mic) {
@@ -1582,8 +2667,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             if (e) { ed = e; break; }
             p0 = p0.parentElement;
           }
+        } else {
+          // AI 端（无 voice-mic-wrap）：复用通用输入框定位（视口下半部可见的 contenteditable）
+          ed = findComposer();
         }
-        if (!ed) return;
+        clearWorkBuddyAiComposerDraft(ed, stashSessionAtClick);
+        var cleared = false;
         var node = ed;
         for (var up = 0; up < 20 && node; up++) {
           var fk = Object.keys(node).find(function (k) { return k.indexOf('__reactFiber') === 0; });
@@ -1602,6 +2691,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
                 // 二次守卫：fiber 必须仍挂在活 DOM 上（React 重渲染期间节点可能已 detach）
                 if (hasText && document.contains(ed)) {
                   p.onChange([{ type: 'paragraph', children: [{ text: '' }] }]);
+                  cleared = true;
+                  // DOM 兜底硬清：新版 Slate 输入框存在 value 与 DOM 脱节的场景
+                  // （中文输入法 composition 未走通受控链 / 外部改 DOM），此时 React 认为
+                  // value 已是空文档 → onChange 不产生 re-render → 文字残留输入框。
+                  // execCommand('delete') 直接清 DOM 并触发 beforeinput，Slate 感知后同步，
+                  // 与 onChange 在同一同步 tick 内执行，不会误删用户新输入。
+                  try {
+                    ed.focus();
+                    var selC = window.getSelection();
+                    var rangeC = document.createRange();
+                    rangeC.selectNodeContents(ed);
+                    selC.removeAllRanges(); selC.addRange(rangeC);
+                    document.execCommand('delete');
+                  } catch (eC) {}
                 }
                 return;
               }
@@ -1610,6 +2713,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           }
           node = node.parentElement;
         }
+        // AI 端（无 mic）fiber 未命中回退：execCommand 全选删除（占位符一并清除，React/Slate 由 input 事件驱动更新），
+        // 有内容才清（避免空输入也触发编辑命令），仍受 hadText 判断约束
+        if (!cleared && !mic) {
+          try {
+            var hasTxt2 = (ed.innerText || '').replace(/[\uFEFF\u200B]/g, '').trim().length > 0;
+            if (hasTxt2) {
+              ed.focus();
+              var sel2 = window.getSelection();
+              var range2 = document.createRange();
+              range2.selectNodeContents(ed);
+              sel2.removeAllRanges();
+              sel2.addRange(range2);
+              document.execCommand('delete');
+            }
+          } catch (e2) {}
+        }
       } catch (e) {}
     }
     // 队列操作超时包装：WorkBuddy 内部 Promise 可能永不 settle，超时后走本地暂存兜底，避免"卡死"
@@ -1617,7 +2736,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return new Promise(function (resolve, reject) {
         var done = false;
         var t = setBuildTimeout(function () {
-          if (!done) { done = true; reject(new Error('WorkBuddy 队列响应超时（' + Math.round(ms / 1000) + 's）')); }
+          if (!done) {
+            done = true;
+            var timeoutError = new Error('WorkBuddy 队列响应超时（' + Math.round(ms / 1000) + 's）');
+            timeoutError.code = 'WBS_QUEUE_TIMEOUT';
+            reject(timeoutError);
+          }
         }, ms);
         promise.then(function (r) { if (!done) { done = true; clearTimeout(t); resolve(r); } },
           function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
@@ -1625,30 +2749,52 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     function enqueueToWorkBuddyQueue(content) {
       try {
-        var adapter = findWbsAdapter();
-        // 官方包装方法必须齐全：enqueueConversationMessageQueueItem（入队+刷新面板）/ pauseConversationMessageQueue（暂停自动发送+刷新面板）
-        if (!adapter || typeof adapter.enqueueConversationMessageQueueItem !== 'function' ||
-            typeof adapter.pauseConversationMessageQueue !== 'function') {
-          return Promise.reject(new Error('未找到 WorkBuddy 队列接口'));
-        }
-        var sessionId = adapter.currentActiveSessionId;
-        if (!sessionId) return Promise.reject(new Error('未获取到当前会话'));
         var blocks = contentToBlocks(content);
         if (!blocks.length) return Promise.reject(new Error('输入框内容为空'));
-        recordStashQueueText(sessionId, blocks);
-        // 官方包装：client RPC + _notifyQueueUpdate(snapshot) → 官方面板自动显示该条（不手动喂回调）
-        return withQueueTimeout(adapter.enqueueConversationMessageQueueItem(sessionId, blocks), 8000)
-        .then(function () {
-          crumb('enqueue:done');
-          // 官方包装：patchConversationQueueRuntime({paused:true,pauseReason}) + RPC + 刷新面板；
-          // 自动发送调度器只对 pauseReason==="cancel" 续发，manual 会稳定拦停。
-          return withQueueTimeout(adapter.pauseConversationMessageQueue(sessionId, 'manual'), 5000)
+        var ready = WBS_PROFILE_IS_AI
+          ? waitForWorkBuddyAiQueueAdapter(10000)
+          : Promise.resolve({ adapter: window.__wbsAdapter || findWbsAdapter(), sessionId: null });
+        return ready.then(function (readyState) {
+          var adapter = readyState && readyState.adapter;
+          // 官方包装方法必须齐全：enqueueConversationMessageQueueItem（入队+刷新面板）/ pauseConversationMessageQueue（暂停自动发送+刷新面板）
+          if (!adapter || typeof adapter.enqueueConversationMessageQueueItem !== 'function' ||
+              typeof adapter.pauseConversationMessageQueue !== 'function') {
+            throw new Error('未找到 WorkBuddy 队列接口');
+          }
+          var sessionId = readyState.sessionId || adapter.currentActiveSessionId;
+          if (!sessionId) throw new Error('未获取到当前会话');
+          // 记录本次实际入队使用的会话 id。等待冷启动就绪期间也不允许换会话后误清空输入。
+          stashSessionAtClick = sessionId;
+          var enqueueSnapshot = null;
+          // 关键事务顺序：先暂停，再入队。AI 5.4 的 dispatcher 会在 enqueue RPC
+          // 返回前继续 activate()，旧的“先入队后暂停”会把已有普通项全部发送掉。
+          var pauseWait = WBS_PROFILE_IS_AI
+            ? withQueueTimeout(adapter.pauseConversationMessageQueue(sessionId, 'manual'), 5000)
+            : Promise.resolve(null);
+          return pauseWait
             .then(function () { crumb('pause:ok'); })
-            .catch(function () { crumb('pause:fail'); return null; });
-        })
-        .then(function () {
-          crumb('enqueue:paused');
-          return { ok: true, blocks: blocks.length, sessionId: sessionId };
+            .catch(function () { crumb('pause:fail'); return null; })
+            .then(function () {
+              // 立即把暂存项镜像到 AI 官方队列 store，避免新版 RPC 冷启动时 UI 空等数秒。
+              // 真实快照返回后会整体替换该临时项；临时项不参与任何官方操作。
+              if (WBS_PROFILE_IS_AI) {
+                try { syncWorkBuddyAiQueueSnapshot(sessionId, { __wbsOptimistic: blocks }); } catch (e) {}
+              }
+              var rawEnqueue = adapter.enqueueConversationMessageQueueItem(sessionId, blocks);
+              return Promise.resolve(rawEnqueue).then(function (snapshot) {
+                // 某些 AI 5.4 时机返回 null/{items:[]}，立即重新读取当前会话，避免
+                // 暂存 ID 丢失或旧空快照覆盖 UI。
+                return getWorkBuddyAiQueueSnapshot(adapter, sessionId, snapshot);
+              });
+            })
+            .then(function (snapshot) {
+              enqueueSnapshot = snapshot;
+              recordStashQueueItem(sessionId, blocks, snapshot);
+              crumb('enqueue:done');
+              // 入队后立即执行一轮守护，保持暂存项暂停。
+              try { guardStashedPause(); } catch (e) {}
+              return { ok: true, blocks: blocks.length, sessionId: sessionId, snapshot: enqueueSnapshot };
+            });
         });
       } catch (e) {
         // 同步异常防护：adapter/队列 API 任何同步抛错都不中断点击链，转 reject 走本地暂存兜底
@@ -1658,6 +2804,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     var stashBusy = false;
     var stashBusyTimer = null;
+    // WorkBuddy AI 官方入队 Promise 可能晚于 UI 超时才 settle。保留同一内容的
+    // in-flight 事务，后续重复点击只复用原事务，绝不再次调用 enqueue。
+    var stashInFlight = null;
     var stashSessionAtClick = null; // 点击暂存时的会话 id：清空输入框的切会话守卫用
     function crumb(msg) {
       try { console.log('[wbscrum]', msg); } catch (e) {}
@@ -1666,7 +2815,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       } catch (e) {}
     }
     listen(stashBtn, 'click', function () {
-      if (stashBusy) return;
+      // 官方入队仍在处理中时，无论看门狗是否已恢复按钮外观，都不允许
+      // 再发起第二次 enqueue；否则冷启动慢响应会把同一提示词写入两次。
+      if (stashBusy || stashInFlight) return;
       crumb('click:start');
       var content = getComposerContent();
       if (!content) { return; }
@@ -1681,31 +2832,53 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 任意时刻都能暂存：走官方包装入队 + 暂停（不自动发送）；面板刷新由 adapter 内部 _notifyQueueUpdate 完成。
       crumb('click:enqueue');
       stashSessionAtClick = (window.__wbsAdapter && window.__wbsAdapter.currentActiveSessionId) || null;
-      enqueueToWorkBuddyQueue(content)
+      var stashWork = enqueueToWorkBuddyQueue(content);
+      stashInFlight = stashWork;
+      stashWork
         .then(function (r) {
-          clearComposerViaOnChange();
+          clearComposerViaOnChange(content);
           syncStash(); // 输入框清空后隐藏暂存按钮
         })
         .catch(function (e) {
+          var optimisticCleanup = WBS_PROFILE_IS_AI ? dropWorkBuddyAiOptimisticItem(stashSessionAtClick) : Promise.resolve();
+          // A timeout is still retained for legacy WorkDaddy only. WorkBuddy AI does
+          // not timeout the official promise: a late successful RPC must not be paired
+          // with a local fallback item, which would create duplicate queue entries.
+          if (e && e.code === 'WBS_QUEUE_TIMEOUT') {
+            crumb('enqueue:timeout-no-fallback');
+            return optimisticCleanup;
+          }
+          if (e && e.code === 'WBS_QUEUE_NOT_READY' && WBS_PROFILE_IS_AI) {
+            crumb('enqueue:not-ready-no-fallback');
+            return optimisticCleanup;
+          }
           // 兜底：WorkBuddy 队列不可用时退回本地暂存
           var uidPromise = (state.current && state.current.uid)
             ? Promise.resolve(state.current.uid)
             : api('/api/current').then(function (c) { return (c && c.uid) || null; }).catch(function () { return null; });
-          return uidPromise.then(function (uid) {
+          return optimisticCleanup.then(function () { return uidPromise; }).then(function (uid) {
             var convId = getConversationId();
             return api('/api/stash', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ uid: uid || null, conversationId: convId, content: content }),
             }).then(function () {
-              // 已暂存到本地面板（WorkBuddy 队列不可用时兜底）
+              // 已暂存到本地面板（WorkBuddy 队列不可用时兜底）：成功后同样清空输入框并刷新按钮显隐
+              clearComposerViaOnChange(content);
+              syncStash();
             });
           });
         })
         .catch(function (e) {
           // 暂存失败：静默（功能内部错误不影响输入框）
         })
-        .finally(function () { clearTimeout(stashBusyTimer); stashBusy = false; stashBtn.style.opacity = ''; stashSessionAtClick = null; });
+        .finally(function () {
+          clearTimeout(stashBusyTimer);
+          stashBusy = false;
+          stashInFlight = null;
+          stashBtn.style.opacity = '';
+          stashSessionAtClick = null;
+        });
     });
 
     var fab = root.querySelector('.wbs-fab');
@@ -1918,9 +3091,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     // ===== 会话 pane（构建：账号/时间筛选 + 按空间分组[默认2条/展开10条] + 刷新 + 批量操作[迁移/删除]）=====
     var sessionsState = { uid: undefined, range: '7d', list: [], selected: {}, wsExpanded: {}, accounts: [], batchMode: false, autoCopy: null };
-    function isTaskSessionRecordUI(cwd) {
-      // WorkBuddy 的普通工作区也使用 WorkBuddy\\YYYY-MM-DD-HH-MM-SS；仅凭 cwd 无法可靠区分任务会话。
-      return false;
+    function isTaskSessionRecordUI(s) {
+      // 任务（未选择项目/一次性）会话：以官方 is_playground=1 为准。
+      // 普通工作区也用 WorkBuddy\\YYYY-MM-DD-HH-MM-SS 命名，仅凭 cwd 无法区分。
+      return !!(s && Number(s.is_playground) === 1);
     }
     function canonicalWorkspaceUI(cwd) {
       var value = String(cwd || '').trim().replace(/\\/g, '/');
@@ -1956,13 +3130,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div class="wbs-sess-toolbar">' +
         '<button class="wbs-sess-bbtn" type="button" id="wbs-sess-batch">批量操作</button>' +
         '<span class="wbs-sess-count" id="wbs-sess-count"></span>' +
-        '<button class="wbs-sess-refresh" type="button" id="wbs-sess-refresh" title="刷新并折叠所有空间"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg></button>' +
-        '</div>' +
         '<div class="wbs-sess-batchbar" id="wbs-sess-batchbar" style="display:none">' +
-        '<button class="wbs-sess-bbtn wbs-sess-check-toggle" type="button" id="wbs-sess-check-all" title="全部勾选/清空勾选"><span class="wbs-sess-check-ico" data-state="unchecked"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg></span><span class="wbs-sess-check-label">全选</span></button>' +
+        '<button class="wbs-sess-bbtn wbs-sess-check-all" type="button" id="wbs-sess-check-all">全选</button>' +
+        '<span class="wbs-sess-batch-count" id="wbs-sess-batch-count">已选 0</span>' +
         '<button class="wbs-sess-bbtn" type="button" id="wbs-sess-copy" title="复制选中到其他账号"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span>复制</span></button>' +
         '<button class="wbs-sess-bbtn wbs-sess-delbtn" type="button" id="wbs-sess-delete" title="删除选中"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg><span>删除</span></button>' +
         '<button class="wbs-sess-bbtn wbs-sess-done" type="button" id="wbs-sess-done">取消</button>' +
+        '</div>' +
         '</div>' +
         '<div class="wbs-sess-list" id="wbs-sess-list"></div>' +
         '</div>' +
@@ -1994,7 +3168,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var html = '<option value="">' + esc(curName) + '</option>';
         accts.forEach(function (a) {
           if (a.uid === curUid) return;
-          html += '<option value="' + a.uid + '">' + esc(a.nickname || '账号' + a.uid.slice(0, 4)) + '</option>';
+          html += '<option value="' + escAttr(a.uid) + '">' + esc(a.nickname || '账号' + a.uid.slice(0, 4)) + '</option>';
         });
         html += '<option value="*">全部账号</option>';
         sel.innerHTML = html;
@@ -2019,23 +3193,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var url = '/api/sessions?range=' + (sessionsState.range || '7d');
       if (sessionsState.uid !== undefined) url += '&uid=' + encodeURIComponent(sessionsState.uid);
       api(url).then(function (d) {
-        // cwd 的时间戳路径同时用于普通工作区，不能据此隐藏会话；所有记录先保留给用户查看和操作。
-        sessionsState.list = ((d && d.sessions) || []).filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
+        // 任务会话（is_playground=1）保留在列表中，由渲染层归入「任务」分组展示与操作。
+        sessionsState.list = ((d && d.sessions) || []);
         sessionsState.autoCopy = (d && d.autoCopy) || null;
         sessionsState.selected = {};
         sessionsState.wsExpanded = {};
         renderSessions();
-        // 筛选变化后退出批量模式（勾选框隐藏 + 恢复「批量操作」入口）
+        // 筛选变化后退出批量模式（勾选框隐藏 + 恢复工具栏右侧按钮）
         if (sessionsState.batchMode) {
           sessionsState.batchMode = false;
-          var bar = sessionsPane.querySelector('#wbs-sess-batchbar');
-          if (bar) bar.style.display = 'none';
-          var bb = sessionsPane.querySelector('#wbs-sess-batch');
-          if (bb) { bb.style.display = ''; bb.classList.remove('active'); }
+          setSessBatchBar(false);
         }
         updateSessCount();
       }).catch(function (e) {
-        listEl.innerHTML = '<div class="wbs-empty">会话加载失败: ' + (e.message || e) + '</div>';
+        listEl.innerHTML = '<div class="wbs-empty">会话加载失败: ' + esc(e.message || e) + '</div>';
       });
     }
 
@@ -2060,7 +3231,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var groups = {};
       var wsOrder = [];
       sessionsState.list.forEach(function (s) {
-        if (isTaskSessionRecordUI(s.cwd)) { tasks.push(s); return; }
+        if (isTaskSessionRecordUI(s)) { tasks.push(s); return; }
         var cwd = s.cwd || '(未指定空间)';
         var owner = String(s.user_id || sessionsState.uid || '');
         var groupKey = owner + '::' + cwd;
@@ -2075,16 +3246,23 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var taskShown = (sessionsState.wsExpanded[taskKey] || SESS_WS_INIT);
         var taskVis = tasks.slice(0, taskShown);
         var taskMore = tasks.length - taskVis.length;
+        var taskAllChecked = tasks.every(function (s) { return sessionsState.selected[s.id]; });
         html += '<div class="wbs-sess-group wbs-sess-tasks">' +
           '<div class="wbs-sess-group-head">' +
-          '<span class="wbs-sess-group-name" title="未选择项目的会话"><span class="wbs-sess-group-type">任务</span></span>' +
+          (batch ? '<input type="checkbox" class="wbs-ws-check" data-ws="__TASKS__"' + (taskAllChecked ? ' checked' : '') + '>' : '') +
+          '<span class="wbs-sess-group-name" title="未选择项目的一次性任务/临时会话"><span class="wbs-sess-group-type">任务</span></span>' +
           '<span class="wbs-sess-group-count">' + tasks.length + '</span>' +
           '</div>';
         taskVis.forEach(function (s) {
           var title = s.custom_title || s.title || '(无标题)';
+          var sel = sessionsState.selected[s.id] ? ' checked' : '';
+          var inherited = !!s.autoCopyWorkspace;
+          var marked = !!s.autoCopySession || inherited;
           html += '<div class="wbs-sess-row">' +
+            (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
-            '<span class="wbs-sess-meta">' + fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at) + '</span></span>' +
+            '<span class="wbs-sess-meta">' + esc(fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at)) + '</span></span>' +
+            (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
             '</div>';
         });
         if (taskMore > 0) html += '<button class="wbs-sess-more" type="button" data-ws="__TASKS__">展开 ' + Math.min(taskMore, SESS_WS_STEP) + ' 条（剩余 ' + taskMore + '）</button>';
@@ -2114,7 +3292,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           html += '<div class="wbs-sess-row">' +
             (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
-            '<span class="wbs-sess-meta">' + fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at) + '</span></span>' +
+            '<span class="wbs-sess-meta">' + esc(fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at)) + '</span></span>' +
             (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
             '</div>';
         });
@@ -2127,7 +3305,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
     function activeAutoCopyCount() {
       return sessionsState.list.filter(function (s) {
-        return !isTaskSessionRecordUI(s.cwd) && (!!s.autoCopySession || !!s.autoCopyWorkspace);
+        return !!s.autoCopySession || !!s.autoCopyWorkspace;
       }).length;
     }
     function updateSessionSummary(countEl) {
@@ -2156,7 +3334,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (wsCheck) {
           var w = wsCheck.getAttribute('data-ws');
           var arr = sessionsState.list.filter(function (s) {
-            return !isTaskSessionRecordUI(s.cwd) && String(s.user_id || sessionsState.uid || '') + '::' + (s.cwd || '(未指定空间)') === w;
+            if (w === '__TASKS__') return isTaskSessionRecordUI(s);
+            return String(s.user_id || sessionsState.uid || '') + '::' + (s.cwd || '(未指定空间)') === w;
           });
           var on = wsCheck.checked;
           arr.forEach(function (s) { sessionsState.selected[s.id] = on; });
@@ -2246,12 +3425,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
     function updateSessCount() {
-      var n = sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd) && sessionsState.selected[s.id]; }).length;
+      var n = sessionsState.list.filter(function (s) { return sessionsState.selected[s.id]; }).length;
       var countEl = sessionsPane.querySelector('#wbs-sess-count');
       updateSessionSummary(countEl);
-      if (countEl && sessionsState.batchMode) {
-        countEl.insertAdjacentHTML('beforeend', '<span class="wbs-sess-summary-selected">已选 ' + n + '</span>');
-      }
+      // 批量模式下「已选 N」显示在批量操作行内（模型页同款排版）
+      var bc = sessionsPane.querySelector('#wbs-sess-batch-count');
+      if (bc) bc.textContent = '已选 ' + n;
       // 未选中会话时隐藏「复制/删除」按钮（仅批量模式可见）
       var cp = sessionsPane.querySelector('#wbs-sess-copy');
       var dl = sessionsPane.querySelector('#wbs-sess-delete');
@@ -2264,23 +3443,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!sessionsPane) return;
       var btn = sessionsPane.querySelector('#wbs-sess-check-all');
       if (!btn) return;
-      var selectable = sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
+      var selectable = sessionsState.list.slice();
       var allSel = selectable.length > 0 && selectable.every(function (s) { return sessionsState.selected[s.id]; });
-      var ico = btn.querySelector('.wbs-sess-check-ico');
-      var lbl = btn.querySelector('.wbs-sess-check-label');
-      if (ico) {
-        if (allSel) {
-          ico.setAttribute('data-state', 'checked');
-          ico.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" fill="currentColor" stroke="currentColor"/><path d="M8 12l3 3 5-6" stroke="#141416" stroke-width="2.4" fill="none"/></svg>';
-        } else {
-          ico.setAttribute('data-state', 'unchecked');
-          ico.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>';
-        }
-      }
-      if (lbl) lbl.textContent = allSel ? '取消全选' : '全选';
+      btn.textContent = allSel ? '取消全选' : '全选';
     }
-    function esc(t) { return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-    function escAttr(t) { return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
     // 人性化时间：刚刚 / x 分钟前 / x 小时前 / 昨天 / x 天前 / 日期
     function fmtHumanTime(ts) {
       if (!ts) return '-';
@@ -2300,6 +3466,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     // 事件绑定（元素在 buildSessionsPane 之后才存在）
+    // 批量模式工具栏切换：开启时隐藏「批量操作/count/刷新」并在同一行显示批量操作按钮；
+    // 关闭时恢复。批量按钮行与筛选行共用 toolbar，不再另起一行。
+    function setSessBatchBar(on) {
+      var bar = sessionsPane.querySelector('#wbs-sess-batchbar');
+      var bb = sessionsPane.querySelector('#wbs-sess-batch');
+      var cnt = sessionsPane.querySelector('#wbs-sess-count');
+      if (bb) { bb.style.display = on ? 'none' : ''; bb.classList.toggle('active', on); }
+      if (cnt) cnt.style.display = on ? 'none' : '';
+      if (bar) bar.style.display = on ? 'flex' : 'none';
+    }
+
     function wireSessionsPane() {
       // 时间 Segment 组件
       var rangeSeg = sessionsPane.querySelector('#wbs-sess-range-seg');
@@ -2314,25 +3491,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           loadSessions();
         });
       }
-      // 刷新：重新加载并折叠所有空间
-      var refreshBtn = sessionsPane.querySelector('#wbs-sess-refresh');
-      if (refreshBtn) {
-        refreshBtn.addEventListener('click', function () {
-          sessionsState.selected = {};
-          sessionsState.wsExpanded = {};
-          loadSessions();
-        });
-      }
-      // 批量操作：进入批量模式（隐藏入口按钮 + 显示勾选框与操作栏）。退出通过「取消」按钮
+      // 批量操作：进入批量模式（工具栏右侧按钮隐藏，批量按钮在同一行原位显示）。退出通过「取消」按钮
       var batchBtn = sessionsPane.querySelector('#wbs-sess-batch');
       if (batchBtn) {
         batchBtn.addEventListener('click', function () {
           if (sessionsState.batchMode) return; // 已在批量模式：仅「取消」可退出
           sessionsState.batchMode = true;
           sessionsState.selected = {};
-          batchBtn.style.display = 'none'; // 隐藏「批量操作」入口
-          var bar = sessionsPane.querySelector('#wbs-sess-batchbar');
-          if (bar) bar.style.display = '';
+          setSessBatchBar(true);
           renderSessions();
           updateSessCount();
         });
@@ -2341,7 +3507,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var checkAll = sessionsPane.querySelector('#wbs-sess-check-all');
       if (checkAll) {
         checkAll.addEventListener('click', function () {
-          var selectable = sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd); });
+          var selectable = sessionsState.list.slice();
           var allSel = selectable.length > 0 && selectable.every(function (s) { return sessionsState.selected[s.id]; });
           sessionsState.selected = {};
           if (!allSel) selectable.forEach(function (s) { sessionsState.selected[s.id] = true; });
@@ -2367,15 +3533,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           openDeleteModal(ids);
         });
       }
-      // 取消（退出批量模式，恢复「批量操作」入口）
+      // 取消（退出批量模式，恢复工具栏右侧按钮）
       var doneBtn = sessionsPane.querySelector('#wbs-sess-done');
       if (doneBtn) {
         doneBtn.addEventListener('click', function () {
           sessionsState.batchMode = false;
           sessionsState.selected = {};
-          var bar = sessionsPane.querySelector('#wbs-sess-batchbar');
-          if (bar) bar.style.display = 'none';
-          if (batchBtn) { batchBtn.style.display = ''; batchBtn.classList.remove('active'); }
+          setSessBatchBar(false);
           renderSessions();
           updateSessCount();
         });
@@ -2413,7 +3577,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           body.innerHTML = '<select class="wbs-sess-select wbs-sess-target" id="wbs-sess-target" title="选择目标账号">' +
             '<option value="">选择目标账号…</option>' +
             targets.map(function (a) {
-              return '<option value="' + a.uid + '">' + esc(a.nickname || a.uid) + (a.phone ? '（' + esc(a.phone) + '）' : '') + '</option>';
+              return '<option value="' + escAttr(a.uid) + '">' + esc(a.nickname || a.uid) + (a.phone ? '（' + esc(a.phone) + '）' : '') + '</option>';
             }).join('') +
             '</select>';
         }
@@ -2460,7 +3624,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       };
     }
     function selectedSessIds() {
-      return sessionsState.list.filter(function (s) { return !isTaskSessionRecordUI(s.cwd) && sessionsState.selected[s.id]; }).map(function (s) { return s.id; });
+      return sessionsState.list.filter(function (s) { return sessionsState.selected[s.id]; }).map(function (s) { return s.id; });
     }
     function showSessModal(show) {
       var mask = sessionsPane.querySelector('#wbs-sess-modal');
@@ -2483,18 +3647,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<span class="wbs-model-imports" id="wbs-model-imports"></span>' +
         '<span class="wbs-model-toolbar-spacer"></span>' +
         '<button class="wbs-sess-bbtn" type="button" id="wbs-model-batch" style="display:none">批量管理</button>' +
-        '</div>' +
         '<div class="wbs-model-batchbar" id="wbs-model-batchbar" style="display:none">' +
         '<button class="wbs-sess-bbtn wbs-model-check-all" type="button" id="wbs-model-check-all">全选</button>' +
         '<span class="wbs-model-batch-count" id="wbs-model-batch-count">已选 0</span>' +
         '<button class="wbs-sess-bbtn wbs-model-batch-action" type="button" id="wbs-model-batch-action"></button>' +
         '<button class="wbs-sess-bbtn wbs-sess-done" type="button" id="wbs-model-done">取消</button>' +
         '</div>' +
+        '</div>' +
         '<div class="wbs-model-tip" id="wbs-model-tip" style="display:none"><span class="wbs-model-tip-ico">' + MODEL_TIP_SVG + '</span><strong>小贴士</strong><span>解决 WorkBuddy 不支持多个同名模型的问题。</span></div>' +
         '<div class="wbs-model-list" id="wbs-model-list"><div class="wbs-empty">加载中…</div></div>' +
         '</div>' +
         '<div class="wbs-modal-mask" id="wbs-model-confirm" style="display:none"><div class="wbs-modal"><div class="wbs-modal-title" id="wbs-model-confirm-title">确认操作</div><div class="wbs-modal-body" id="wbs-model-confirm-body"></div><div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-model-confirm-cancel">取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-model-confirm-ok">确定</button></div></div></div>' +
-        '<div class="wbs-modal-mask" id="wbs-model-edit" style="display:none"><div class="wbs-modal wbs-model-edit-modal"><div class="wbs-modal-title">编辑模型</div><div class="wbs-model-edit-form"><label class="wbs-model-edit-field"><span>名称</span><input id="wbs-model-edit-name" type="text" autocomplete="off"></label><label class="wbs-model-edit-field"><span>URL</span><input id="wbs-model-edit-url" type="url" autocomplete="off"></label><label class="wbs-model-edit-field"><span>API Key</span><span class="wbs-model-secret-wrap"><input id="wbs-model-edit-key" type="password" autocomplete="off"><button class="wbs-model-eye" id="wbs-model-edit-eye" type="button" title="显示或隐藏 API Key" aria-label="显示或隐藏 API Key"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></svg></button></span></label></div><div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-model-edit-cancel">取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-model-edit-save">保存</button></div></div></div>';
+        '<div class="wbs-modal-mask" id="wbs-model-edit" style="display:none"><div class="wbs-modal wbs-model-edit-modal"><div class="wbs-modal-title">编辑模型</div><div class="wbs-model-edit-form"><label class="wbs-model-edit-field"><span>自定义名称</span><input id="wbs-model-edit-name" type="text" autocomplete="off" placeholder="例如我的 DeepSeek"></label><label class="wbs-model-edit-field"><span>模型名</span><input id="wbs-model-edit-id" type="text" autocomplete="off" placeholder="例如 deepseek-v4-flash"></label><label class="wbs-model-edit-field"><span>URL</span><input id="wbs-model-edit-url" type="url" autocomplete="off"></label><label class="wbs-model-edit-field"><span>API Key</span><span class="wbs-model-secret-wrap"><input id="wbs-model-edit-key" type="password" autocomplete="off"><button class="wbs-model-eye" id="wbs-model-edit-eye" type="button" title="显示或隐藏 API Key" aria-label="显示或隐藏 API Key"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></svg></button></span></label></div><div class="wbs-modal-actions"><button class="wbs-modal-btn" type="button" id="wbs-model-edit-cancel">取消</button><button class="wbs-modal-btn wbs-modal-ok" type="button" id="wbs-model-edit-save">保存</button></div></div></div>';
       wireModelsPane();
       loadModels();
     }
@@ -2523,9 +3687,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 按钮组占流固定在标题行右侧，仅 hover/focus cell 时由透明变不透明，布局与高度恒定
       var actions = options.official
         ? '<div class="wbs-model-actions">' +
-          '<button class="wbs-model-icon-action" type="button" data-model-backup="' + model.index + '" title="备份" aria-label="备份">' + MODEL_BACKUP_SVG + '</button>' +
-          '<button class="wbs-model-icon-action" type="button" data-model-test="' + model.index + '" title="连通测试" aria-label="连通测试">' + MODEL_TEST_SVG + '</button>' +
-          '<button class="wbs-model-icon-action wbs-model-danger-action" type="button" data-model-delete-official="' + model.index + '" title="删除" aria-label="删除">' + TRASH_SVG + '</button>' +
+          '<button class="wbs-model-icon-action" type="button" data-model-backup="' + escAttr(model.index) + '" title="备份" aria-label="备份">' + MODEL_BACKUP_SVG + '</button>' +
+          '<button class="wbs-model-icon-action" type="button" data-model-test="' + escAttr(model.index) + '" title="连通测试" aria-label="连通测试">' + MODEL_TEST_SVG + '</button>' +
+          '<button class="wbs-model-icon-action wbs-model-danger-action" type="button" data-model-delete-official="' + escAttr(model.index) + '" title="删除" aria-label="删除">' + TRASH_SVG + '</button>' +
           '</div>'
         : '<div class="wbs-model-actions">' +
           '<button class="wbs-model-icon-action" type="button" data-model-copy="' + escAttr(model.backupId) + '" title="复制" aria-label="复制">' + MODEL_COPY_SVG + '</button>' +
@@ -2581,8 +3745,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
       var batchBtn = modelsPane.querySelector('#wbs-model-batch');
       if (batchBtn) batchBtn.style.display = !modelsState.batch ? '' : 'none';
+      var modelCount = modelsPane.querySelector('#wbs-model-count');
+      if (modelCount) modelCount.style.display = modelsState.batch ? 'none' : '';
+      var spacer = modelsPane.querySelector('.wbs-model-toolbar-spacer');
+      if (spacer) spacer.style.display = modelsState.batch ? 'none' : '';
       var batchbar = modelsPane.querySelector('#wbs-model-batchbar');
-      if (batchbar) batchbar.style.display = modelsState.batch ? '' : 'none';
+      if (batchbar) batchbar.style.display = modelsState.batch ? 'flex' : 'none';
       var tip = modelsPane.querySelector('#wbs-model-tip');
       if (tip) tip.style.display = modelsState.tab === 'mine' && !modelsState.batch ? '' : 'none';
       var imports = modelsPane.querySelector('#wbs-model-imports');
@@ -2608,7 +3776,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (!modelsState.groups.length) { list.innerHTML = '<div class="wbs-empty">还没有模型备份</div>'; return; }
       list.innerHTML = modelsState.groups.map(function (group) {
         var items = group.items || [];
-        return '<div class="wbs-model-group"><div class="wbs-model-group-head"><span class="wbs-model-group-title">' + esc(group.name || '(未命名模型)') + '</span><span class="wbs-model-group-count">' + items.length + '</span></div>' + items.map(function (model) {
+        return '<div class="wbs-model-group"><div class="wbs-model-group-head"><span class="wbs-model-group-title">' + esc(group.id || '(未命名模型)') + '</span><span class="wbs-model-group-count">' + items.length + '</span></div>' + items.map(function (model) {
           return modelRowHtml(model, { selectionKey: 'backup:' + model.backupId });
         }).join('') + '</div>';
       }).join('');
@@ -2773,12 +3941,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var item = findModelBackup(backupId);
       var mask = modelsPane.querySelector('#wbs-model-edit');
       if (!item || !mask) return;
+      var id = modelsPane.querySelector('#wbs-model-edit-id');
       var name = modelsPane.querySelector('#wbs-model-edit-name');
       var url = modelsPane.querySelector('#wbs-model-edit-url');
       var key = modelsPane.querySelector('#wbs-model-edit-key');
       var eye = modelsPane.querySelector('#wbs-model-edit-eye');
       var save = modelsPane.querySelector('#wbs-model-edit-save');
       var cancel = modelsPane.querySelector('#wbs-model-edit-cancel');
+      id.value = item.id || item.name || '';
       name.value = item.name || item.id || '';
       url.value = item.url || '';
       key.value = item.apiKey || '';
@@ -2791,7 +3961,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       mask.onclick = function (event) { if (event.target === mask) close(); };
       eye.onclick = function () { key.type = key.type === 'password' ? 'text' : 'password'; };
       save.onclick = function () {
-        var patch = { name: name.value, url: url.value };
+        var patch = { id: id.value, name: name.value, url: url.value };
         if (key.value !== key.dataset.originalMask) patch.apiKey = key.value;
         save.disabled = true;
         api('/api/models/edit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backupId: backupId, patch: patch }) })
@@ -2889,6 +4059,38 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<label class="wbs-switch" title="开启后仍有确认弹窗时自动替你点「允许」，所有自动批准记录在审计日志"><input type="checkbox" id="wbs-nd-auto"><span class="wbs-switch-slider"></span></label>' +
         '</div>' +
         '</div>' +
+        '<div class="wbs-pcard" id="wbs-ac-card">' +
+        '<div class="wbs-pcard-title">会话<span class="wbs-pcard-sub" id="wbs-ac-status"></span></div>' +
+        '<div class="wbs-nd-row" id="wbs-ac-row">' +
+        '<span class="wbs-nd-title">继续异常中断会话</span>' +
+        '<span class="wbs-nd-hint">检测到会话异常中断，自动让它继续。</span>' +
+        '<label class="wbs-switch"><input type="checkbox" id="wbs-ac-switch"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">暂存提示词</span>' +
+        '<span class="wbs-nd-hint">暂存想法择机发送，发送后自动删除。</span>' +
+        '<label class="wbs-switch"><input type="checkbox" id="wbs-sess-stash"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">快捷短语</span>' +
+        '<span class="wbs-nd-hint">发送后不会自动删除。</span>' +
+        '<label class="wbs-switch"><input type="checkbox" id="wbs-sess-phrase"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-qp-area" id="wbs-qp-area" style="display:none">' +
+        '<div class="wbs-qp-toolbar">' +
+        '<span class="wbs-qp-batchbar" id="wbs-qp-batchbar" style="display:none">' +
+        '<button class="wbs-sess-bbtn" type="button" id="wbs-qp-checkall">全选</button>' +
+        '<span class="wbs-qp-batch-count" id="wbs-qp-batch-count">已选 0</span>' +
+        '<button class="wbs-sess-bbtn wbs-qp-batch-action" type="button" id="wbs-qp-batch-del">删除</button>' +
+        '<button class="wbs-sess-bbtn wbs-sess-done" type="button" id="wbs-qp-done">取消</button>' +
+        '</span>' +
+        '<button class="wbs-sess-bbtn" type="button" id="wbs-qp-batch">批量管理</button>' +
+        '<span class="wbs-qp-toolbar-spacer"></span>' +
+        '<button class="wbs-sess-bbtn" type="button" id="wbs-qp-add">+ 新增</button>' +
+        '</div>' +
+        '<div class="wbs-qp-list" id="wbs-qp-list"><div class="wbs-empty">加载中…</div></div>' +
+        '</div>' +
+        '</div>' +
         '<div class="wbs-pcard" id="wbs-ask-card" style="display:none">' +
         '<div class="wbs-pcard-title">决策弹窗</div>' +
         '<div class="wbs-ask-row">' +
@@ -2903,6 +4105,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<button class="wbs-theme-inspect" id="wbs-theme-inspect" type="button" title="检查元素：点击页面任意组件，查看它的样式与颜色来源">元素检查</button>' +
         '</div>' +
         '<div class="wbs-enh-tip">连续点击面板标题「' + WBS_BRAND + '」5 次可隐藏/呼出本模块</div>' +
+        '<div class="wbs-ac-log-wrap" id="wbs-ac-log-wrap">' +
+        '<div class="wbs-ac-log-head">会话 · 状态机日志<span class="wbs-ac-log-clear" id="wbs-ac-log-clear" title="清空日志">清空</span></div>' +
+        '<pre class="wbs-ac-log" id="wbs-ac-log">（未开启「会话异常中断」监控时无日志）</pre>' +
+        '</div>' +
         '</div>';
       wireEnhancePane();
     }
@@ -2948,7 +4154,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       syncSleepState();
     }
 
-    // 关于 pane：项目信息卡（名字/标语/原理徽章/介绍）+ 支持项目入口 + 版本
+      // 关于 pane：项目信息卡 + 简洁的错误诊断开关 + 版本
     function buildAboutPane() {
       if (!aboutPane) return;
       aboutPane.dataset.built = '1';
@@ -2966,24 +4172,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           '<div class="wbs-update-bar" id="wbs-update-bar" style="display:none;height:6px;border-radius:3px;background:color-mix(in srgb,var(--wb-button-primary-bg,#1f1f1f) 22%,transparent);overflow:hidden;margin-top:8px"><i id="wbs-update-bar-fill" style="display:block;height:100%;width:0;border-radius:3px;background:var(--wb-button-primary-bg,#1f1f1f);transition:width .6s ease"></i></div>' +
         '</div>' +
         '<div class="wbs-pcard wbs-about-hero">' +
-          '<div class="wbs-about-name" id="wbs-about-name">' + WBS_BRAND + '</div>' +
-          '<div class="wbs-about-tag" id="wbs-about-tag">' + (PROFILE_ID === 'workbuddy-ai' ? 'WorkBuddy AI 的多账号 · 主题 · 增强工具集' : 'WorkBuddy 的多账号 · 主题 · 增强工具集') + '</div>' +
+          '<div class="wbs-about-name-row"><div class="wbs-about-name" id="wbs-about-name">' + WBS_BRAND + '</div><span class="wbs-about-ver" id="wbs-about-ver">' + esc('') + '</span></div>' +
           '<span class="wbs-about-badge" id="wbs-about-badge">本机回环 CDP 注入 · 不改官方安装包</span>' +
           '<div class="wbs-about-desc">一个基于 <b>Chrome DevTools Protocol (CDP)</b> 的 WorkBuddy 桌面端增强工具。零侵入、零重签名——只把界面组件注入到正在运行的 WorkBuddy 渲染进程里。</div>' +
           '<div class="wbs-about-support">' +
-            '<span class="wbs-about-support-text">如果 WorkDaddy 对你有帮助，欢迎在 GitHub 点个 Star。你的支持会让这个小项目持续更新。</span>' +
-            '<a class="wbs-about-ghbtn" id="wbs-about-repo" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" aria-label="在 GitHub 上给 WorkDaddy 点 Star" title="在 GitHub 上给 WorkDaddy 点 Star">' +
-              '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>' +
-            '</a>' +
-          '</div>' +
-          '<div class="wbs-about-foot">' +
-            '<span class="wbs-about-ver" id="wbs-about-ver">' + esc('') + '</span>' +
+            '<span class="wbs-about-support-text" title="如果 WorkDaddy 对你有帮助，欢迎在 GitHub 点个 Star。你的支持会让这个小项目持续更新。">如果 WorkDaddy 对你有帮助，欢迎在 GitHub 点个 Star。你的支持会让这个小项目持续更新。</span>' +
             '<a class="wbs-about-feedback" id="wbs-about-issues" href="https://github.com/babygoton/WorkDaddy/issues" target="_blank" rel="noopener" title="去 GitHub Issues 反馈问题">' +
               '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
               '<span>问题反馈</span>' +
             '</a>' +
+            '<a class="wbs-about-ghbtn" id="wbs-about-repo" href="https://github.com/babygoton/WorkDaddy" target="_blank" rel="noopener" aria-label="在 GitHub 上给 WorkDaddy 点 Star" title="在 GitHub 上给 WorkDaddy 点 Star">' +
+              '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6.01 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.62-5.49 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 12 .3z"/></svg>' +
+            '</a>' +
           '</div>' +
-        '</div>';
+        '</div>' +
+        '<div class="wbs-pcard wbs-telemetry-card" id="wbs-telemetry-card">' +
+          '<div class="wbs-telemetry-head">' +
+            '<div class="wbs-telemetry-label"><span class="wbs-pcard-title">发送错误诊断</span><span class="wbs-telemetry-help" tabindex="0" aria-label="查看错误诊断说明"><svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M8.4 7.6a1.8 1.8 0 1 1 2.8 1.45c-.75.48-1.2.85-1.2 1.75M10 13.7v.1"/></svg><span class="wbs-telemetry-tooltip" role="tooltip">仅发送经过脱敏、截断的版本、系统和错误信息，不包含账号、会话内容、Token 或 API Key；可随时关闭。</span></span></div>' +
+            '<div class="wbs-telemetry-ctrl"><span class="wbs-telemetry-reco">推荐开启</span>' +
+            '<label class="wbs-switch wbs-telemetry-switch" title="发送经过脱敏的错误诊断"><input type="checkbox" id="wbs-telemetry-switch" aria-label="发送错误诊断"><span class="wbs-switch-slider"></span></label>' +
+            '</div>' +
+          '</div>' +
+          '<div class="wbs-telemetry-status" id="wbs-telemetry-status" role="status" aria-live="polite">正在读取设置…</div>' +
+        '</div>' +
+        '';
 
       // 回拉 /api/about 填充信息（失败时保留硬编码占位）
       var ver = aboutPane.querySelector('#wbs-about-ver');
@@ -2993,8 +4205,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var el;
         el = aboutPane.querySelector('#wbs-about-name');
         if (el && d.name) el.textContent = d.name;
-        el = aboutPane.querySelector('#wbs-about-tag');
-        if (el && d.tagline) el.textContent = d.tagline;
         el = aboutPane.querySelector('#wbs-about-badge');
         if (el && d.principle) el.textContent = d.principle;
         el = aboutPane.querySelector('#wbs-about-ver');
@@ -3006,8 +4216,47 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var issues = aboutPane.querySelector('#wbs-about-issues');
         if (issues && d.repository) issues.href = d.repository.replace(/\/$/, '') + '/issues';
       }).catch(function () {});
+      wireTelemetrySettings();
       // 自动更新：检查 + 红点 + 更新卡片
       checkForUpdate();
+    }
+
+    function wireTelemetrySettings() {
+      var toggle = aboutPane.querySelector('#wbs-telemetry-switch');
+      var status = aboutPane.querySelector('#wbs-telemetry-status');
+      if (!toggle || !status) return;
+      function renderTelemetryState(enabled, managed) {
+        toggle.checked = !!enabled;
+        toggle.disabled = !managed;
+        // 管理范围内：开关左侧固定展示「推荐开启」，不再显示已开启/已关闭动态文案
+        var reco = aboutPane.querySelector('.wbs-telemetry-reco');
+        if (reco) reco.style.display = managed ? '' : 'none';
+        status.textContent = managed ? '' : '由环境变量控制';
+        status.classList.toggle('is-off', !enabled);
+      }
+      api('/api/telemetry-settings').then(function (data) {
+        renderTelemetryState(data.enabled, data.managed !== false);
+      }).catch(function () {
+        renderTelemetryState(true, true);
+        status.textContent = '默认开启 · 设置读取失败';
+      });
+      toggle.addEventListener('change', function () {
+        var next = toggle.checked;
+        toggle.disabled = true;
+        status.textContent = '保存中…';
+        api('/api/telemetry-settings', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: next }),
+        }).then(function (data) {
+          renderTelemetryState(data.enabled, data.managed !== false);
+        }).catch(function (error) {
+          toggle.checked = !next;
+          toggle.disabled = false;
+          status.textContent = '由环境变量控制';
+          toast('诊断设置保存失败: ' + (error.message || error), true, root);
+        });
+      });
     }
 
     // 自动更新 UI：查询 /api/update-check（force=1 每次面板打开都强制刷新，不受 daemon 6 小时缓存限制）
@@ -3238,10 +4487,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (segBtn) {
           var id = segBtn.getAttribute('data-theme');
           // 不做 active 拦截：即使当前已是该主题也强制重新应用（保证「切换到默认主题=强制浅色 / 切换到 WorkDaddy 主题=强制深色」始终生效，面板状态与真实主题不一致时也能纠正）
+          var previous = themePane.querySelector('.wbs-theme-opt.active');
           themePane.querySelectorAll('.wbs-theme-opt').forEach(function (b) { b.classList.toggle('active', b === segBtn); });
           applyTheme(id).then(function () {
             toast('已应用主题「' + (id === 'default' ? 'WorkBuddy 默认主题' : WBS_BRAND + ' 主题') + '」', false, root);
           }).catch(function (er) {
+            themePane.querySelectorAll('.wbs-theme-opt').forEach(function (b) { b.classList.toggle('active', b === previous); });
             toast('应用主题失败: ' + (er.message || er), true, root);
           });
           return;
@@ -3407,6 +4658,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
       syncAskSwitch();
       wireNoDisturbPane();
+      wireAutoContinuePane();
+      wireSessionControls();
       // DevTools 按钮
       var devtoolsBtn = enhancePane.querySelector('#wbs-theme-devtools');
       if (devtoolsBtn) {
@@ -3448,10 +4701,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         if (!list.length) { grid.innerHTML = '<div class="wbs-wp-loading">暂无官方壁纸</div>'; return; }
         var html = '';
         list.forEach(function (w) {
+          var wallpaperUrl = base + '/wallpapers/' + encodeURIComponent(w.name);
           html +=
-            '<div class="wbs-wp" data-wp="' + w.name + '" title="' + w.title + '">' +
-            '<div class="wbs-wp-thumb"><img data-src="' + base + '/wallpapers/' + encodeURIComponent(w.name) + '" alt="' + w.title + '" loading="lazy"></div>' +
-            '<div class="wbs-wp-badge">' + (String(w.name).replace(/\D/g, '').replace(/^0+/, '') || w.title) + '</div>' +
+            '<div class="wbs-wp" data-wp="' + escAttr(w.name) + '" title="' + escAttr(w.title) + '">' +
+            '<div class="wbs-wp-thumb"><img data-src="' + escAttr(wallpaperUrl) + '" alt="' + escAttr(w.title) + '" loading="lazy"></div>' +
+            '<div class="wbs-wp-badge">' + esc(String(w.name).replace(/\D/g, '').replace(/^0+/, '') || w.title) + '</div>' +
             '</div>';
         });
         grid.innerHTML = html;
@@ -3498,13 +4752,33 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       });
     }
 
+    var workBuddyAiThemeMigrationStarted = false;
+    function migrateWorkBuddyAiThemeOnce() {
+      if (!WBS_PROFILE_IS_AI || workBuddyAiThemeMigrationStarted) return;
+      var migrationKey = workBuddyAiThemeMigrationKey(PROFILE_ID);
+      var marker = null;
+      try { marker = localStorage.getItem(migrationKey); } catch (_) {}
+      if (!shouldMigrateWorkBuddyAiTheme(PROFILE_ID, marker)) return;
+      // 同一 build 内先锁住，避免重复点击/重复打开并发发起两次迁移；失败时
+      // 解锁，让下次打开仍可重试，而不是把用户永久留在旧主题上。
+      workBuddyAiThemeMigrationStarted = true;
+      applyTheme('default').then(function () {
+        try { localStorage.setItem(migrationKey, '1'); } catch (_) {}
+      }).catch(function () {
+        workBuddyAiThemeMigrationStarted = false;
+      });
+    }
+
     function setOpen(open) {
       state.open = open;
       panel.classList.toggle('show', open);
       fab.classList.toggle('hidden', open); // 打开时隐藏按钮
       if (open) {
+        migrateWorkBuddyAiThemeOnce(); // WorkDaddy AI 仅首次打开时恢复官方浅色
         refresh();
         checkForUpdate(); // 打开面板即检测更新（每次打开都强制查一次新版本）
+        try { acCheckPromptOnOpen(); } catch (e) {} // 每次打开面板：指令块丢失则请求 daemon 补写（无 toast）
+        try { syncSessionModule(); } catch (e) {} // 每次打开面板刷新会话模块（开关+快捷短语，含外部修改）
       } else {
         stopCheckinPolling();
         state.creditRunId++;
@@ -3857,12 +5131,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         ['圆角', cs.borderRadius], ['模糊', cs.backdropFilter === 'none' ? '—' : cs.backdropFilter],
       ];
       for (var i = 0; i < items.length; i++) {
-        rows += '<div class="wbs-ins-row"><span>' + items[i][0] + '</span><code>' + (items[i][1] || '—') + '</code></div>';
+        rows += '<div class="wbs-ins-row"><span>' + esc(items[i][0]) + '</span><code>' + esc(items[i][1] || '—') + '</code></div>';
       }
       var vars = '';
       for (var k = 0; k < INSPECT_KEYS.length; k++) {
         var v = cs.getPropertyValue(INSPECT_KEYS[k][0]).trim();
-        vars += '<div class="wbs-ins-row"><span>' + INSPECT_KEYS[k][1] + ' <em>' + INSPECT_KEYS[k][0] + '</em></span><code>' + (v || '未定义（继承上层）') + '</code></div>';
+        vars += '<div class="wbs-ins-row"><span>' + esc(INSPECT_KEYS[k][1]) + ' <em>' + esc(INSPECT_KEYS[k][0]) + '</em></span><code>' + esc(v || '未定义（继承上层）') + '</code></div>';
       }
       var rules = [];
       try {
@@ -3879,7 +5153,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         }
       } catch (e) {}
       var rulesHtml = rules.length
-        ? rules.map(function (x) { return '<div class="wbs-ins-rule">' + x + '</div>'; }).join('')
+        ? rules.map(function (x) { return '<div class="wbs-ins-rule">' + esc(x) + '</div>'; }).join('')
         : '<div class="wbs-ins-rule muted">无直接样式规则（颜色来自继承）</div>';
       // 完整报告文本（复制用：选择器 + 基础样式 + 主题变量 + 匹配规则）
       var report = ['🔍 ' + buildSelector(el), ''];
@@ -3898,9 +5172,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 元素 query 路径（从 body 到该元素的完整 CSS 选择器，可直接用于 document.querySelector）
       var queryPath = buildQueryPath(el);
       div.innerHTML =
-        '<div class="wbs-ins-head"><span>🔍 ' + buildSelector(el) + '</span>' +
+        '<div class="wbs-ins-head"><span>🔍 ' + esc(buildSelector(el)) + '</span>' +
         '<span class="wbs-ins-btns"><button class="wbs-ins-copy" type="button" title="复制元素 query 路径（从 body 起的完整 CSS 选择器）">复制路径</button><button class="wbs-ins-repick" type="button">再检查</button><button class="wbs-ins-close" type="button">✕</button></span></div>' +
-        '<div class="wbs-ins-sec">元素路径</div><div class="wbs-ins-path">' + queryPath + '</div>' +
+        '<div class="wbs-ins-sec">元素路径</div><div class="wbs-ins-path">' + esc(queryPath) + '</div>' +
         '<div class="wbs-ins-sec">基础样式</div>' + rows +
         '<div class="wbs-ins-sec">主题变量（当前生效值）</div>' + vars +
         '<div class="wbs-ins-sec">匹配的样式规则</div>' + rulesHtml +
@@ -4476,6 +5750,1176 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       else stopNoDisturbAutoApprove();
     }
 
+    /* ———— 持续会话 · 会话异常中断（Auto-Continue 监控，macOS only）————
+     * 状态机：IDLE → WATCHING（发现新助手消息）→ SETTLING → JUDGED。
+     * 终局信号 = 助手消息底部操作区出现 feedback 元素（[class*="assistantFeedback"]，任务无论成败都会渲染），
+     *          出现并经短缓冲（AC_FB_SETTLE_MS）稳定后：正文块末尾有完成标记 = 完成；无标记 = 异常 → 发送「如果未完成，继续执行；已完成则回复"已完成"」。
+     * 兜底：feedback 选择器失效时，消息静默超过 AC_IDLE_FALLBACK_MS 也判定一次。
+     * 只处理开关开启后新出现的回复；同一条只触发一次（judgedMessages）；generation 隔离旧回调。 */
+    var AC_SETTLE_MS = 800;           // 判定轮询间隔（feedback 出现后/等待期间）
+    var AC_FB_SETTLE_MS = 3000;       // feedback 出现后的 3 秒静默缓冲：等操作按钮区和正文彻底稳定再判定
+    var AC_IDLE_FALLBACK_MS = 60000;  // DOM 兜底：feedback 一直未出现时，消息静默超过此时长才判定
+    var AC_CONTROLLER_SETTLE_MS = 8000; // store 显示已空闲但 assistant 尚未 terminal 时的防抖窗口
+    var AC_RETRY_DELAY_MS = 300;      // 发送失败重试间隔
+    var AC_MAX_SEND_ATTEMPTS = 2;     // 同一回复最多发送尝试次数（首次+1 重试）
+    var AC_STRICT_MARKER = '\u200B\u200B\u2060'; // 严格三连完成标记
+    var AC_CONTINUE_TEXT = '如果未完成，继续执行；已完成则回复"已完成"';
+    var AC_HEARTBEAT_MS = 5000;       // controller/会话区存活体检
+
+    var acCtx = {
+      generation: 0,
+      controller: null,
+      controllerUnsubs: null,
+      controllerLastVersion: -1,
+      controllerLastBusy: false,
+      controllerIdleAt: 0,
+      sessionRoot: null,
+      observer: null,
+      settleTimer: null,
+      heartbeat: null,
+      activeMessage: null,
+      judgedMessages: null,   // Set<消息签名>：同一条消息只判定/触发一次（签名判重，虚拟列表重建可免疫）
+      baselineMessages: null,
+      lastMutationAt: 0,
+      lastActiveTxt: '',
+      lastMsgCount: 0,   // 上次观察到的助手消息数：新增消息 = 新回复；数量的增减而非元素重建可区分"切会话回放"
+      sessionSig: '',    // 会话身份签名（URL + 首条用户消息）：变化 = 切换会话 → 重新校准基准，不触发
+      feedbackSeen: false, // 当前消息是否已出现操作区（feedback）终局信号
+      feedbackAt: 0,       // feedback 出现时间戳
+      baselineAssistantKey: '', // 当前会话「切换后/开启后」最后一条已有助手消息的稳定 key（baseline，绝不判定）
+      awaitingNewReply: false,  // 是否仍在等待新回复：为 true 时 baseline 消息的 feedback/文本变化/重排均不解除判定，不安排 settle
+    };
+    var acRunning = false;
+    var acStatusTimer = null;
+
+    /** 状态机可视化日志：写入环形缓冲 + 渲染到开发者工具卡片（连点 5 次 logo 呼出）+ 上报 daemon breadcrumb */
+    var AC_LOG_MAX = 150;
+    var acLogLines = [];
+    var acLogLastKeyTs = {};
+    function acLogLine(msg, extra) {
+      var now = new Date();
+      var t = now.toTimeString().slice(0, 8) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      return '[' + t + '] ' + msg + (extra ? ' | ' + JSON.stringify(extra).slice(0, 200) : '');
+    }
+    function acLog(msg, extra) {
+      var line = acLogLine(msg, extra);
+      acLogLines.push(line);
+      if (acLogLines.length > AC_LOG_MAX) acLogLines.shift();
+      try {
+        var pre = enhancePane && enhancePane.querySelector('#wbs-ac-log');
+        if (pre) { pre.textContent = acLogLines.join('\n'); pre.scrollTop = pre.scrollHeight; }
+      } catch (e) {}
+      try {
+        fetch(API + '/api/breadcrumb', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'X-WorkDaddy-Token': WBS_API_TOKEN },
+          body: JSON.stringify({ msg: 'ac:' + msg, extra: extra || {} }),
+        }).catch(function () {});
+      } catch (e) {}
+    }
+    /** 限频日志：同一 key 在窗口内最多打一条（流式 mutation 每帧都打会刷屏） */
+    function acLogR(key, msg, extra, windowMs) {
+      var w = windowMs || 400;
+      var last = acLogLastKeyTs[key] || 0;
+      var now = Date.now();
+      if (now - last < w) return;
+      acLogLastKeyTs[key] = now;
+      acLog(msg, extra);
+    }
+
+    function acResetState() {
+      var c = acCtx;
+      c.generation++;
+      if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
+      if (c.observer) { try { c.observer.disconnect(); } catch (e) {} c.observer = null; }
+      if (Array.isArray(c.controllerUnsubs)) {
+        for (var ui = 0; ui < c.controllerUnsubs.length; ui++) {
+          try { c.controllerUnsubs[ui](); } catch (e) {}
+        }
+      }
+      c.controller = null;
+      c.controllerUnsubs = null;
+      c.controllerLastVersion = -1;
+      c.controllerLastBusy = false;
+      c.controllerIdleAt = 0;
+      c.sessionRoot = null;
+      c.activeMessage = null;
+      c.judgedMessages = new Set();
+      c.baselineMessages = new WeakSet();
+      c.lastMutationAt = 0;
+      c.lastActiveTxt = '';
+      c.lastMsgCount = 0;
+      c.sessionSig = '';
+      c.feedbackSeen = false;
+      c.feedbackAt = 0;
+      c.baselineAssistantKey = '';
+      c.awaitingNewReply = false;
+    }
+
+    /* 监控状态常驻展示：开关开启期间卡片标题右侧固定显示「监控激活会话中」 */
+    var acStatusVisible = false;
+    function acShowStatus() {
+      acStatusVisible = true;
+      if (acStatusTimer) { clearTimeout(acStatusTimer); acStatusTimer = null; } // 清掉弱提示残留定时
+      var st = enhancePane && enhancePane.querySelector('#wbs-ac-status');
+      if (st) st.textContent = '监控激活会话中';
+    }
+    function acHideStatus() {
+      acStatusVisible = false;
+      var st = enhancePane && enhancePane.querySelector('#wbs-ac-status');
+      if (st) st.textContent = '';
+    }
+    function acStartStatusAnim() { acShowStatus(); } // 兼容旧调用名（固定展示）
+    function acStopStatusAnim() { acHideStatus(); }
+
+    /** 弱提示：复用卡片标题右侧的 wbs-ac-status 小字，4s 后自动清除；若状态常驻显示则暂停，提示结束恢复 */
+    function acWeak(msg) {
+      var restore = acStatusVisible;
+      acStatusVisible = false;
+      var st = enhancePane && enhancePane.querySelector('#wbs-ac-status');
+      if (st) st.textContent = msg;
+      if (acStatusTimer) clearTimeout(acStatusTimer);
+      acStatusTimer = setTimeout(function () {
+        var s = enhancePane && enhancePane.querySelector('#wbs-ac-status');
+        if (s && s.textContent === msg) s.textContent = '';
+        if (acRunning && restore) acShowStatus(); // 弱提示结束恢复状态常驻
+      }, 4000);
+    }
+
+    /** 取正文块：内容容器直接子块中排除 widget/推理/元信息折叠，优先最后一段文本内容块（_assistantTextContent/markdown） */
+    function acPickBodyBlock(contentEl) {
+      if (!contentEl || !contentEl.children || !contentEl.children.length) return contentEl;
+      var children = contentEl.children;
+      var picked = null;
+      for (var i = 0; i < children.length; i++) {
+        var el = children[i];
+        var cls = typeof el.className === 'string' ? el.className : '';
+        if (/_widget|widgetRenderer|_assistantReasoning|_metaFold|_collapse/i.test(cls)) continue; // 非正文块跳过
+        if (/_assistantTextContent|_assistantText|_markdown|markdown/i.test(cls)) picked = el; // 正文文本段优先
+        else if (!picked) picked = el; // 兜底：第一个非跳过块
+      }
+      return picked || children[children.length - 1];
+    }
+
+    /** 完成标记判定：正文文本末尾（去除可见空白后）为严格三连标记 或 任一零宽字符。可见转义文本不算 */
+    function acHasMarker(text) {
+      if (typeof text !== 'string' || !text.length) return false;
+      var t = text.replace(/[ \t\r\n\f\v\u00A0]+$/, ''); // 只去除可见空白，保留零宽字符（含 U+FEFF）
+      if (!t.length) return false;
+      if (t.slice(-AC_STRICT_MARKER.length) === AC_STRICT_MARKER) return true;
+      if (/[\u200B\uFEFF\u2060\u200D]$/.test(t)) return true;
+      return false;
+    }
+
+    function acHasCompletionActions(row) {
+      if (!row || !row.querySelectorAll) return false;
+      var controls = row.querySelectorAll('button,[role="button"]');
+      for (var i = 0; i < controls.length; i++) {
+        var el = controls[i];
+        if (typeof isVisibleHealthNode === 'function') {
+          if (!isVisibleHealthNode(el)) continue;
+        } else if (el.offsetParent === null) continue;
+        var text = [el.innerText, el.getAttribute('aria-label'), el.getAttribute('title'), el.className]
+          .join(' ').replace(/\s+/g, ' ');
+        if (/(^|\s)(copy|复制|regenerate|重新生成|retry|重试|read aloud|朗读)(\s|$)/i.test(text) ||
+            /_copyButton_|_ratingButton_|_actionButton_|_shareButton_|_moreButton_/i.test(String(el.className || ''))) return true;
+      }
+      return false;
+    }
+
+    function acHasErrorSignal(row) {
+      if (!row || !row.querySelectorAll) return false;
+      var errors = row.querySelectorAll('[role="alert"],[class*="errorBanner"],[class*="_error_"],[class*="failed"],[class*="Failed"]');
+      for (var i = 0; i < errors.length; i++) {
+        var error = errors[i];
+        if (error.closest && error.closest('.wbs-root')) continue;
+        if (typeof isVisibleHealthNode === 'function' && !isVisibleHealthNode(error)) continue;
+        if (error.offsetParent === null && !(error.getBoundingClientRect && error.getBoundingClientRect().width)) continue;
+        var text = (error.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && /(错误|失败|重试|超时|限流|error|failed|retry|timeout|rate limit)/i.test(text)) return true;
+      }
+      return false;
+    }
+
+    function acLooksTruncated(text) {
+      var t = String(text || '').replace(/[ \t\r\n\f\v\u00A0]+$/, '');
+      // Punctuation alone is not interruption evidence: a normal answer may end in
+      // a comma/colon while introducing a list. Keep only explicit continuation
+      // language and ellipsis, which are useful fallback signals when error UI is absent.
+      return /(\.\.\.|…|正在$|等待$|调用$|执行$|结果如下[:：]?$)/.test(t);
+    }
+
+    function acReplyDecision(row, content, text) {
+      return classifyAutoContinueReply({
+        observed: !!text,
+        hasCompletionActions: acHasCompletionActions(row),
+        completionMarker: acHasMarker(text),
+        error: acHasErrorSignal(row),
+        looksTruncated: acLooksTruncated(text),
+      });
+    }
+
+    /** 忙碌判定：仅匹配"停止生成"类精确信号（宽泛 stop/loading 会命中 _loadingWithCredit 等常驻元素，导致永不发送）；
+     *  只认「可见 + 未隐藏 + 未禁用」的元素，避免把隐藏残留的停止按钮误判为忙碌 */
+    function acIsBusyEl(sessionRoot) {
+      if (!sessionRoot) return null;
+      // querySelectorAll 遍历：跳过隐藏/aria-hidden/disabled 的匹配元素，返回第一个真实有效的停止信号
+      var els = sessionRoot.querySelectorAll(
+        '[aria-label*="停止"],[title*="停止"],[class*="stopGenerate"],[class*="StopGenerate"],' +
+        '[class*="stopButton"],[class*="StopButton"],[class*="stopEmit"],[class*="_generating"],[class*="_Generating"]'
+      );
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (el.offsetParent === null) continue;                 // 不可见（display:none / 已卸载区域）
+        if (el.getAttribute('aria-hidden') === 'true') continue; // 对辅助技术隐藏
+        if (el.hasAttribute('disabled') || el.disabled) continue; // 禁用态不算工作中
+        return el;
+      }
+      return null;
+    }
+    function acIsBusy(sessionRoot) {
+      return !!acIsBusyEl(sessionRoot);
+    }
+
+    /** 定位输入框：优先 textarea，其次 contenteditable；必须可见 */
+    function acFindComposer(sessionRoot) {
+      if (!sessionRoot) return null;
+      var ta = sessionRoot.querySelector('textarea');
+      if (ta && ta.offsetParent !== null) return { el: ta, type: 'textarea' };
+      var ce = sessionRoot.querySelector('[contenteditable="true"]');
+      if (ce && ce.offsetParent !== null) return { el: ce, type: 'contenteditable' };
+      return null;
+    }
+    function acComposerText(composer) {
+      if (!composer) return '';
+      if (composer.type === 'textarea') return composer.el.value || '';
+      // contenteditable（Slate）：克隆后剔除 data-slate-placeholder 占位节点，避免空态误判为"有内容"
+      try {
+        var clone = composer.el.cloneNode(true);
+        var ph = clone.querySelectorAll('[data-slate-placeholder]');
+        for (var i = 0; i < ph.length; i++) { var p = ph[i]; if (p.parentNode) p.parentNode.removeChild(p); }
+        return clone.textContent || '';
+      } catch (e) { return composer.el.textContent || ''; }
+    }
+
+    /** 定位发送按钮：最后一个可见、带 send/发送 语义的按钮 */
+    function acFindSendButton(sessionRoot) {
+      if (!sessionRoot) return null;
+      var btns = sessionRoot.querySelectorAll('button');
+      var last = null;
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.offsetParent === null) continue;
+        var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        var title = (b.getAttribute('title') || '').toLowerCase();
+        var cls = typeof b.className === 'string' ? b.className : '';
+        if (/send|发送/.test(aria) || /send|发送/.test(title) || /\bsend\b/i.test(cls)) last = b;
+      }
+      return last;
+    }
+
+    /** 写入输入框（React 合成事件需 native setter；contenteditable/Slate 用插入文本） */
+    function acSetValue(composer, text) {
+      if (!composer) return;
+      if (composer.type === 'textarea') {
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        try { setter.call(composer.el, text); } catch (e) { composer.el.value = text; }
+        composer.el.dispatchEvent(new Event('input', { bubbles: true }));
+        composer.el.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        try {
+          composer.el.focus();
+          var sel = window.getSelection();
+          var range = document.createRange();
+          range.selectNodeContents(composer.el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('delete'); // 先清空（含占位符），避免插入内容与占位文本堆叠
+          document.execCommand('insertText', false, text);
+          composer.el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+        } catch (e) {}
+      }
+    }
+    function acPressEnter(el) {
+      try {
+        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      } catch (e) {}
+    }
+
+    /** 官方 assistant 消息 ID：.cb-assistant-message 的 data-message-request-id；取不到返回 null。
+     *  用于 baseline 解锁/切换识别——只认官方 ID，绝不回退文本签名（文本变化不得视为新回复） */
+    function acAssistantMsgId(content) {
+      if (!content) return null;
+      try {
+        var row = content.closest ? content.closest('.cb-assistant-message') : null;
+        var mid = row && row.getAttribute('data-message-request-id');
+        return mid || null;
+      } catch (e) { return null; }
+    }
+
+    /** 消息稳定签名：正文规范化文本截断——DOM 虚拟列表重建后签名不变，可稳定判重（judgedMessages 用签名而非节点引用） */
+    function acMsgSignature(content) {
+      if (!content) return '';
+      try {
+        // 优先使用官方稳定消息 ID（.cb-assistant-message 的 data-message-request-id）：
+        // 唯一、不碰撞、虚拟列表重建后属性仍在；重新生成会换新 ID = 重新判定，语义正确
+        var row = content.closest ? content.closest('.cb-assistant-message') : null;
+        var mid = row && row.getAttribute('data-message-request-id');
+        if (mid) return 'id:' + mid;
+        // 回退（无 ID 的旧 DOM）：len + 前96 + 后96，防模板前缀碰撞
+        var body = acPickBodyBlock(content) || content;
+        var t = (body.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t) return '';
+        return t.length + ':' + t.slice(0, 96) + ':' + t.slice(-96);
+      } catch (e) { return ''; }
+    }
+
+    /** 用户消息快照（发送前后对比，作为真实发送证据） */
+    function acUserMsgSnapshot(sessionRoot) {
+      try {
+        // 用户消息稳定 ID：.cb-user-message 外层 id="user-message-<uuid>"（官方唯一，比数量/文本更可靠）
+        var ms = sessionRoot.querySelectorAll('.cb-user-message[id], [id^="user-message-"]');
+        if (!ms.length) ms = sessionRoot.querySelectorAll('.cb-user-message, [class*="_userMessage_"]');
+        var text = '';
+        var lastId = '';
+        var ids = [];
+        for (var qi = 0; qi < ms.length; qi++) {
+          var idv = ms[qi].getAttribute('id');
+          if (idv) ids.push(idv);
+        }
+        if (ms.length) {
+          var last = ms[ms.length - 1];
+          lastId = last.getAttribute('id') || '';
+          var pick = last.querySelector('[class*="_userMessageText_"]') || last;
+          text = (pick.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+        }
+        return { count: ms.length, last: text, lastId: lastId, ids: ids };
+      } catch (e) { return null; }
+    }
+
+    function acControllerComposerEmpty() {
+      var editor = findComposer();
+      if (!editor) return true; // controller 直发不依赖 DOM；无 editor 时不阻塞
+      try { return !composerHasContent(editor); } catch (e) { return false; }
+    }
+
+    /** 优先走 ConversationController.sendPrompt：同一层接口同时服务 WorkBuddy/WorkBuddy AI，
+     *  不依赖输入框 DOM 与 CDP。只有控制器缺失/调用失败时才回退旧发送链。 */
+    function acSendViaController(gen, controller, assistantId) {
+      if (gen !== acCtx.generation || !controller || typeof controller.sendPrompt !== 'function') return false;
+      var activeId = acActiveConversationId();
+      if (activeId && String(activeId) !== String(controller.conversationId || '')) {
+        acLog('controller-send-session-mismatch', { activeId: activeId, controllerId: controller.conversationId || '' });
+        acStartMonitor();
+        return true;
+      }
+      var view;
+      try { view = controller.getSessionViewState(); } catch (e) { return false; }
+      if (!view || view.isBusy || view.isRunActive || view.isTurnActive || view.isPending || view.isSending) {
+        acLog('controller-send-busy-skip', { assistantId: assistantId || '', state: view && view.state });
+        return true;
+      }
+      if (!acControllerComposerEmpty()) {
+        acLog('composer-busy-abandon');
+        acWeak('输入框非空，已放弃自动发送，避免覆盖你的输入');
+        return true;
+      }
+      toast('检测到会话异常中断，即将自动发送「' + AC_CONTINUE_TEXT + '」', false, root);
+      acLog('controller-send-call', { assistantId: assistantId || '' });
+      var sendPromise;
+      try {
+        sendPromise = controller.sendPrompt({ blocks: [{ type: 'text', text: AC_CONTINUE_TEXT }] }, {
+          _meta: { 'codebuddy.ai': { source: 'workdaddy-auto-continue' } },
+        });
+      } catch (e) {
+        acLog('controller-send-throw', { err: (e && e.message) || '?' });
+        acWeak('底层发送失败，请手动发送');
+        return true;
+      }
+      Promise.resolve(sendPromise).then(function (result) {
+        if (gen !== acCtx.generation) return;
+        if (result && result.ok === false) throw new Error((result.error && result.error.message) || 'controller-send-rejected');
+        acLog('controller-send-ok', { assistantId: assistantId || '' });
+        acWeak('已发送「' + AC_CONTINUE_TEXT + '」');
+      }).catch(function (e) {
+        if (gen !== acCtx.generation) return;
+        // Promise 拒绝不代表底层一定未接受请求；自动二次走 DOM/CDP 可能重复发送。
+        // 保守停止并提示人工确认，只有 controller 本身完全不存在时才使用旧发送链。
+        acLog('controller-send-unconfirmed', { err: (e && e.message) || '?' });
+        acWeak('底层发送结果未确认，为避免重复消息已停止重试，请检查会话');
+      });
+      return true;
+    }
+
+    /** 发送主流程：检测到异常中断先 toast 预告，记录发送前用户消息快照，然后发送固定文案 */
+    function acSendContinue(gen, sessionRoot, activeMessage, skipController) {
+      if (gen !== acCtx.generation) return;
+      if (!skipController && acSendViaController(gen, acCtx.controller, activeMessage && acAssistantMsgId(activeMessage))) return;
+      if (!sessionRoot || !document.body.contains(sessionRoot)) return;
+      if (!activeMessage || !document.body.contains(activeMessage)) return;
+      var composer = acFindComposer(sessionRoot);
+      if (!composer) { acLog('no-composer'); acWeak('未找到输入框'); return; }
+      if (acIsBusy(sessionRoot)) {
+        var busyEl = acIsBusyEl(sessionRoot);
+        acLog('busy-skip', { el: busyEl ? String(busyEl.className).slice(0, 50) : '?' });
+        return; // 仍在生成：不提示不发送
+      }
+      toast('检测到会话异常中断，即将自动发送「' + AC_CONTINUE_TEXT + '」', false, root);
+      acLog('toast-shown', { gen: gen, composer: composer.type });
+      // 局部发送上下文（快照+会话签名+generation）：贯穿本次发送与验证，防并发发送互相覆盖、防切会话误证
+      var sendCtx = {
+        snap: acUserMsgSnapshot(sessionRoot),
+        sig: acSessionSig(sessionRoot),
+        gen: gen,
+      };
+      var txt = acComposerText(composer).trim();
+      if (txt !== '') {
+        // 用户正在输入：轮询最多 2s 等待清空，仍非空则放弃，绝不覆盖用户内容
+        var waitUntil = Date.now() + 2000;
+        (function tryWait() {
+          if (gen !== acCtx.generation) return;
+          if (!acComposerText(composer).trim()) { acDoSend(gen, sessionRoot, composer, 0, sendCtx); return; }
+          if (Date.now() < waitUntil) { setTimeout(tryWait, 200); return; }
+          acLog('composer-busy-abandon');
+          acWeak('输入框非空，已放弃自动发送，避免覆盖你的输入');
+        })();
+      } else {
+        acDoSend(gen, sessionRoot, composer, 0, sendCtx);
+      }
+    }
+    /** 发送：统一走 daemon CDP 真实输入（聚焦→全选→插入「如果未完成，继续执行；已完成则回复"已完成"」→真实 Enter，isTrusted Slate 必然响应）。
+     *  CDP 失败才兜底：按钮可用（存在且未禁用）则先写入固定文案再点按钮；最后手段为本地模拟填写+合成 Enter。 */
+    function acDoSend(gen, sessionRoot, composer, attempt, sendCtx) {
+      if (gen !== acCtx.generation) return;
+      acLog('send-cdp-call', { attempt: attempt });
+      api('/api/auto-continue-send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      }).then(function (d) {
+        if (gen !== acCtx.generation) return;
+        if (!d || !d.ok) throw new Error((d && d.error) || 'cdp-send-failed');
+        acLog('cdp-send-ok');
+        acVerifySent(gen, sessionRoot, composer, attempt, sendCtx);
+      }).catch(function (e) {
+        if (gen !== acCtx.generation) return;
+        acLog('cdp-send-fail-fallback', { err: (e && e.message) || '?' });
+        var btn = acFindSendButton(sessionRoot);
+        if (btn && !btn.disabled && !btn.hasAttribute('disabled') && btn.getAttribute('aria-disabled') !== 'true') {
+          // 兜底点按钮前必须先写入固定文案（空输入框点发送 = 什么都没发）
+          acSetValue(composer, AC_CONTINUE_TEXT);
+          setTimeout(function () {
+            if (gen !== acCtx.generation) return;
+            acLog('send-btn-click', { attempt: attempt });
+            btn.click();
+            acVerifySent(gen, sessionRoot, composer, attempt, sendCtx);
+          }, 80);
+          return;
+        }
+        acSetValue(composer, AC_CONTINUE_TEXT);
+        setTimeout(function () {
+          if (gen !== acCtx.generation) return;
+          acLog('send-synthetic-enter', { attempt: attempt });
+          acPressEnter(composer.el);
+          acVerifySent(gen, sessionRoot, composer, attempt, sendCtx);
+        }, 100);
+      });
+    }
+    /** 发送结果验证：必须观测到真实发送证据——用户消息数增加，或末条文本变化且包含固定文案。
+     *  仅凭「输入框清空」不算成功（空输入框点发送=没发也清空）；证据缺失则重试，超时按失败汇报。 */
+    function acVerifySent(gen, sessionRoot, composer, attempt, sendCtx) {
+      var before = sendCtx && sendCtx.snap;
+      if (!before) { acLog('send-no-snapshot'); return; }
+      var pollAt = Date.now();
+      (function poll() {
+        if (gen !== acCtx.generation) return;
+        // 验证期间会话切换：本发送上下文已失效，立即终止——不重试、不提示成功（防把新会话消息误当证据）
+        if (sendCtx && sendCtx.sig && acSessionSig(sessionRoot) !== sendCtx.sig) {
+          acLog('send-abort-session-switch');
+          return;
+        }
+        if (attempt >= AC_MAX_SEND_ATTEMPTS) { acLog('send-failed-attempts', { attempt: attempt }); acWeak('自动发送失败，请手动点击发送'); return; }
+        var snap = acUserMsgSnapshot(sessionRoot);
+        // 新消息 ID 证据：snap 可能为 null（DOM 异常）；空 ID（降级 DOM 无官方 id）不得当新 ID——
+        // 必须 snap/lastId/ids 三者齐全且非空，且 lastId 不在发送前 id 集中
+        var newId = !!(snap && snap.lastId && before && Array.isArray(before.ids) &&
+          before.ids.length && snap.lastId && before.ids.indexOf(snap.lastId) < 0);
+        var fresh = snap && before && snap.last &&
+          snap.last.indexOf('如果未完成，继续执行；已完成则回复"已完成"') >= 0 &&
+          (newId || snap.count > before.count || (before.last && snap.last !== before.last));
+        if (fresh) { // 真实证据：出现了包含固定文案的新用户消息
+          acLog('send-verified-ok', { attempt: attempt, count: snap.count });
+          acWeak('已发送「如果未完成，继续执行；已完成则回复"已完成"」');
+          return;
+        }
+        if (Date.now() - pollAt > 7000) {
+          if (!acComposerText(composer).trim()) {
+            // 输入框已空但证据未到：很大可能是发送成功、WorkBuddy 渲染延迟 → 延长观察窗口，绝不重发（防重复消息）
+            acLog('send-wait-evidence', { ms: Date.now() - pollAt });
+            if (Date.now() - pollAt > 15000) {
+              // 无 sent 证据绝不能呈现为成功：提示未确认结果、已停止重试（避免重复消息）
+              acLog('send-evidence-timeout', { attempt: attempt });
+              acWeak('未能确认自动发送结果，请检查会话；为避免重复消息，已停止重试');
+              return;
+            }
+            setTimeout(poll, 1000);
+            return;
+          }
+          // composer 仍非空 = 确实没发出去 → 重试
+          acLog('send-retry', { attempt: attempt, count: snap && snap.count });
+          acDoSend(gen, sessionRoot, composer, attempt + 1, sendCtx);
+          return;
+        }
+        setTimeout(poll, 500);
+      })();
+    }
+
+    /** 该消息是否为「用户主动取消」：内容容器带 cb-user-cancelled-indicator → 不发送继续，仅记日志 */
+    function acUserCancelled(row) {
+      return !!row && !!row.querySelector('[class*="user-cancelled-indicator"],[class*="UserCancelled"]');
+    }
+
+    /** 从 React fiber 上找当前 ConversationController。只依赖稳定能力形状，不依赖类名/hash；
+     * WorkBuddy 与 WorkBuddy AI 若采用同一 controller 均走此路径。 */
+    function acFindConversationController() {
+      try {
+        var activeId = acActiveConversationId();
+        var roots = [
+          activeId ? document.querySelector('.cr-document[data-root-id="' + String(activeId).replace(/"/g, '\\"') + '"]') : null,
+          document.querySelector('.conversation-shell'),
+          document.querySelector('.chat-container'),
+          document.querySelector('#root > div'),
+        ].filter(Boolean);
+        var fallback = null;
+        for (var ri = 0; ri < roots.length; ri++) {
+          var stack = [roots[ri]], guard = 0;
+          while (stack.length && guard++ < 450) {
+            var el = stack.pop();
+            if (!el) continue;
+            for (var key in el) {
+              if (key.indexOf('__reactFiber$') !== 0 && key.indexOf('__reactInternalInstance') !== 0) continue;
+              var cur = el[key], seen = 0;
+              while (cur && seen++ < 650) {
+                var props = cur.memoizedProps;
+                var controller = props && props.value;
+                if (controller && controller.conversationId && controller.messageStore && controller.sessionStore &&
+                    typeof controller.getSessionViewState === 'function' && typeof controller.getMessagesViewState === 'function') {
+                  if (!fallback) fallback = controller;
+                  if (!activeId || String(controller.conversationId) === String(activeId)) return controller;
+                }
+                cur = cur.return;
+              }
+              break;
+            }
+            var children = el.children || [];
+            for (var ci = 0; ci < children.length; ci++) stack.push(children[ci]);
+          }
+        }
+        // 已知 activeId 时绝不返回其他会话的 fallback controller，避免切换会话后绑定/发送到旧会话。
+        return activeId ? null : fallback;
+      } catch (e) { return null; }
+    }
+
+    function acControllerSnapshot(controller) {
+      if (!controller) return null;
+      try {
+        var session = controller.getSessionViewState();
+        var messageState = controller.messageStore.getState();
+        var assistant = selectAutoContinueAssistant(messageState);
+        var errorView = typeof controller.getErrorViewState === 'function' ? controller.getErrorViewState() : {};
+        var sessionState = controller.sessionStore.getState();
+        var error = sessionState && sessionState.error;
+        var warning = sessionState && sessionState.warning;
+        var errText = [error && error.code, error && error.message, warning && warning.code, warning && warning.message].filter(Boolean).join(' ');
+        var text = autoContinueMessageText(assistant);
+        var extra = assistant && assistant.extra || {};
+        return {
+          conversationId: String(controller.conversationId || ''),
+          version: Number(messageState.version || 0),
+          assistant: assistant,
+          assistantId: assistant && String(assistant.id || assistant.requestId || ''),
+          text: text,
+          complete: !!(assistant && assistant.complete === true),
+          terminalKnown: Object.prototype.hasOwnProperty.call(extra, 'isRequestTerminal'),
+          terminal: !!(assistant && extra.isRequestTerminal === true),
+          manualStop: !!extra.isCancelled,
+          error: !!error || !!(errorView && (errorView.error || errorView.hasError)),
+          networkFailure: /network|offline|timeout|connection|网络|离线|超时|连接/i.test(errText),
+          blocked: !!(session && (session.isPending || session.state === 'pending')),
+          busy: !!(session && (session.isBusy || session.isRunActive || session.isTurnActive || session.isSending || session.isPending)) ||
+            !!messageState.streamingRequestId || !!messageState.streamingMessageId,
+          hydrating: !!(session && (session.isHydrating || (session.viewHistoryRestorePhase && session.viewHistoryRestorePhase !== 'idle'))),
+          state: session && session.state,
+          phase: session && session.agentPhase,
+        };
+      } catch (e) {
+        acLogR('controller-snapshot-error', 'controller-snapshot-error', { err: (e && e.message) || '?' }, 3000);
+        return null;
+      }
+    }
+
+    function acControllerCheck() {
+      var c = acCtx;
+      var gen = c.generation;
+      var snap = acControllerSnapshot(c.controller);
+      if (!snap || !snap.conversationId) return;
+      var sig = 'conversation:' + snap.conversationId;
+      var activeId = acActiveConversationId();
+      if (sig !== c.sessionSig || (activeId && String(activeId) !== String(snap.conversationId))) {
+        acStartMonitor();
+        return;
+      }
+      if (snap.hydrating) {
+        c.controllerLastVersion = snap.version;
+        c.baselineAssistantKey = snap.assistantId || '';
+        c.awaitingNewReply = true;
+        c.controllerIdleAt = 0;
+        acLogR('controller-hydrating', 'controller-hydrating', { id: snap.conversationId, assistantId: snap.assistantId }, 3000);
+        return;
+      }
+      if (snap.version !== c.controllerLastVersion) {
+        c.controllerLastVersion = snap.version;
+        c.lastMutationAt = Date.now();
+        if (!snap.busy) c.controllerIdleAt = Date.now();
+      }
+      if (snap.busy) {
+        if (!c.controllerLastBusy) acLog('controller-running', { id: snap.assistantId, state: snap.state, phase: snap.phase });
+        c.controllerLastBusy = true;
+        c.controllerIdleAt = 0;
+        return;
+      }
+      if (c.controllerLastBusy || !c.controllerIdleAt) c.controllerIdleAt = Date.now();
+      c.controllerLastBusy = false;
+      if (!snap.assistantId) return;
+      if (snap.blocked || findBlockingPrompt()) {
+        acLogR('controller-blocked', 'controller-blocked', { id: snap.assistantId, state: snap.state }, 3000);
+        return;
+      }
+      if (c.awaitingNewReply) {
+        if (!snap.assistantId || snap.assistantId === c.baselineAssistantKey) return;
+        c.awaitingNewReply = false;
+        c.baselineAssistantKey = snap.assistantId;
+        c.controllerIdleAt = Date.now();
+        acLog('controller-new-reply', { id: snap.assistantId, version: snap.version });
+      }
+      var signature = 'id:' + snap.assistantId;
+      if (c.judgedMessages.has(signature)) return;
+      var idleFor = Date.now() - c.controllerIdleAt;
+      var controllerCompleted = autoContinueControllerCompleted(snap);
+      // 明确 terminal（或旧版无 terminal 字段时的 complete）是可靠终局，可立即判定；错误也只需短缓冲；
+      // 其余 incomplete 空闲等待 8 秒，避免 state 与最后一个消息 chunk 存在极短时序差。
+      if (!controllerCompleted && !snap.error && idleFor < AC_CONTROLLER_SETTLE_MS) {
+        acScheduleSettle(Math.max(250, AC_CONTROLLER_SETTLE_MS - idleFor));
+        return;
+      }
+      var decision = classifyAutoContinueControllerSnapshot({
+        assistantId: snap.assistantId,
+        busy: snap.busy,
+        manualStop: snap.manualStop,
+        error: snap.error,
+        networkFailure: snap.networkFailure,
+        completionMarker: acHasMarker(snap.text),
+        // 新版明确暴露 isRequestTerminal 时只认该字段；旧版没有该字段才退回 complete。
+        complete: snap.terminalKnown ? false : snap.complete,
+        terminal: snap.terminal,
+      });
+      c.judgedMessages.add(signature);
+      if (!decision.trigger) {
+        acLog('controller-completed', { id: snap.assistantId, reason: decision.reason, complete: snap.complete, terminal: snap.terminal });
+        return;
+      }
+      if (snap.manualStop) { acLog('controller-user-cancelled-skip', { id: snap.assistantId }); return; }
+      acLog('controller-trigger', { id: snap.assistantId, reason: decision.reason, state: snap.state, idleForMs: idleFor });
+      acSendViaController(gen, c.controller, snap.assistantId);
+    }
+
+    function acBindController(controller, carry) {
+      var c = acCtx;
+      if (!controller) return false;
+      var snap = acControllerSnapshot(controller);
+      if (!snap || !snap.conversationId) return false;
+      var preserve = carry && String(carry.conversationId || '') === String(snap.conversationId);
+      c.controller = controller;
+      c.sessionSig = 'conversation:' + snap.conversationId;
+      c.controllerLastVersion = snap.version;
+      c.controllerLastBusy = snap.busy;
+      c.controllerIdleAt = snap.busy ? 0 : Date.now();
+      c.baselineAssistantKey = preserve ? String(carry.baselineAssistantKey || '') : (snap.assistantId || '');
+      c.awaitingNewReply = preserve ? !!carry.awaitingNewReply : true;
+      c.judgedMessages = new Set(preserve && Array.isArray(carry.judgedMessages) ? carry.judgedMessages : []);
+      c.controllerUnsubs = [];
+      var notify = function () {
+        if (!acRunning || controller !== acCtx.controller) return;
+        try { acControllerCheck(); } catch (e) {}
+      };
+      try { c.controllerUnsubs.push(controller.sessionStore.subscribe(notify)); } catch (e) {}
+      try { c.controllerUnsubs.push(controller.messageStore.subscribe(notify)); } catch (e) {}
+      acLog('controller-monitor-start', { id: snap.conversationId, assistantId: snap.assistantId, busy: snap.busy, version: snap.version });
+      acLog('baseline-established', { via: 'controller', awaitingNewReply: true });
+      acStartStatusAnim();
+      return true;
+    }
+
+    /** 判定：feedback 终局信号出现（经稳定缓冲）后检查正文末尾完成标记；无标记且非用户取消 = 异常 → 触发。
+     *  兜底：feedback 一直未出现（选择器失效）时，消息静默超 AC_IDLE_FALLBACK_MS 也判定一次 */
+    function acSettleCheck() {
+      if (acCtx.controller) { acControllerCheck(); return; }
+      var c = acCtx;
+      var gen = c.generation;
+      if (!c.sessionRoot || !document.body.contains(c.sessionRoot)) { acLog('settle-root-gone'); return; }
+      // 静默期间会话切换 → 重校准基准，绝不触发旧会话的判定
+      var sigNow = acSessionSig(c.sessionRoot);
+      if (!sigNow) { acLog('settle-no-id-skip'); return; } // 官方会话 ID 取不到：保守不判定
+      if (sigNow !== c.sessionSig) {
+        // 与 acOnMutation 切换分支一致的「统一建立 baseline」：清 timer + 记会话 ID + 记最后 assistant ID + 等待新回复
+        if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
+        var st0 = acSnapshot(c.sessionRoot);
+        c.sessionSig = sigNow;
+        c.lastMsgCount = st0.count;
+        c.lastActiveTxt = st0.content ? (st0.content.textContent || '') : '';
+        c.activeMessage = st0.content || null;
+        c.judgedMessages = new Set();
+        c.feedbackSeen = false;
+        c.feedbackAt = 0;
+        c.lastMutationAt = Date.now();
+        c.baselineAssistantKey = acAssistantMsgId(st0.content) || '';
+        c.awaitingNewReply = true;
+        acLog('settle-session-switch', { count: st0.count });
+        acLog('baseline-established', { via: 'settle' });
+        return;
+      }
+      var stat = acSnapshot(c.sessionRoot);
+      if (!stat.content || !stat.row) { acLog('settle-no-content', { count: stat.count }); return; }
+      // baseline 等待期兜底：即使旧 timer 未取消成功，只要仍在等待新回复且当前仍是 baseline → 直接返回，绝不判定/发送
+      if (c.awaitingNewReply) {
+        var keyNow = acAssistantMsgId(stat.content);
+        if (!keyNow || keyNow === c.baselineAssistantKey) {
+          acLog('settle-baseline-wait', { count: stat.count });
+          return;
+        }
+        // key 变化 = 第一条新回复已出现 → 解除等待继续正常判定
+        c.awaitingNewReply = false;
+        c.baselineAssistantKey = keyNow;
+        c.lastMutationAt = Date.now();
+        c.feedbackSeen = false;
+        c.feedbackAt = 0;
+        acLog('settle-baseline-released', { count: stat.count });
+      }
+      if (stat.count > c.lastMsgCount) { // 判定期间出现新回复 → 回到新回复流程
+        c.lastMsgCount = stat.count;
+        c.lastMutationAt = Date.now();
+        c.activeMessage = stat.content;
+        c.feedbackSeen = false;
+        c.feedbackAt = 0;
+        acLog('settle-recount-new', { count: stat.count });
+        acScheduleSettle(0);
+        return;
+      }
+      if (c.judgedMessages.has(acMsgSignature(stat.content))) { acLog('settle-already-judged', { count: stat.count }); return; }
+      var fb = !!stat.row.querySelector('[class*="assistantFeedback"]');
+      if (fb && !c.feedbackSeen) { c.feedbackSeen = true; c.feedbackAt = Date.now(); acLog('feedback-seen-settle', { count: stat.count }); }
+      var mutAge = Date.now() - c.lastMutationAt;
+      if (fb) {
+        // feedback 已出现但还在稳定渲染 → 再等
+        if (Date.now() - c.feedbackAt < AC_FB_SETTLE_MS) { acScheduleSettle(AC_SETTLE_MS); return; }
+        c.judgedMessages.add(acMsgSignature(stat.content));
+        var body = acPickBodyBlock(stat.content);
+        var text = body ? (body.textContent || '') : '';
+        if (!text.trim()) { acLog('settle-empty-body', { count: stat.count }); return; }
+        var decision = acReplyDecision(stat.row, stat.content, text);
+        if (!decision.trigger) { acLog('settle-completed', { reason: decision.reason, tail: text.slice(-24) }); return; }
+        // 明确异常证据仍需排除用户手动取消（取消 = 有意终止，不自动继续，仅留痕）
+        if (acUserCancelled(stat.row)) { acLog('user-cancelled-skip', { via: 'feedback', count: stat.count }); return; }
+        acLog('trigger', { via: 'feedback', reason: decision.reason, count: stat.count, tail: text.slice(-40) });
+        acSendContinue(gen, c.sessionRoot, stat.content);
+        return;
+      }
+      // 无 feedback：静默超兜底时长才判定（避开多工具调用之间的停顿；正常结束都会渲染 feedback）
+      if (mutAge >= AC_IDLE_FALLBACK_MS) {
+        // AI 仍在工作中（工具执行/生成中，停止按钮在 DOM）→ 不是中断：重置静默计时继续等，绝不误触发
+        if (acIsBusy(c.sessionRoot)) {
+          c.lastMutationAt = Date.now();
+          acLog('busy-skip-at-fallback', { count: stat.count, mutAgeMs: mutAge });
+          acScheduleSettle(AC_IDLE_FALLBACK_MS);
+          return;
+        }
+        c.judgedMessages.add(acMsgSignature(stat.content));
+        var body2 = acPickBodyBlock(stat.content);
+        var text2 = body2 ? (body2.textContent || '') : '';
+        if (!text2.trim()) return;
+        var decision2 = acReplyDecision(stat.row, stat.content, text2);
+        if (!decision2.trigger) { acLog('settle-completed-fallback', { reason: decision2.reason }); return; }
+        if (acUserCancelled(stat.row)) { acLog('user-cancelled-skip', { via: 'idle-fallback', count: stat.count, mutAgeMs: mutAge }); return; }
+        acLog('trigger', { via: 'idle-fallback', reason: decision2.reason, count: stat.count, mutAgeMs: mutAge, tail: text2.slice(-40) });
+        acSendContinue(gen, c.sessionRoot, stat.content);
+        return;
+      }
+      acLogR('settle-waiting', 'settle-waiting', { count: stat.count, fb: fb, mutAgeMs: mutAge }, 3000);
+      acScheduleSettle(AC_SETTLE_MS);
+    }
+    function acScheduleSettle(delay) {
+      var c = acCtx;
+      if (c.settleTimer) clearTimeout(c.settleTimer);
+      var ms = (typeof delay === 'number' && delay >= 0) ? delay : AC_SETTLE_MS;
+      c.settleTimer = setTimeout(function () {
+        c.settleTimer = null;
+        try { acSettleCheck(); } catch (e) {}
+      }, ms);
+    }
+
+    /** Auto-Continue 专用的「当前激活会话 ID」：优先级 adapter.currentActiveSessionId（官方，最可靠）
+     *  → URL 参数 conversationId/conversation_id → active/aria-selected=true 的官方 data-conversation-id。
+     *  全部取不到返回 ''；绝不回退到任意会话、标题或文本（共享的 getConversationId 有任意会话兜底，本模块不用） */
+    function acActiveConversationId() {
+      try {
+        var a = window.__wbsAdapter;
+        if (a && a.currentActiveSessionId) return a.currentActiveSessionId;
+      } catch (e) {}
+      try {
+        var u = new URL(location.href);
+        var q = u.searchParams.get('conversationId') || u.searchParams.get('conversation_id');
+        if (q) return q;
+      } catch (e) {}
+      try {
+        var sel = document.querySelector(
+          '[data-conversation-id].active,[data-conversation-id][aria-selected="true"],' +
+          '[class*="conversation"][class*="active"],[data-conversation-id][class*="active"]'
+        );
+        var id = sel && (sel.getAttribute('data-conversation-id') || sel.getAttribute('data-id'));
+        if (id) return id;
+      } catch (e) {}
+      return '';
+    }
+
+    /** 会话身份签名：当前激活会话的官方 conversation ID（adapter 优先，其次 URL 参数 / active 的 data-conversation-id）。
+     *  取不到返回 '' → 调用方保守跳过判定（绝不回退任意会话/标题/文本） */
+    function acSessionSig(sessionRoot) {
+      try {
+        var id = acActiveConversationId();
+        return id ? 'conversation:' + id : '';
+      } catch (e) { return ''; }
+    }
+
+    /** 观察快照：最后一条助手消息「行」与内容容器 + 消息总数 */
+    function acSnapshot(sessionRoot) {
+      var msgs = sessionRoot.querySelectorAll('.cb-assistant-message');
+      var count = msgs ? msgs.length : 0;
+      var row = null, content = null;
+      if (count) {
+        row = msgs[count - 1];
+        content = row.querySelector('[class*="assistantMessageContent"]') || row;
+      }
+      return { row: row, content: content, count: count };
+    }
+
+    /** observer 回调：会话身份变化 → 建立新 baseline 并等待新回复（绝不判定历史消息）；
+     *  计数增加或消息 key 变化 → 解除等待进入新回复流；feedback/文本变化仅在非等待期判定 */
+    function acOnMutation() {
+      var c = acCtx;
+      if (!c.sessionRoot || !document.body.contains(c.sessionRoot)) return;
+      var stat = acSnapshot(c.sessionRoot);
+      var content = stat.content;
+      if (!content || !content.parentNode) return;
+      var txt = content.textContent || '';
+      var sig = acSessionSig(c.sessionRoot);
+      if (!sig) { acLog('session-id-idle-skip'); return; } // 官方会话 ID 取不到：保守，不做任何判定
+      // 会话切换（新会话/切回）：取消旧 timer，建立新 baseline，等待新回复
+      if (sig !== c.sessionSig) {
+        if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
+        c.sessionSig = sig;
+        c.lastMsgCount = stat.count;
+        c.lastActiveTxt = txt;
+        c.activeMessage = content;
+        c.judgedMessages = new Set();
+        c.feedbackSeen = false;
+        c.feedbackAt = 0;
+        c.lastMutationAt = Date.now();
+        // 切换后的最后一条已有消息 = 历史 baseline，绝不判定；只有新回复出现才解除
+        c.baselineAssistantKey = acAssistantMsgId(content) || '';
+        c.awaitingNewReply = true;
+        acLog('session-switch', { count: stat.count, txtLen: txt.length, sig: sig });
+        acLog('baseline-established', { awaitingNewReply: true });
+        return;
+      }
+      if (stat.count > c.lastMsgCount) {
+        if (c.awaitingNewReply) {
+          // awaiting 期间数量增加（虚拟列表重挂/历史回放/重排都可能造成）：只刷新基准计数作观察日志，
+          // 绝不单独解锁——继续落入下方官方 assistant ID 门控，由 ID 决定是否解除等待
+          c.lastMsgCount = stat.count;
+          c.lastActiveTxt = txt;
+          acLog('count-grow-awaiting', { count: stat.count });
+          // fall through → awaiting 门控
+        } else {
+          // 正常判定流中出现新回复（内容开始流式输出）
+          c.lastMsgCount = stat.count;
+          c.activeMessage = content;
+          c.lastActiveTxt = txt;
+          c.lastMutationAt = Date.now();
+          c.feedbackSeen = false;
+          c.feedbackAt = 0;
+          acLog('new-reply', { count: stat.count, txtLen: txt.length, tail: txt.slice(-24) });
+          acScheduleSettle();
+          return;
+        }
+      }
+      if (stat.count < c.lastMsgCount) { // 消息被删除/回滚 → 校准基准；保留 judgedMessages（7→6→7 时旧消息不重复判定），重置 feedback/计时
+        c.lastMsgCount = stat.count;
+        c.lastActiveTxt = txt;
+        c.activeMessage = content;
+        c.feedbackSeen = false;
+        c.feedbackAt = 0;
+        c.lastMutationAt = Date.now();
+        acLogR('count-shrink', 'count-shrink', { count: stat.count }, 2000);
+        return;
+      }
+      // 等待新回复门控：等待期唯一解锁依据 = 官方 assistant ID 变化（数量增加只刷新基准观察日志，不单独解锁）；
+      // 历史消息出现 feedback/文本变化/重排 一律不解除、不安排判定
+      if (c.awaitingNewReply) {
+        // 解锁只认官方 assistant ID（data-message-request-id）；无官方 ID（null）或 ID 仍等于 baseline → 保守继续等待
+        var keyNow = acAssistantMsgId(content);
+        if (keyNow && keyNow !== c.baselineAssistantKey) {
+          c.baselineAssistantKey = keyNow;
+          c.awaitingNewReply = false;
+          c.activeMessage = content;
+          c.lastActiveTxt = txt;
+          c.lastMutationAt = Date.now();
+          c.feedbackSeen = false;
+          c.feedbackAt = 0;
+          acLog('new-reply', { count: stat.count, via: 'key-change', txtLen: txt.length });
+          acScheduleSettle();
+          return;
+        }
+        c.lastActiveTxt = txt; // baseline：只更新追踪，不判定
+        return;
+      }
+      // 终局信号：消息行内出现 feedback 操作区（无论任务成败都会渲染）
+      if (stat.row && stat.row.querySelector('[class*="assistantFeedback"]')) {
+        if (!c.feedbackSeen) {
+          c.feedbackSeen = true;
+          c.feedbackAt = Date.now();
+          c.lastMutationAt = c.feedbackAt;
+          acLog('feedback-seen', { count: stat.count });
+        }
+        acScheduleSettle();
+        return;
+      }
+      if (txt !== c.lastActiveTxt) { // 同一消息文本增长/变化 → 仅刷新计时
+        var grew = txt.length > c.lastActiveTxt.length;
+        c.lastActiveTxt = txt;
+        c.lastMutationAt = Date.now();
+        acLogR('mut:' + (grew ? 'grow' : 'change'), 'mut-' + (grew ? 'grow' : 'change'), { count: stat.count, txtLen: txt.length });
+        acScheduleSettle();
+      }
+    }
+
+    /** 启动监控：优先绑定 ConversationController stores；旧客户端找不到 controller 时才挂 DOM observer。 */
+    function acStartMonitor() {
+      var carry = acCtx.controller ? {
+        conversationId: acCtx.controller.conversationId,
+        baselineAssistantKey: acCtx.baselineAssistantKey,
+        awaitingNewReply: acCtx.awaitingNewReply,
+        judgedMessages: acCtx.judgedMessages ? Array.from(acCtx.judgedMessages) : [],
+      } : null;
+      acResetState(); // 使旧 generation 回调全部失效
+      var c = acCtx;
+      var gen = c.generation;
+      // 心跳先行：controller/页面重挂载或会话切换后都能自动重绑
+      if (c.heartbeat) clearInterval(c.heartbeat);
+      c.heartbeat = setInterval(function () {
+        if (!acRunning) return;
+        if (c.controller) {
+          var activeId = acActiveConversationId();
+          var currentController = acFindConversationController();
+          if ((activeId && String(activeId) !== String(c.controller.conversationId)) ||
+              (currentController && currentController !== c.controller) ||
+              !c.controller.sessionStore || !c.controller.messageStore) { acStartMonitor(); return; }
+          acControllerCheck();
+          return;
+        }
+        var root = c.sessionRoot;
+        if (!root || !document.body.contains(root)) { acStartMonitor(); return; }
+        if (acSessionSig(root) !== c.sessionSig) acOnMutation();
+      }, AC_HEARTBEAT_MS);
+      var controller = acFindConversationController();
+      if (controller) {
+        // 仅为 controller.sendPrompt 失败保留窄 DOM 发送兜底；监控与判定仍完全来自 stores。
+        c.sessionRoot = document.querySelector('.chat-container') || document.querySelector('.conversation-shell');
+        if (c.sessionRoot) {
+          var fallbackStat = acSnapshot(c.sessionRoot);
+          c.activeMessage = fallbackStat.content || null;
+        }
+      }
+      if (acBindController(controller, carry)) return;
+      var sessionRoot = document.querySelector('.chat-container') ||
+        document.querySelector('.main-content--chat') ||
+        document.querySelector('.main-content.main-content--chat') ||
+        document.querySelector('.conversation-shell');
+      if (!sessionRoot) { acWeak('会话控制器尚未就绪，稍后自动重试'); acLog('controller-retry-waiting'); return; }
+      c.sessionRoot = sessionRoot;
+      var stat = acSnapshot(sessionRoot);
+      c.lastMsgCount = stat.count; // 当前已有消息计入基准；之后数量增加才视为新回复
+      c.lastActiveTxt = stat.content ? (stat.content.textContent || '') : '';
+      // baseline：监控开启时的最后一条已有助手消息绝不判定（awaitingNewReply 门控，等新回复出现才解除）
+      c.baselineAssistantKey = acAssistantMsgId(stat.content) || '';
+      c.awaitingNewReply = true;
+      c.sessionSig = acSessionSig(sessionRoot);
+      c.observer = new MutationObserver(function () { try { acOnMutation(); } catch (e) {} });
+      c.observer.observe(sessionRoot, { childList: true, subtree: true, characterData: true });
+      acLog('monitor-start', { count: c.lastMsgCount, gen: gen, sig: c.sessionSig });
+      acLog('baseline-established', { awaitingNewReply: true });
+      acStartStatusAnim(); // 开关开启期间持续显示「监控激活会话中…」
+    }
+    function acStopMonitor() {
+      var c = acCtx;
+      if (c.settleTimer) { clearTimeout(c.settleTimer); c.settleTimer = null; }
+      if (c.observer) { try { c.observer.disconnect(); } catch (e) {} c.observer = null; }
+      if (Array.isArray(c.controllerUnsubs)) {
+        for (var ui = 0; ui < c.controllerUnsubs.length; ui++) {
+          try { c.controllerUnsubs[ui](); } catch (e) {}
+        }
+      }
+      c.controllerUnsubs = null;
+      c.controller = null;
+      if (c.heartbeat) { clearInterval(c.heartbeat); c.heartbeat = null; }
+      c.generation++;
+      acLog('monitor-stop', { gen: c.generation });
+      acStopStatusAnim();
+      c.sessionRoot = null;
+      c.activeMessage = null;
+      c.judgedMessages = null;
+      c.baselineMessages = null;
+    }
+
+    /** 把已累积日志渲染进开发者工具卡片（buildEnhancePane 重建后恢复显示） */
+    function acRenderLog() {
+      try {
+        var pre = enhancePane && enhancePane.querySelector('#wbs-ac-log');
+        if (pre) {
+          pre.textContent = acLogLines.length ? acLogLines.join('\n') : '（未开启「会话异常中断」监控时无日志）';
+          pre.scrollTop = pre.scrollHeight;
+        }
+      } catch (e) {}
+    }
+
+    function wireAutoContinuePane() {
+      acRenderLog();
+      var logClear = enhancePane && enhancePane.querySelector('#wbs-ac-log-clear');
+      if (logClear) {
+        logClear.addEventListener('click', function () {
+          acLogLines = [];
+          acRenderLog();
+          acLog('log-cleared');
+        });
+      }
+      var sw = enhancePane && enhancePane.querySelector('#wbs-ac-switch');
+      if (sw) {
+        sw.addEventListener('change', function () {
+          var enabled = this.checked;
+          api('/api/auto-continue-set', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ enabled: enabled }),
+          }).then(function (d) {
+            if (!d || !d.ok) throw new Error((d && d.error) || 'daemon 未确认');
+            applyAutoContinueState(d); // 开关切换成功：不弹 toast（状态由卡片标题右侧常驻动画体现）
+          }).catch(function (e) {
+            toast('设置失败: ' + (e.message || e), true, root);
+            syncAutoContinue();
+          });
+        });
+      }
+      syncAutoContinue();
+    }
+    /** 会话模块控件绑定：两个开关（暂存提示词/快捷短语）+ 快捷短语列表（批量/新增）。面板每次打开重建时重绑（元素全新无叠加） */
+    function wireSessionControls() {
+      var pane2 = enhancePane;
+      if (!pane2) { syncSessionModule(); return; }
+      var swS = pane2.querySelector('#wbs-sess-stash');
+      if (swS) swS.addEventListener('change', function () { setSessionSwitchWire('stashEnabled', this); });
+      var swP = pane2.querySelector('#wbs-sess-phrase');
+      if (swP) swP.addEventListener('change', function () { setSessionSwitchWire('phraseEnabled', this); });
+      var batchBtn = pane2.querySelector('#wbs-qp-batch');
+      if (batchBtn) batchBtn.addEventListener('click', function () { sessState.qpBatch = true; sessState.qpSel = {}; renderQpList(); });
+      var doneBtn = pane2.querySelector('#wbs-qp-done');
+      if (doneBtn) doneBtn.addEventListener('click', function () { sessState.qpBatch = false; sessState.qpSel = {}; renderQpList(); });
+      var allBtn = pane2.querySelector('#wbs-qp-checkall');
+      if (allBtn) allBtn.addEventListener('click', function () {
+        var allSelected = sessState.phrases.length && Object.keys(sessState.qpSel).length === sessState.phrases.length;
+        sessState.qpSel = {};
+        if (!allSelected) {
+          for (var i = 0; i < sessState.phrases.length; i++) sessState.qpSel[sessState.phrases[i].id] = 1;
+        }
+        renderQpList();
+      });
+      var batchDel = pane2.querySelector('#wbs-qp-batch-del');
+      if (batchDel) batchDel.addEventListener('click', function () {
+        var ids = Object.keys(sessState.qpSel);
+        if (!ids.length) { acWeak('请先勾选要删除的短语'); return; }
+        confirmQpDelete(ids);
+      });
+      var addBtn = pane2.querySelector('#wbs-qp-add');
+      if (addBtn) addBtn.addEventListener('click', function () { openQpEdit(null); });
+      syncSessionModule(); // 每次面板打开拉取最新开关与短语（含外部修改）
+    }
+    function syncAutoContinue() {
+      api('/api/auto-continue').then(function (d) {
+        if (d && d.ok) applyAutoContinueState(d);
+      }).catch(function () {});
+    }
+    function applyAutoContinueState(d) {
+      // UI 同步（增强页可能未构建，不影响监控运行）
+      var card = enhancePane && enhancePane.querySelector('#wbs-ac-card');
+      var acRow = enhancePane && enhancePane.querySelector('#wbs-ac-row');
+      var sw = enhancePane && enhancePane.querySelector('#wbs-ac-switch');
+      if (card && acRow && sw) {
+        if (!d.platformSupported || !AC_SUPPORTED) { acRow.style.display = 'none'; }
+        else { acRow.style.display = ''; sw.checked = !!d.enabled; }
+      }
+      // 监控启停（与 UI 解耦：开关开着，监控就必须在跑，无论面板是否打开）
+      syncAutoContinueMonitor(d);
+    }
+    /** 按 daemon 状态启动/停止监控（注入后、增强页构建时、开关切换时都会调用） */
+    function syncAutoContinueMonitor(d) {
+      if (!d) return;
+      if (!d.platformSupported || !AC_SUPPORTED) {
+        if (acRunning) { acRunning = false; acLog('monitor-stop-by-state', { reason: 'unsupported' }); acStopMonitor(); }
+        return;
+      }
+      if (d.enabled && !acRunning) { acRunning = true; acLog('monitor-start-by-state'); acStartMonitor(); }
+      else if (!d.enabled && acRunning) { acRunning = false; acLog('monitor-stop-by-state'); acStopMonitor(); }
+    }
+    /** 注入后无条件检查一次开关状态（不依赖打开增强页），根除"开关开着但监控没跑" */
+    function ensureAutoContinueMonitor() {
+      api('/api/auto-continue').then(function (d) {
+        if (d && d.ok) syncAutoContinueMonitor(d);
+      }).catch(function () {});
+    }
+    /** 每次打开面板时校验：开关开着但本地自定义指令块已丢失（外部重写/误删）→ 请求 daemon 补写（不弹 toast） */
+    function acCheckPromptOnOpen() {
+      api('/api/auto-continue').then(function (d) {
+        if (!d || !d.ok) return;
+        if (d.enabled && !d.promptBlockPresent) {
+          acLog('prompt-block-lost-restore');
+          api('/api/auto-continue-set', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ enabled: true }),
+          }).then(function (r) {
+            if (r && r.ok) applyAutoContinueState(r); // 补写指令块并保持监控开启（无 toast）
+          }).catch(function () {});
+        }
+      }).catch(function () {});
+    }
+
+    // reinject/刷新时销毁监控，避免叠加 observer/timer
+    registerDisposer(function () {
+      acRunning = false;
+      if (acThemeObserver) { try { acThemeObserver.disconnect(); } catch (e) {} acThemeObserver = null; }
+      acStopMonitor();
+      if (acStatusTimer) { clearTimeout(acStatusTimer); acStatusTimer = null; }
+    });
+
     /* —— 弹窗自动点允许（兜底，默认关）—— */
     function startNoDisturbAutoApprove() {
       if (ndAutoObserver) return;
@@ -4736,6 +7180,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function creditBlockHtml(credits, segments, account) {
       if (isIdentityExpired(account)) return '';
       var checkin = checkinHtml(account);
+      // 企业账号不限量（官方 getEnterpriseUsage 返回 limitNum === -1）
+      if (account && account.creditUnlimited) {
+        return '<div class="wbs-credit-block">' +
+          '<div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-total">' + CREDIT_ICON + '<b>不限量</b></span></div>' +
+          '<div class="wbs-credit-hint">企业配额</div>' +
+          '</div>';
+      }
       if (credits === undefined) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-loading">读取中…</span></div></div>';
       if (credits === null) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-na">-</span></div></div>';
       return '<div class="wbs-credit-block">' +
@@ -4834,14 +7285,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var credits = a.credits;
         var card = el('div', 'wbs-card' + (isCur ? ' cur' : ''));
         card.setAttribute('data-uid', a.uid);
-        var badge = isCur ? '<span class="wbs-badge">当前</span>' : '';
+        // 版本标签：个人账号显示「个人版」；企业账号显示企业名称（enterpriseName），缺省回退「企业」。
+        var editionBadge = a.type === 'personal' ? '个人版' : (a.enterpriseName ? a.enterpriseName : (a.type ? '企业' : ''));
+        var badge = editionBadge ? '<span class="wbs-badge">' + esc(editionBadge) + '</span>' : '';
+        // 当前登录账号：卡片右上角对勾角标（替代原「当前」文字标签）
+        var curMark = isCur ? '<span class="wbs-cur-marker" title="当前使用中">' + CUR_MARK_SVG + '</span>' : '';
         // 当前登录账号隐藏操作；认证已过期的账号保留删除，但隐藏切换，避免进入登录页。
         var expired = isIdentityExpired(a);
         var ops = isCur
           ? ''
           : '<div class="wbs-ops">' +
-            (expired ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
-            '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + a.uid + '" data-name="' + (a.nickname || '未命名') + '">' + TRASH_SVG + '</button>' +
+            (expired ? '' : '<button class="wbs-icon-btn wbs-acc-switch" type="button" title="切换" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + SWITCH_SVG + '</button>') +
+            '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + TRASH_SVG + '</button>' +
             '</div>';
         // 国际版没有手机号：用 UIN（账号唯一数字标识）替代展示；国内版仍显示手机。
         // wbs-uin-cell 用于 UIN 模式下补齐标签与取值之间的间距（wbs-phone-cell 默认 gap:0 过于紧凑）。
@@ -4849,11 +7304,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var idLbl = a.phone ? '手机' : (a.uin ? 'UIN' : '账号');
         var idVal = a.phone ? esc(a.phone) : (a.uin ? esc(a.uin) : '-');
         card.innerHTML =
+          curMark +
           '<div class="wbs-info">' +
-          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + (a.nickname || '(未命名)') + '</span>' + badge + '</div>' + ops + '</div>' +
+          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + esc(a.nickname || '(未命名)') + '</span>' + badge + '</div>' + ops + '</div>' +
           '<div class="wbs-meta wbs-secondary-row">' +
           '<div class="wbs-mi wbs-phone-cell' + (isUinMode ? ' wbs-uin-cell' : '') + '"><span class="wbs-lbl">' + idLbl + '</span><span class="wbs-val">' + idVal + '</span></div>' +
-          '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + ts.label + '</span></div>' +
+          '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + esc(ts.label) + '</span></div>' +
           '</div>' +
           '<div class="wbs-credit-cell' + (isIdentityExpired(a) ? ' wbs-credit-hidden' : '') + '">' + creditBlockHtml(credits, a.creditSegments, a) + '</div>' +
           '</div>';
@@ -4957,7 +7413,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           fetchCreditsForAccounts();
         })
         .catch(function (e) {
-          var msg = '<div class="wbs-empty">无法连接本地服务: ' + e.message + '<br>请确认守护进程已运行</div>';
+          var msg = '<div class="wbs-empty">无法连接本地服务: ' + esc(e.message || e) + '<br>请确认守护进程已运行</div>';
           accountsPane.innerHTML = msg;
         });
     }
@@ -5094,15 +7550,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             if (runId !== state.creditRunId) return;
             var credits = r && typeof r.credits === 'number' && isFinite(r.credits) ? r.credits : null;
             var segments = r && Array.isArray(r.segments) ? r.segments : [];
+            var unlimited = !!(r && r.unlimited);
             for (var i = 0; i < state.accounts.length; i++) {
-              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = credits; state.accounts[i].creditSegments = segments; break; }
+              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = credits; state.accounts[i].creditSegments = segments; state.accounts[i].creditUnlimited = unlimited; break; }
             }
             updateCreditCell(a.uid, credits, segments);
           })
           .catch(function () {
             if (runId !== state.creditRunId) return;
             for (var i = 0; i < state.accounts.length; i++) {
-              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = null; state.accounts[i].creditSegments = []; break; }
+              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = null; state.accounts[i].creditSegments = []; state.accounts[i].creditUnlimited = false; break; }
             }
             updateCreditCell(a.uid, null);
             // 静默失败，不弹 toast；避免面板抖动
@@ -5262,6 +7719,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       if (blurStyleEl) { blurStyleEl.remove(); blurStyleEl = null; }
       root.remove();
       stashBtn.remove();
+      exploreBtn.remove();
       debugPanel.remove();
       var tags = document.querySelectorAll('.wbs-queue-tag');
       Array.prototype.forEach.call(tags, function (tag) { tag.remove(); });
@@ -5270,6 +7728,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         try { delete window.__wbsDiag; } catch (e) { window.__wbsDiag = null; }
       }
     });
+
+    // 注入完成即按开关状态启动/停止监控（不依赖打开增强面板）
+    try { ensureAutoContinueMonitor(); } catch (e) {}
+    // 注入完成即同步会话模块状态（暂存/快捷短语开关 + 短语列表）并应用到输入框按钮显隐
+    try { syncSessionModule(); } catch (e) {}
+    // 打开面板时校验指令块是否丢失，丢失则自动关闭开关（不弹 toast）
+    try { acCheckPromptOnOpen(); } catch (e) {}
+    // 按钮主题色（浅色黑底白图 / 深色白底黑图）+ 监听主题切换
+    try { applyThemeButtonColors(); watchThemeForButtons(); } catch (e) {}
 
     return { destroy: lifecycle.destroy, alive: lifecycle.alive };
   }
@@ -5376,7 +7843,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-btn-close:hover{color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-body{overflow-y:auto;padding:10px 10px 6px;flex:1;min-height:0;height:calc(650px - 170px);max-height:none}',
     /* 账号卡片：头像 + 信息 + 右侧操作 */
-    '.wbs-card{display:block;padding:10px 12px;border-radius:12px;margin-bottom:4px;transition:background .12s}',
+    '.wbs-card{display:block;position:relative;padding:10px 12px;border-radius:12px;margin-bottom:4px;transition:background .12s}',
     '.wbs-card:hover{background:var(--wb-bg-hover,#f7f8fa)}',
     '.wbs-card.cur{background:var(--wb-bg-hover,#f5f5f5)}',
     '.wbs-ava{width:34px;height:34px;border-radius:50%;background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-secondary,#555);display:flex;align-items:center;justify-content:center;font-weight:600;flex-shrink:0;font-size:14px}',
@@ -5427,6 +7894,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     'html.cb-dark .wbs-credit-segment.within1{background:rgba(126,134,255,.12);border-color:rgba(126,134,255,.12)}',
     '.wbs-credit-tooltip{display:none;position:fixed;z-index:2147483647;min-width:170px;max-width:260px;padding:8px 10px;border-radius:7px;background:#151518;color:#fff;font-size:11px;font-weight:500;line-height:1.55;white-space:pre-line;box-shadow:0 8px 22px rgba(0,0,0,.28);pointer-events:none}',
     '.wbs-credit-empty{height:5px;border-radius:0;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent);color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:5px;text-align:center}',
+    '.wbs-credit-hint{color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:1.4;margin-top:2px}',
     '.wbs-credit-icon{width:14px;height:14px;vertical-align:middle;flex-shrink:0}',
     '.wbs-credit-loading{color:var(--wb-icon-tertiary,#999);font-size:12px}',
     '.wbs-credit-na{color:var(--wb-icon-tertiary,#999);font-size:12px}',
@@ -5451,8 +7919,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-del:hover{background:#ffecec;color:#f53f3f;border-color:transparent}',
     '.wbs-del.armed{background:#f53f3f;color:#fff;border-color:#f53f3f}',
     '.wbs-icon-btn:disabled{opacity:.5;cursor:not-allowed}',
-    /* 「当前」标签 */
-    '.wbs-badge{display:inline-flex;align-items:center;font-size:10px;line-height:1;padding:2px 7px;border-radius:999px;background:#1f1f1f;color:#fff;flex-shrink:0;font-weight:600}',
+    /* 版本标签（昵称旁：个人版 / 企业名称）：低饱和浅灰，信息次要不抢眼；深色主题单独适配 */
+    '.wbs-badge{display:inline-flex;align-items:center;font-size:10px;line-height:1;padding:2px 7px;border-radius:999px;flex-shrink:1;min-width:0;max-width:112px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;background:var(--wb-bg-tertiary,#eef0f3);color:var(--wb-color-text-secondary,#5f6368);border:1px solid transparent}',
+    'html.cb-dark .wbs-badge,html[data-theme="dark"] .wbs-badge{background:rgba(255,255,255,.07);color:rgba(235,236,240,.68);border-color:rgba(255,255,255,.08)}',
+    /* 当前使用中角标：无底图形，颜色跟随昵称（text-primary），深色随变量自动适配 */
+    '.wbs-cur-marker{position:absolute;top:9px;right:12px;display:inline-flex;color:var(--wb-icon-secondary,#555);opacity:.9}',
+    '.wbs-cur-marker svg{display:block}',
     '.wbs-empty{text-align:center;color:var(--wb-icon-tertiary,#999);padding:28px 12px;font-size:13px;line-height:1.8}',
     /* 底部 */
     '.wbs-foot{padding:12px 14px;border-top:1px solid var(--wb-border-subtle,#f0f0f0);display:flex;flex-direction:column;gap:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 30%,transparent)}',
@@ -5472,6 +7944,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-theme-inspect.active{background:#22d3ee;color:#04222b;border-color:#22d3ee}',
     '.wbs-theme-devtools{flex-shrink:0;padding:7px 10px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:11px;cursor:pointer;line-height:1;transition:all .15s}',
     '.wbs-theme-devtools:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);border-color:var(--wb-border-strong,#bbb)}',
+    '.wbs-ac-log-wrap{margin-top:8px;border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 55%,transparent);overflow:hidden}',
+    '.wbs-ac-log-head{display:flex;align-items:center;justify-content:space-between;padding:5px 8px;font-size:11px;color:var(--wb-icon-secondary,#555);border-bottom:1px solid var(--wb-border-subtle,#f0f0f0)}',
+    '.wbs-ac-log-clear{cursor:pointer;color:var(--wb-icon-tertiary,#999);user-select:none}',
+    '.wbs-ac-log-clear:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-ac-log{margin:0;padding:6px 8px;max-height:180px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.55;color:var(--wb-icon-secondary,#555);white-space:pre-wrap;word-break:break-all}',
     /* 元素检查器浮层 */
     '.wbs-inspector{position:fixed;right:16px;top:16px;width:360px;max-height:calc(100vh - 40px);overflow:auto;background:var(--wb-bg-popover,#fff);border:1px solid var(--wb-border-default,#e5e5e5);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.18);z-index:2147483647;font-size:12px;color:var(--wb-color-text-primary,#1f1f1f);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}',
     '.wbs-ins-head{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid #eee;font-weight:600;position:sticky;top:0;background:var(--wb-bg-popover,#fff);z-index:1;word-break:break-all}',
@@ -5519,13 +7996,69 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-stash-inline .wbs-stash-txt{opacity:0;max-width:0;overflow:hidden;white-space:nowrap;font-size:13px;font-weight:500;margin-left:0;transition:opacity .2s,max-width .25s,margin-left .25s}',
     '.wbs-stash-inline:hover{width:113px;border-radius:40px;padding-right:5px}',
     '.wbs-stash-inline:hover .wbs-stash-txt{opacity:1;max-width:76px;margin-left:7px}',
+    '.wbs-explore-inline{position:fixed;left:auto;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;z-index:auto;top:0;right:0;overflow:visible;padding:0 8px}',
+    /* 复用暂存按钮视觉（wbs-stash-inline 提供 32px 圆形/背景/阴影），但 hover 不变宽 */
+    '.wbs-stash-inline.wbs-explore-inline:hover{width:32px;height:32px;border-radius:50%;padding:0 8px}',
+    /* 图标常显；hover 无任何自身动画 */
+    '.wbs-explore-ico{display:flex;align-items:center;justify-content:center}',
+    /* AI 端内联模式：弹层(absolute)必须以按钮自身为定位上下文——static 会让 .wbs-explore-pop 的 bottom:100% 上溯到最近的 positioned 祖先（操作栏外壳），导致弹层大幅偏离按钮；z-index 抬升让按钮成为独立层叠上下文，弹层在其内不受操作栏兄弟元素压制 */
+    '.wbs-explore-inline.wbs-stash-inline-inline{position:relative;z-index:99999}',
+    /* 按钮不可点击缩放（点击不改变按钮自身与面板大小），菜单全由 hover 展示 */
+    '.wbs-explore-inline:active{transform:none}',
+    '.wbs-explore-pop{position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%) translateY(6px);width:280px;max-width:84vw;opacity:0;visibility:hidden;transition:opacity .18s ease,transform .18s ease,visibility 0s linear .18s;z-index:2147483647;pointer-events:none}',
+    /* hover 桥接：向下覆盖按钮与弹窗之间的 10px 间隙，按钮→弹窗移动不丢失悬停（菜单雏形） */
+    '.wbs-explore-pop::before{content:"";position:absolute;left:-12px;right:-12px;bottom:-14px;height:14px}',
+    '.wbs-explore-inline:hover .wbs-explore-pop,.wbs-explore-pop:hover{opacity:1;visibility:visible;transform:translateX(-50%) translateY(0);pointer-events:auto}',
+    /* 点击选项后关闭面板（wbs-menu-closed 期间强制隐藏，重新进入按钮区后恢复可展示） */
+    '.wbs-explore-inline.wbs-menu-closed .wbs-explore-pop{opacity:0;visibility:hidden;pointer-events:none;transform:translateX(-50%) translateY(6px)}',
+    /* 弹窗卡片：适配插件主题的毛玻璃；面板整体为默认箭头，仅选项 hover 变点击手型 */
+    '.wbs-explore-card{position:relative;padding:8px;border-radius:12px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 62%,transparent);backdrop-filter:blur(18px) saturate(1.3);-webkit-backdrop-filter:blur(18px) saturate(1.3);border:1px solid var(--wb-border-subtle,#ececec);box-shadow:0 12px 32px rgba(0,0,0,.18);color:var(--wb-color-text-primary,#1f1f1f);cursor:default}',
+    '.wbs-explore-item{position:relative;display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:8px;font-size:12px;color:var(--wb-color-text-primary,#1f1f1f);line-height:1.4;cursor:pointer}',
+    '.wbs-explore-it{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.wbs-explore-item:hover{background:color-mix(in srgb,var(--wb-bg-hover,#f3f3f3) 76%,transparent)}',
+    /* 选项 hover：antd 风格 tooltip（半透明毛玻璃小气泡，出现在选项左侧，完全展示文字） */
+    '.wbs-explore-tip{position:absolute;right:calc(100% + 10px);top:50%;transform:translateY(-50%);display:block;width:max-content;padding:5px 11px;border-radius:8px;font-size:11px;line-height:1.35;white-space:normal;word-break:break-word;max-width:240px;color:var(--wb-color-text-primary,#1f1f1f);background:var(--wb-bg-popover,#fff);border:1px solid color-mix(in srgb,var(--wb-border-subtle,#ececec) 65%,transparent);box-shadow:0 6px 20px rgba(0,0,0,.16);opacity:0;visibility:hidden;transition:opacity .15s ease;pointer-events:none;z-index:2}',
+    /* 滚动条默认透明，滚动/悬停时才出现（内容多时可上下滚动，内容少完全展示无滚动条） */
+    '.wbs-explore-tip-body{display:block;max-height:240px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:transparent transparent;white-space:normal;word-break:break-word}',
+    '.wbs-explore-tip-body::-webkit-scrollbar{width:6px}',
+    '.wbs-explore-tip-body::-webkit-scrollbar-thumb{background:transparent;border-radius:3px}',
+    '.wbs-explore-tip-body:hover::-webkit-scrollbar-thumb,.wbs-explore-tip-body::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--wb-icon-secondary,#666) 45%,transparent)}',
+    '.wbs-explore-tip::before{content:"";position:absolute;left:100%;top:50%;transform:translateY(-50%);border:5px solid transparent;border-left-color:var(--wb-border-subtle,#ececec)}',
+    /* tooltip 显隐由 JS（mouseenter/mouseleave + 延迟）控制，CSS 不参与（避免合成器 hover 判定差异导致闪烁） */
+    '.wbs-explore-foot{display:flex;align-items:center;justify-content:space-between;padding:10px 6px 4px;margin-top:2px;border-top:1px solid var(--wb-border-subtle,#ececec)}',
+    '.wbs-explore-send-txt{font-size:12px;color:color-mix(in srgb,var(--wb-color-text-primary) 40%,transparent)}',
+    '.wbs-explore-edit{font-size:12px;font-weight:500;color:var(--wb-icon-secondary,#666);text-decoration:none;cursor:pointer}',
+    '.wbs-explore-edit:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-stash-inline:active{background:var(--wb-button-primary-bg)}',
     /* 队列消息「暂存提示词」标签：入队的暂存消息在操作按钮最左侧 */
-    '.wbs-queue-tag{display:inline-flex;align-items:center;gap:3px;background:color-mix(in srgb,var(--wb-bg-primary) 72%,transparent);color:var(--wb-color-text-primary);border-radius:999px;font-size:11px;line-height:1;padding:3px 8px 3px 6px;margin-right:6px;font-weight:600;user-select:none;vertical-align:middle;white-space:nowrap;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--wb-border-subtle) 60%,transparent)}',
+    '.wbs-queue-tag{display:inline-flex;align-items:center;gap:4px;background:color-mix(in srgb,var(--wb-color-text-primary) 8%,transparent);color:var(--wb-color-text-secondary);border-radius:999px;font-size:11px;line-height:1;padding:5px 10px 5px 8px;margin-right:6px;font-weight:600;user-select:none;vertical-align:middle;white-space:nowrap}',
     '.wbs-queue-tag svg{flex-shrink:0}',
+    /* 会话模块 · 快捷短语列表区（增强页） */
+    '.wbs-qp-area{margin-top:10px;border-top:1px solid var(--wb-border-subtle,#eee);padding-top:10px}',
+    '.wbs-qp-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:8px}',
+    '.wbs-qp-toolbar-spacer{flex:1}',
+    '.wbs-qp-batchbar{display:inline-flex;align-items:center;gap:6px;margin-right:8px}',
+    '.wbs-qp-batch-count{font-size:11px;color:var(--wb-color-text-secondary,#666)}',
+    '.wbs-qp-batch-action{color:#d64545}',
+    '.wbs-qp-list{display:flex;flex-direction:column;max-height:220px;overflow-y:auto}',
+    '.wbs-qp-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid var(--wb-border-subtle,#eee)}',
+    '.wbs-qp-row:hover{background:color-mix(in srgb,var(--wb-bg-hover,#f3f3f3) 45%,transparent)}',
+    '.wbs-qp-check{margin:0;width:14px;height:14px;flex:0 0 auto;accent-color:var(--wb-button-primary-bg,#1f1f1f)}',
+    '.wbs-qp-text{flex:1;font-size:12px;line-height:1.5;color:var(--wb-color-text-primary,#1f1f1f);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;white-space:nowrap;word-break:break-all}',
+    '.wbs-qp-actions{display:flex;gap:2px;flex-shrink:0;opacity:0;transition:opacity .12s}',
+    '.wbs-qp-row:hover .wbs-qp-actions,.wbs-qp-row:focus-within .wbs-qp-actions{opacity:1}',
+    '.wbs-qp-icon-btn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border:none;border-radius:6px;background:transparent;color:var(--wb-icon-secondary,#666);cursor:pointer;flex-shrink:0}',
+    '.wbs-qp-icon-btn:hover{background:color-mix(in srgb,var(--wb-bg-hover,#f3f3f3) 80%,transparent);color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-qp-icon-btn.wbs-qp-del:hover{color:#d64545}',
+    '.wbs-qp-empty{font-size:12px;color:var(--wb-color-text-secondary,#666);text-align:center;padding:14px 0}',
+    '.wbs-qp-empty-menu{padding:10px 0 4px}',
+    '.wbs-qp-textarea{width:100%;min-height:96px;max-height:150px;resize:vertical;padding:8px 10px;border-radius:8px;border:1px solid var(--wb-border-default,#e5e5e5);background:var(--wb-bg-input,var(--wb-bg-primary,#fff));color:var(--wb-color-text-primary,#1f1f1f);font-size:13px;line-height:1.6;outline:none;box-sizing:border-box}',
+    '.wbs-qp-textarea:focus{border-color:var(--wb-accent,#185fa5)}',
+    '.wbs-password-field textarea.wbs-qp-textarea{margin-top:6px}',
     /* 暂存项禁拖 + 隐藏拖拽图标：data-wbs-stash 由 syncQueueTags 幂等标记，普通项不受影响 */
     '.cb-message-queue-item[data-wbs-stash="1"]{cursor:default}',
     '.cb-message-queue-item[data-wbs-stash="1"] .cb-message-queue-item-left .prompt-icon{visibility:hidden}',
+    '.cb-message-queue-item[data-wbs-stash="1"] .cb-message-queue-item-left .prompt-ico,.cb-message-queue-item[data-wbs-stash="1"] .cb-message-queue-item-left .prompt-icon{display:none !important;width:0 !important;margin:0 !important}',
     /* 暂存消息：拖拽把手置灰 + 不可拖拽 */
     '.wbs-stash-item{cursor:default}',
     '.wbs-stash-item .cb-message-queue-item-left .prompt-icon{opacity:.28;cursor:default;filter:grayscale(1)}',
@@ -5545,7 +8078,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-pane.active{display:flex;flex-direction:column;height:100%;min-height:0}',
     /* 分组卡片（主题/增强 tab） */
     '.wbs-pcard{background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 18%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:14px;padding:10px 12px;margin-bottom:8px;backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2)}',
-    '.wbs-pcard-title{display:flex;align-items:baseline;gap:8px;font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:8px}',
+    '.wbs-pcard-title{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--wb-color-text-primary,#1f1f1f);margin-bottom:8px}',
     '.wbs-pcard-sub{font-size:11px;color:var(--wb-icon-tertiary,#999);font-weight:400}',
     /* 免打扰：标题行右置批量开关 + 三列 grid 对齐（标题/小标题/开关，所有小标题左对齐） */
     '.wbs-nd-head{display:flex;align-items:center;gap:6px}',
@@ -5557,7 +8090,21 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-nd-title{font-size:12px;font-weight:600;color:var(--wb-color-text-primary,#1f1f1f);white-space:nowrap}',
     '.wbs-nd-hint{font-size:11px;color:var(--wb-icon-tertiary,#999);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     /* 会话页：筛选 + 批量 + 列表 + 迁移/删除弹窗 */
-    '.wbs-sess-filters{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}',
+    '.wbs-sess-filters{display:flex;flex-direction:row;align-items:center;gap:8px;margin-bottom:10px}',
+    // 账号 + 时间筛选同一行：账号下拉缩窄，时间分段占用剩余宽度
+    '.wbs-sess-filter-row{display:flex;align-items:center;gap:8px;flex:0 0 auto}',
+    '.wbs-sess-filter-row:last-child{flex:1 1 auto;min-width:0}',
+    '#wbs-sess-account-select{max-width:112px}',
+    /* 会话页/模型页：卡片与列表贴底，减少底部留白 */
+    '.wbs-pane[data-pane="sessions"]{padding-bottom:1px}',
+    '.wbs-pane[data-pane="sessions"] > .wbs-pcard{margin-bottom:0;padding-bottom:4px}',
+    '.wbs-pane[data-pane="sessions"] .wbs-sess-list{margin-bottom:0}',
+    '.wbs-pane[data-pane="models"]{padding-bottom:1px}',
+    '.wbs-pane[data-pane="models"] > .wbs-pcard{margin-bottom:0;padding-bottom:4px}',
+    /* 批量操作行按钮与「批量操作」按钮同高 */
+    '.wbs-sess-toolbar .wbs-sess-bbtn,#wbs-sess-batchbar .wbs-sess-bbtn{height:30px;padding:0 12px}',
+    /* 会话页卡片纵向撑满面板剩余高度，列表 flex 吸收多余空间 */
+    '.wbs-pane[data-pane="sessions"] > .wbs-pcard{display:flex;flex-direction:column;flex:1 1 auto;min-height:0}',
     '.wbs-sess-filter-row{display:flex;align-items:center;gap:8px}',
     '.wbs-sess-flabel{font-size:12px;color:var(--wb-icon-tertiary,#999);flex-shrink:0;width:28px}',
     /* 账号筛选：Select 下拉（尺寸参考主题页「更换头像」按钮） */
@@ -5575,7 +8122,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-bbtn{display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:7px 12px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:var(--wb-bg-popover,#fff);color:var(--wb-icon-secondary,#555);font-size:12px;cursor:pointer;line-height:1;transition:all .15s}',
     '.wbs-sess-bbtn:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-sess-bbtn.active{background:#fff;color:#1f1f1f;border-color:#fff}',
-    '.wbs-sess-batchbar{display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap;padding:7px 8px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:10px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 15%,transparent)}',
+    '.wbs-sess-batchbar{display:flex;align-items:center;gap:5px;flex-wrap:nowrap;margin:0;padding:0;border:none;background:transparent}',
     '.wbs-sess-done{margin-left:auto;color:#fff;background:#141416;border-color:#141416}',
     '.wbs-sess-done:hover{background:#2a2a2e;color:#fff}',
     /* 删除按钮：图标按钮，尺寸与兄弟一致；点击后变警告色（armed） */
@@ -5597,11 +8144,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-model-imports{display:flex;align-items:center;gap:5px;flex-wrap:wrap}',
     '.wbs-model-import:disabled{opacity:.5;cursor:not-allowed}',
     '.wbs-model-count{font-size:13px;color:var(--wb-icon-tertiary,#888)}',
-    '.wbs-model-batchbar{display:flex;align-items:center;gap:6px;margin-bottom:7px;padding:6px 8px;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:9px;background:color-mix(in srgb,var(--wb-bg-secondary,#fff) 18%,transparent)}',
-    '.wbs-model-batch-count{font-size:11px;color:var(--wb-icon-tertiary,#999)}',
-    '.wbs-model-batch-action{margin-left:auto}',
-    '.wbs-model-batchbar .wbs-sess-done{margin-left:0}',
+    '.wbs-model-batchbar{display:flex;align-items:center;gap:5px;flex-wrap:nowrap;margin:0;padding:0;border:none;background:transparent}',
+    '.wbs-model-batch-count{font-size:11px;color:var(--wb-icon-tertiary,#999);white-space:nowrap}',
     '.wbs-model-batch-action:disabled{opacity:.45;cursor:not-allowed}',
+    '.wbs-model-toolbar .wbs-sess-bbtn,#wbs-model-batchbar .wbs-sess-bbtn{height:30px;padding:0 12px}',
+    '.wbs-sess-batch-count{font-size:11px;color:var(--wb-icon-tertiary,#999);white-space:nowrap}',
     '.wbs-model-list{display:flex;flex:1;min-height:0;flex-direction:column;gap:6px;max-height:none;overflow-y:auto;scrollbar-width:thin;scrollbar-color:transparent transparent}',
     '.wbs-model-list:hover{scrollbar-color:rgba(128,128,128,.45) transparent}',
     '.wbs-model-list::-webkit-scrollbar{width:6px}',
@@ -5659,7 +8206,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-model-eye{position:absolute;right:4px;top:3px;width:27px;height:27px;display:flex;align-items:center;justify-content:center;border:0;border-radius:6px;background:transparent;color:var(--wb-icon-tertiary,#888);cursor:pointer}',
     '.wbs-model-eye:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-model-edit-field small{font-size:10px;color:var(--wb-icon-tertiary,#999)}',
-    '.wbs-sess-list{max-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-bottom:8px;scrollbar-width:thin;scrollbar-color:transparent transparent}',
+    '.wbs-sess-list{flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-bottom:8px;scrollbar-width:thin;scrollbar-color:transparent transparent}',
     '.wbs-sess-list:hover{scrollbar-color:rgba(128,128,128,.45) transparent}',
     '.wbs-sess-list::-webkit-scrollbar{width:6px}',
     '.wbs-sess-list::-webkit-scrollbar-thumb{background:transparent;border-radius:3px}',
@@ -5743,11 +8290,28 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-about-badge{font-size:11px;font-weight:600;color:var(--wb-button-primary-bg,#1f1f1f);background:rgba(0,0,0,.05);border:1px solid rgba(0,0,0,.08);padding:3px 10px;border-radius:999px;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}',
     '.wbs-about-desc{font-size:11.5px;line-height:1.6;color:var(--wb-icon-tertiary,#777);text-align:center;padding:2px 6px 0}',
     '.wbs-about-desc b{color:var(--wb-color-text-primary,#1f1f1f);font-weight:600}',
-    '.wbs-about-support{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;max-width:360px;box-sizing:border-box;margin-top:3px;padding:9px 10px;border-top:1px solid var(--wb-border-default,rgba(0,0,0,.08));border-bottom:1px solid var(--wb-border-default,rgba(0,0,0,.08))}',
-    '.wbs-about-support-text{min-width:0;flex:1 1 auto;font-size:11.5px;line-height:1.55;color:var(--wb-icon-tertiary,#777);text-align:left}',
+    '.wbs-about-support{display:flex;align-items:center;justify-content:flex-start;gap:10px;width:100%;box-sizing:border-box;margin-top:3px;padding:9px 0;border-top:1px solid var(--wb-border-default,rgba(0,0,0,.08));border-bottom:1px solid var(--wb-border-default,rgba(0,0,0,.08));flex-wrap:nowrap}',
+    '.wbs-about-name-row{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}',
+    '.wbs-about-name-row .wbs-about-ver{font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:11px;font-weight:500;color:var(--wb-icon-tertiary,#999);letter-spacing:.3px;margin-top:3px}',
+    '.wbs-about-support-text{min-width:0;flex:1 1 auto;font-size:11.5px;line-height:1.55;color:var(--wb-icon-tertiary,#777);text-align:left;white-space:normal;overflow-wrap:break-word}',
+    '.wbs-telemetry-card{padding:6px 14px 8px;margin:2px 0 4px;background:transparent;border:none;opacity:.75}',
+    '.wbs-telemetry-card .wbs-pcard-title{font-size:11px;color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-telemetry-card .wbs-telemetry-status{font-size:10.5px;color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-telemetry-ctrl{display:flex;align-items:center;gap:8px;flex-shrink:0}',
+    '.wbs-telemetry-reco{font-size:10.5px;color:var(--wb-icon-tertiary,#999);white-space:nowrap}',
+    '.wbs-telemetry-head{display:flex;align-items:center;justify-content:space-between;gap:12px}',
+    '.wbs-telemetry-label{display:flex;align-items:center;gap:5px;min-width:0}',
+    '.wbs-telemetry-label .wbs-pcard-title{margin-bottom:0}',
+    '.wbs-telemetry-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;color:var(--wb-icon-tertiary,#888);cursor:help;outline:none}',
+    '.wbs-telemetry-help:hover,.wbs-telemetry-help:focus{color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-telemetry-tooltip{position:absolute;z-index:20;left:0;top:calc(100% + 7px);width:245px;padding:7px 9px;border:1px solid var(--wb-border-default,rgba(0,0,0,.14));border-radius:7px;background:var(--wb-bg-primary,#fff);box-shadow:0 6px 18px rgba(0,0,0,.14);color:var(--wb-color-text-primary,#1f1f1f);font-size:11px;font-weight:400;line-height:1.5;white-space:normal;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(-2px);transition:opacity .12s,transform .12s,visibility .12s}',
+    '.wbs-telemetry-help:hover .wbs-telemetry-tooltip,.wbs-telemetry-help:focus .wbs-telemetry-tooltip{opacity:1;visibility:visible;transform:translateY(0)}',
+    '.wbs-telemetry-switch{flex:0 0 36px}',
+    '.wbs-telemetry-status{margin-top:5px;font-size:10.5px;color:var(--wb-button-primary-bg,#1f1f1f);font-weight:600}',
+    '.wbs-telemetry-status.is-off{color:var(--wb-icon-tertiary,#999);font-weight:500}',
     '.wbs-about-foot{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:10px}',
     '.wbs-about-ver{font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:11px;font-weight:500;color:var(--wb-icon-tertiary,#999);letter-spacing:.3px}',
-    '.wbs-about-feedback{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;color:var(--wb-button-primary-bg,#1f1f1f);background:rgba(0,0,0,.05);padding:5px 12px;border-radius:999px;text-decoration:none;transition:background .15s}',
+    '.wbs-about-feedback{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;color:var(--wb-button-primary-bg,#1f1f1f);background:rgba(0,0,0,.05);padding:5px 12px;border-radius:999px;text-decoration:none;transition:background .15s;flex-shrink:0;white-space:nowrap}',
     '.wbs-about-feedback:hover{background:rgba(0,0,0,.1)}',
     '.wbs-about-ghbtn{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.06);color:var(--wb-color-text-primary,#1f1f1f);text-decoration:none;transition:background .15s,transform .15s;flex:0 0 32px}',
     '.wbs-about-ghbtn:hover{background:rgba(0,0,0,.1);transform:translateY(-1px)}',

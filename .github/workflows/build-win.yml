@@ -20,8 +20,8 @@ permissions:
 
 jobs:
   build-and-verify:
-    name: Build zip + Setup.exe + verify
-    runs-on: windows-latest   # IExpress 是真 GUI，必须在 Windows runner 上打包
+    name: Build Setup.exe + verify
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,32 +59,57 @@ jobs:
             echo "警告: 未找到 builtin，面板将无官方壁纸（不影响安装功能）"
           fi
 
-      - name: 生成 Windows zip
+      - name: 生成 Windows 安装暂存包（仅供 Inno Setup 使用）
         shell: bash
+        env:
+          WORKDADDY_BUILD_VERSION: ${{ steps.ver.outputs.version }}
         run: bash scripts/build-win-zip.sh
 
-      - name: 生成 Setup.exe（IExpress 自解压安装包）
-        shell: cmd
+      - name: 安装 Inno Setup
+        shell: pwsh
         run: |
-          call scripts\make-setup.cmd
+          choco upgrade innosetup --version=6.7.1 --allow-downgrade --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed with exit code $LASTEXITCODE" }
+
+      - name: 生成 Setup.exe（用户态 Inno Setup 安装包）
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path scripts\daemon.js -Pattern "const DAEMON_VERSION = '([^']+)'" ).Matches[0].Groups[1].Value
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned `
+            -File .\scripts\build-win-installer.ps1 -IsccPath $iscc -Profile workbuddy-cn -Version ${{ steps.ver.outputs.version }}
+          if ($LASTEXITCODE -ne 0) { throw "WorkDaddy Setup build failed with exit code $LASTEXITCODE" }
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned `
+            -File .\scripts\build-win-installer.ps1 -IsccPath $iscc -Profile workbuddy-ai -Version ${{ steps.ver.outputs.version }}
+          if ($LASTEXITCODE -ne 0) { throw "WorkDaddy AI Setup build failed with exit code $LASTEXITCODE" }
+
+      - name: 确认仅保留 Setup.exe 发行产物
+        shell: pwsh
+        run: |
+          $legacyZip = Get-ChildItem -LiteralPath release\windows -Filter '*-win64.zip' -File -ErrorAction SilentlyContinue
+          if ($legacyZip) {
+            $legacyZip | Remove-Item -Force
+          }
+          if (Get-ChildItem -LiteralPath release\windows -Filter '*-win64.zip' -File -ErrorAction SilentlyContinue) {
+            throw 'Windows 发布目录仍包含旧 ZIP 产物。'
+          }
 
       - name: 列出产物
         shell: bash
-        run: ls -lh release/
+        run: ls -lh release/windows/
 
       - name: 产物完整性自检（verify-win.cmd，纯只读）
         shell: cmd
         run: |
           call scripts\verify-win.cmd
 
-      - name: 上传产物（zip + Setup.exe）
+      - name: 上传产物（仅 Setup.exe）
         uses: actions/upload-artifact@v4
         with:
           name: workdaddy-win64
           path: |
-            release/WorkDaddy-*-win64.zip
-            release/WorkDaddy-Setup.exe
-            release/WorkDaddy-Setup-*.exe
+            release/windows/WorkDaddy-Setup-*.exe
+            release/windows/WorkDaddy-AI-Setup-*.exe
 
       # ---- 只有打 tag 时才顺手挂到 GitHub Release ----
       - name: 发布到 GitHub Release
@@ -92,8 +117,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/WorkDaddy-*-win64.zip
-            release/WorkDaddy-Setup.exe
-            release/WorkDaddy-Setup-*.exe
+            release/windows/WorkDaddy-Setup-*.exe
+            release/windows/WorkDaddy-AI-Setup-*.exe
             release/*.dmg
           generate_release_notes: true

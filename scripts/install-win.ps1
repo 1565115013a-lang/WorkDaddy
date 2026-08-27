@@ -1,6 +1,6 @@
 ﻿# WorkDaddy Windows 安装脚本（install.sh 的 Windows 对应物）
 # 用法：双击 install-win.cmd，或 powershell -ExecutionPolicy Bypass -File install-win.ps1
-# 作用：复制到安装目录 → 初始化数据目录 → 清理旧登录自启 → 启动 launcher（自动拉起 daemon + 以 CDP 模式重启 WorkBuddy）
+# 作用：复制到安装目录 → 初始化数据目录 → 清理旧登录自启 → 启动 launcher（WorkBuddy 已运行时提示退出）
 # 全程用户态，无需管理员权限。
 param(
   [string]$SrcDir = $PSScriptRoot,
@@ -8,6 +8,24 @@ param(
   [string]$Profile = '__WBS_DEFAULT_PROFILE__'
 )
 
+try {
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+  $isElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if ($isElevated -ne $false) {
+    [Console]::Error.WriteLine('拒绝以管理员权限运行 WorkDaddy 安装脚本；请使用普通用户终端。')
+    exit 5
+  }
+} catch {
+  [Console]::Error.WriteLine('无法确认当前 PowerShell 为普通用户权限；安装已停止。')
+  exit 5
+}
+
+$ErrorActionPreference = 'Stop'
+try { . (Join-Path $PSScriptRoot 'windows-process-boundary.ps1') } catch {
+  [Console]::Error.WriteLine('无法加载 Windows 进程身份边界；安装已停止。')
+  exit 5
+}
 $ErrorActionPreference = 'Continue'
 if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq '__WBS_DEFAULT_PROFILE__') { $Profile = 'workbuddy-cn' }
 if ($Profile -ne 'workbuddy-ai') { $Profile = 'workbuddy-cn' }
@@ -15,6 +33,10 @@ $env:WBSWITCH_PROFILE = $Profile
 $productName = if ($Profile -eq 'workbuddy-ai') { 'WorkDaddy AI' } else { 'WorkDaddy' }
 if ([string]::IsNullOrWhiteSpace($AppDir)) { $AppDir = Join-Path $env:LOCALAPPDATA (Join-Path 'Programs' $productName) }
 $targetScripts = Join-Path $AppDir 'scripts'
+$dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
+$dataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
+$uiPort = if ($Profile -eq 'workbuddy-ai') { 47833 } else { 47832 }
+$env:WBSWITCH_PORT = [string]$uiPort
 $sentryReporter = Join-Path $SrcDir 'sentry-report.js'
 $nodeBin = $null
 
@@ -37,48 +59,38 @@ function Send-Sentry {
   } catch {}
 }
 
-function Test-ExclusiveFile {
-  param([string]$Path)
-  if (-not (Test-Path -LiteralPath $Path)) { return $true }
-  $stream = $null
-  try {
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
-    return $true
-  } catch {
-    return $false
-  } finally {
-    if ($stream) { $stream.Dispose() }
-  }
+# PowerShell 5.1 can throw a Win32 host exception when the host cmdlet emits CJK text
+# through a UTF-8 cmd console. Write directly to .NET's console stream instead.
+function Write-InstallLine {
+  param([object]$Message)
+  [Console]::WriteLine([string]$Message)
 }
 
-function Release-LockedLauncher {
-  param([string]$LauncherPath)
-  if (Test-ExclusiveFile $LauncherPath) { return $true }
-  $needle = ([IO.Path]::GetFullPath($LauncherPath)).Replace('/', '\').ToLowerInvariant()
-  try {
-    Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
-      $commandLine = ([string]$_.CommandLine).Replace('/', '\').ToLowerInvariant()
-      if ($commandLine.Contains($needle) -and $_.ProcessId -ne $PID) {
-        taskkill /F /T /PID $_.ProcessId 2>$null | Out-Null
-      }
-    }
-  } catch {}
-  for ($i = 0; $i -lt 10; $i++) {
-    if (Test-ExclusiveFile $LauncherPath) { return $true }
-    Start-Sleep -Milliseconds 300
-  }
-  return (Test-ExclusiveFile $LauncherPath)
-}
+Write-InstallLine '=============================================================='
+Write-InstallLine (" " + $productName + " Windows 安装")
+Write-InstallLine '=============================================================='
+Write-InstallLine ("  源目录   : " + $SrcDir)
+Write-InstallLine ("  安装目录 : " + $AppDir)
 
-Write-Host '=============================================================='
-Write-Host (" " + $productName + " Windows 安装")
-Write-Host '=============================================================='
-Write-Host ("  源目录   : " + $SrcDir)
-Write-Host ("  安装目录 : " + $AppDir)
+# Stop only the lifecycle whose exact scripts, PID file, owner, and process
+# identities match this profile. This also repairs older AI installs whose
+# daemon inherited the legacy 47832 default instead of binding to 47833.
+try {
+  Stop-VerifiedWorkDaddyLifecycle `
+    -DataDir $dataDir `
+    -Port $uiPort `
+    -ExpectedWatchdogScript (Join-Path $AppDir 'scripts\watchdog.js') `
+    -ExpectedDaemonScript (Join-Path $AppDir 'scripts\daemon.js')
+  Write-InstallLine '  已停止并清理当前 profile 的旧守护进程。'
+} catch {
+  Write-InstallLine ('错误：无法安全停止当前 profile 的旧守护进程: ' + $_.Exception.Message)
+  Send-Sentry 'windows-install-stop-lifecycle' $_.Exception.Message 2
+  exit 2
+}
 
 # 1) 复制（排除开发/临时文件；node_modules/ws 随包带入）
 if (-not (Test-Path (Join-Path $SrcDir 'daemon.js'))) {
-  Write-Host '错误：源目录中找不到 daemon.js，请从仓库 scripts/ 目录运行本脚本。'
+  Write-InstallLine '错误：源目录中找不到 daemon.js，请从仓库 scripts/ 目录运行本脚本。'
   Send-Sentry 'windows-install-missing-files' '安装源目录中找不到 daemon.js' 1
   exit 1
 }
@@ -88,33 +100,31 @@ $targetFull = [IO.Path]::GetFullPath($targetScripts).TrimEnd('\')
 if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
   # 从已安装目录重复运行安装脚本时，源和目标相同；robocopy 会尝试覆盖正在执行的脚本，
   # 在 Windows 上容易出现“文件正被另一个进程使用”。此时只需继续执行后续注册/快捷方式步骤。
-  Write-Host '  源目录与安装目录相同，跳过自拷贝。'
+  Write-InstallLine '  源目录与安装目录相同，跳过自拷贝。'
 } else {
   $launcherToReplace = Join-Path $targetScripts 'launcher.cmd'
-  if (-not (Release-LockedLauncher $launcherToReplace)) {
-    Write-Host "复制前无法释放 launcher.cmd 文件锁: $launcherToReplace"
+  if (-not (Release-VerifiedLauncherLock -LauncherPath $launcherToReplace)) {
+    Write-InstallLine "复制前无法释放 launcher.cmd 文件锁: $launcherToReplace"
     Send-Sentry 'windows-install-launcher-lock' "无法释放 launcher.cmd 文件锁: $launcherToReplace" 2
     exit 2
   }
   robocopy $SrcDir $targetScripts /E /XF *.log .DS_Store /XD win\probe /R:2 /W:1
   $rc = $LASTEXITCODE
   if ($rc -ge 8) {
-    Write-Host "复制失败（robocopy=$rc）"
+    Write-InstallLine "复制失败（robocopy=$rc）"
     Send-Sentry 'windows-install-copy' "robocopy 复制失败 (code=$rc)" $rc
     exit 2
   }
 }
 
 # 2) profile 数据目录（与 profiles.js / watchdog.js 一致）
-$dataRoot = Join-Path $env:APPDATA 'WorkDaddy'
-$dataDir = if ($Profile -eq 'workbuddy-ai') { Join-Path $dataRoot 'profiles\workbuddy-ai' } else { $dataRoot }
 New-Item -ItemType Directory -Force -Path (Join-Path $dataDir 'accounts') | Out-Null
 
 # 2.5) Logo 图标：随安装复制到安装目录根（桌面快捷方式用），源在 scripts 同级的 WorkDaddy.ico
 $logoIcoSrc = Join-Path $SrcDir 'WorkDaddy.ico'
 $logoIco = Join-Path $AppDir 'WorkDaddy.ico'
 if (Test-Path $logoIcoSrc) {
-  try { Copy-Item $logoIcoSrc $logoIco -Force; Write-Host ('  图标复制 : ' + $logoIco) } catch {}
+  try { Copy-Item $logoIcoSrc $logoIco -Force; Write-InstallLine ('  图标复制 : ' + $logoIco) } catch {}
 }
 
 # 3) 禁用登录自启：WorkDaddy / WorkDaddy AI 共存时由用户手动启动对应端。
@@ -124,15 +134,15 @@ try {
   foreach ($runName in @('WorkDaddy', 'WorkDaddy AI')) {
     Remove-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue
   }
-  Write-Host '  自启：已禁用（已清理 WorkDaddy / WorkDaddy AI 登录启动项）'
+  Write-InstallLine '  自启：已禁用（已清理 WorkDaddy / WorkDaddy AI 登录启动项）'
 } catch {
-  Write-Host ('  自启清理失败（可忽略，之后手动双击 launcher.cmd 即可）: ' + $_.Exception.Message)
+  Write-InstallLine ('  自启清理失败（可忽略，之后手动双击 launcher.cmd 即可）: ' + $_.Exception.Message)
   Send-Sentry 'windows-install-autostart-cleanup' ('清理登录自启失败: ' + $_.Exception.Message) 0
 }
 
 # 4) 启动（daemon + 以 CDP 模式重启 WorkBuddy + 注入）
 $launcher = Join-Path $targetScripts 'launcher.cmd'
-Write-Host ("  正在启动 " + $productName + "（如果 WorkBuddy 正在运行，会重启它以开启调试模式）...")
+Write-InstallLine ("  正在启动 " + $productName + "（如果 WorkBuddy 正在运行，会提示先完全退出）...")
 $launcherVbs = Join-Path $targetScripts 'launcher-hidden.vbs'
 if (Test-Path $launcher) {
   if (Test-Path $launcherVbs) {
@@ -141,11 +151,11 @@ if (Test-Path $launcher) {
     Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
   }
 } else {
-  Write-Host '  警告：launcher.cmd 不存在，跳过自动启动（请到安装目录手动双击）'
+  Write-InstallLine '  警告：launcher.cmd 不存在，跳过自动启动（请到安装目录手动双击）'
 }
 
 # 5) 创建桌面快捷方式（名称跟随安装包 profile）
-#    优先使用 wscript.exe 隐藏入口，避免 Windows Terminal 为管理员 cmd 创建空白窗口；
+#    优先使用 wscript.exe 隐藏入口，避免启动时出现多余的终端窗口；
 #    缺少隐藏入口时回退到 cmd.exe，兼容旧包/手工安装目录。
 $desktopDir = [Environment]::GetFolderPath('Desktop')
 if (-not $desktopDir) { $desktopDir = Join-Path $env:USERPROFILE 'Desktop' }
@@ -163,21 +173,21 @@ try {
     $sc.Arguments        = '/d /c call "' + $launcher + '"'
   }
   $sc.WorkingDirectory = (Split-Path $launcher)
-  $sc.Description      = ($productName + ' – WorkBuddy 增强工具（请以管理员身份运行）')  # 描述跟随安装包 profile（WorkDaddy / WorkDaddy AI）
+  $sc.Description      = ($productName + ' – WorkBuddy 增强工具')  # 描述跟随安装包 profile（WorkDaddy / WorkDaddy AI）
   if (Test-Path $logoIco) { $sc.IconLocation = $logoIco + ',0' }   # 用官方 logo，而非 cmd 默认图标
   $sc.Save()
-  Write-Host ('  桌面快捷方式 : ' + $lnkPath)
-  if (Test-Path $logoIco) { Write-Host ('  图标         : ' + $logoIco) }
+  Write-InstallLine ('  桌面快捷方式 : ' + $lnkPath)
+  if (Test-Path $logoIco) { Write-InstallLine ('  图标         : ' + $logoIco) }
 } catch {
-  Write-Host ('  桌面快捷方式创建失败（可忽略，之后可手动创建）: ' + $_.Exception.Message)
+  Write-InstallLine ('  桌面快捷方式创建失败（可忽略，之后可手动创建）: ' + $_.Exception.Message)
   Send-Sentry 'windows-install-shortcut' ('创建桌面快捷方式失败: ' + $_.Exception.Message) 0
 }
 
-Write-Host '=============================================================='
-Write-Host ' 安装完成！'
-Write-Host ('  profile  : ' + $Profile)
-Write-Host ("  安装目录 : " + $AppDir)
-Write-Host ("  数据目录 : " + $dataDir)
-Write-Host ('  备份账号 : ' + (Join-Path $dataDir 'accounts'))
-Write-Host '  卸载     : 运行安装目录 scripts\uninstall-win.ps1'
-Write-Host '=============================================================='
+Write-InstallLine '=============================================================='
+Write-InstallLine ' 安装完成！'
+Write-InstallLine ('  profile  : ' + $Profile)
+Write-InstallLine ("  安装目录 : " + $AppDir)
+Write-InstallLine ("  数据目录 : " + $dataDir)
+Write-InstallLine ('  备份账号 : ' + (Join-Path $dataDir 'accounts'))
+Write-InstallLine '  卸载     : 运行安装目录 scripts\uninstall-win.ps1'
+Write-InstallLine '=============================================================='

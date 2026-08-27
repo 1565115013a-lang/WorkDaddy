@@ -2,10 +2,10 @@
 /**
  * WorkDaddy Windows 启动器（macOS launcher 的 Windows 对应物，node 实现）
  *
- * 幂等三步：
+ * 冷启动流程：
  *   1) 确保 daemon 运行 —— watchdog 常驻（崩溃自动拉起）；daemon 版本与内置不一致时强制重启
- *   2) WorkBuddy 已在 CDP 模式（优先 9222，端口被占用时自动发现）→ 直接注入组件即完成
- *   3) 否则退出 WorkBuddy 并以自动选择的 CDP 端口重启 → 等端口 → 注入
+ *   2) 若 WorkBuddy 已在运行，弹窗要求用户完全退出，本次入口安静结束
+ *   3) 否则以自动选择的 CDP 端口启动 → 等端口 → 注入
  *
  * 由 launcher.cmd 调用（cmd 负责兜底找 node），也可 node win-launcher.js 直接运行。
  * 所有操作用户态完成（HKCU / %LOCALAPPDATA% / %APPDATA%），无需管理员权限。
@@ -18,6 +18,29 @@ const os = require('os');
 const net = require('net');
 const http = require('http');
 const { spawn, spawnSync } = require('child_process');
+const {
+  assertDaemonServiceIdentity,
+  assertDaemonTerminationIdentity,
+  assertSameProcessIdentity,
+  assertStandardWindowsPrivilege,
+  assertVerifiedNodeProcess,
+  buildNativeProcessQuery,
+  filterVerifiedNodeProcesses,
+  filterVerifiedWindowsProcesses,
+  parseCimProcessResult,
+  resolveWindowsExecutable,
+  sameWindowsPath,
+  selectRunningProfileBinary,
+  selectUniqueDiscoveredBinary,
+} = require('./windows-process-boundary.js');
+if (process.platform === 'win32') {
+  try {
+    assertStandardWindowsPrivilege();
+  } catch (error) {
+    console.error(error.message);
+    process.exit(5);
+  }
+}
 const { captureMessage, captureException } = require('./sentry-report.js');
 const { getProfile, profileDataDir } = require('./profiles.js');
 const { isTargetForProfile } = require('./cdp-targets.js');
@@ -33,6 +56,9 @@ const DATA_DIR =
   profileDataDir(PROFILE);
 const DEFAULT_UI_PORT = { 'workbuddy-cn': 47832, 'workbuddy-ai': 47833, 'codebuddy-cn': 47834, 'codebuddy-intl': 47835 }[PROFILE.id] || 47832;
 const UI_PORT = parseInt(process.env.WBSWITCH_PORT || String(DEFAULT_UI_PORT), 10);
+// watchdog/daemon inherit process.env. Persist the resolved profile port so an
+// AI launcher cannot fall back to daemon.js's legacy 47832 default.
+process.env.WBSWITCH_PORT = String(UI_PORT);
 const PROFILE_CDP_PORTS = {
   'workbuddy-cn': [9222, 9226, 9227, 9228, 9229, 9230, 9231, 9232],
   'workbuddy-ai': [9223, 9233, 9234, 9235, 9236, 9237, 9238, 9239],
@@ -41,16 +67,25 @@ const PROFILE_CDP_PORTS = {
 };
 const DEFAULT_CDP_PORT = (PROFILE_CDP_PORTS[PROFILE.id] || [9222])[0];
 const cliCdpPort = process.argv.find((arg) => /^--cdp-port=\d+$/i.test(arg));
+const HAS_EXPLICIT_CDP_PORT = Boolean(process.env.WBSWITCH_CDP_PORT || cliCdpPort);
 let CDP_PORT = parseInt(process.env.WBSWITCH_CDP_PORT || (cliCdpPort ? cliCdpPort.split('=')[1] : '') || String(DEFAULT_CDP_PORT), 10);
+process.env.WBSWITCH_CDP_PORT = String(CDP_PORT);
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
-const ELEVATED_HELPER_MODE = process.argv.includes('--inject-helper');
 // 便携版/低速磁盘上的 WorkBuddy 首次启动可能超过 20 秒；超时只应在足够长的窗口后报告。
 const CDP_STARTUP_TIMEOUT_MS = 60000;
-// PR#8 实机确认 WorkBuddy 两个版本分别使用 WorkBuddy.exe / WorkBuddyAI.exe。
-// 两者都纳入探测和退出；路径过滤负责避免 CN launcher 误杀 AI 的同名族进程。
+// Electron/ShellExecute 冷启动可能超过 5 秒；过早换端口会让首个实例与重试实例发生单实例冲突。
+const CDP_PORT_RETRY_GRACE_MS = 15000;
+const INJECT_REQUEST_TIMEOUT_MS = 5000;
+const INJECT_MAX_ATTEMPTS = 6;
+const INJECT_RETRY_DELAY_MS = 1000;
+// 每个 profile 只查询自己的主程序镜像；其他 CodeBuddy/WorkBuddy profile 不参与退出判定。
 const PROFILE_PROCESS_NAMES = new Set(
-  PROFILE.kind === 'workbuddy' ? ['workbuddy.exe', 'workbuddyai.exe'] :
-    PROFILE.id === 'codebuddy-intl' ? ['codebuddy.exe'] : ['codebuddy.exe']
+  PROFILE.id === 'workbuddy-ai' ? ['workbuddyai.exe'] :
+    PROFILE.id === 'workbuddy-cn' ? ['workbuddy.exe'] : ['codebuddy.exe']
+);
+const PROFILE_BINARY_NAMES = new Set(
+  PROFILE.id === 'workbuddy-ai' ? ['workbuddyai.exe'] :
+    PROFILE.id === 'workbuddy-cn' ? ['workbuddy.exe'] : ['codebuddy.exe']
 );
 
 function log(...args) {
@@ -61,6 +96,44 @@ function log(...args) {
 
 // ---------- 小工具 ----------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function runHiddenPowerShell(script) {
+  if (process.platform !== 'win32') return;
+  try {
+    const encoded = Buffer.from(String(script), 'utf16le').toString('base64');
+    // Resolve the system PowerShell explicitly. The managed Node runtime may
+    // resolve a different shim when the shortcut is launched via wscript.
+    const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const result = spawnSync(powershell, [
+      '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+      '-EncodedCommand', encoded,
+    ], { stdio: 'ignore', windowsHide: true, timeout: 10000 });
+    if (result.error) log('Windows 本地提示调用失败: ' + result.error.message);
+    else if (result.status !== 0) log('Windows 本地提示退出码: ' + result.status);
+    else log('Windows 本地提示已完成');
+  } catch (error) {
+    log('Windows 本地提示调用失败: ' + error.message);
+  }
+}
+
+function showWindowsMessageBox(title, message) {
+  const ps = `$ErrorActionPreference='SilentlyContinue'; Add-Type -AssemblyName PresentationFramework; ` +
+    `[System.Windows.MessageBox]::Show(${powershellQuote(message)},${powershellQuote(title)},'OK','Warning') | Out-Null`;
+  runHiddenPowerShell(ps);
+}
+
+function showWindowsNotification(title, message) {
+  const ps = `$ErrorActionPreference='SilentlyContinue'; Add-Type -AssemblyName System.Windows.Forms; ` +
+    `Add-Type -AssemblyName System.Drawing; $n=New-Object System.Windows.Forms.NotifyIcon; ` +
+    `$n.Icon=[System.Drawing.SystemIcons]::Information; $n.Visible=$true; ` +
+    `$n.BalloonTipTitle=${powershellQuote(title)}; $n.BalloonTipText=${powershellQuote(message)}; ` +
+    `$n.ShowBalloonTip(5000); Start-Sleep -Milliseconds 5500; $n.Dispose()`;
+  runHiddenPowerShell(ps);
+}
+
+function powershellQuote(value) {
+  return "'" + String(value).replace(/'/g, "''") + "'";
+}
 
 async function reportAndExit(code, message, stage = 'windows-launcher') {
   try { await captureMessage(message, { stage, extra: { exitCode: code } }); } catch (_) {}
@@ -89,56 +162,13 @@ function writeCdpPortFile(port) {
 
 function cdpPortCandidates() {
   const result = [];
+  const profilePorts = PROFILE_CDP_PORTS[PROFILE.id] || [DEFAULT_CDP_PORT];
   const add = (port) => { if (validCdpPort(port) && !result.includes(port)) result.push(port); };
-  add(CDP_PORT);
-  add(readCdpPortFile());
-  // 与 daemon.js 的候选顺序保持一致：首选/持久化端口之后，扫描完整的本机回环端口池。
-  for (let port = 9222; port <= 9232; port++) add(port);
-  add(9333);
+  if (HAS_EXPLICIT_CDP_PORT || profilePorts.includes(CDP_PORT)) add(CDP_PORT);
+  const savedPort = readCdpPortFile();
+  if (profilePorts.includes(savedPort)) add(savedPort);
+  for (const port of profilePorts) add(port);
   return result;
-}
-
-// 当前进程是否为管理员（Windows）
-function isElevated() {
-  try {
-    const r = spawnSync(
-      'net', ['session'], { stdio: 'ignore', windowsHide: true, timeout: 8000 }
-    );
-    return r.status === 0;
-  } catch (_) { return false; }
-}
-
-// 以管理员身份运行"重启注入助手"（child 脚本），launcher 本体保持普通权限。
-// 返回是否已成功派发（派发后 launcher 立即退出，由助手完成真正的重启+注入）。
-function spawnElevatedHelper() {
-  const nodeBin = process.execPath;                 // 当前 node
-  const childJs = path.join(SCRIPTS_DIR, 'win-inject-helper.js');
-  if (!fs.existsSync(childJs)) return false;
-  // 用 UTF-16LE 编码 PowerShell 命令，避免安装目录含中文时经过当前代码页导致路径乱码；
-  // Node 参数顺序必须是「脚本路径 → 脚本参数」，否则 --inject-helper 会被 Node 当成自身选项。
-  const childArg = '"' + childJs + '"';
-  const command = [
-    "$ErrorActionPreference = 'Stop'",
-    'Start-Process -FilePath ' + psQuote(nodeBin) + ' ' +
-      '-ArgumentList @(' + [psQuote(childArg), psQuote('--inject-helper'), psQuote(String(CDP_PORT))].join(', ') + ') ' +
-      '-Verb RunAs -WindowStyle Hidden',
-  ].join('; ');
-  const encodedCommand = Buffer.from(command, 'utf16le').toString('base64');
-  const ps = [
-    '-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-EncodedCommand', encodedCommand,
-  ];
-  try {
-    const r = spawnSync('powershell', ps, { stdio: 'ignore', windowsHide: true, timeout: 15000 });
-    if (r.error || r.status !== 0) {
-      log('提权助手派发失败: ' + (r.error ? r.error.message : 'powershell exit ' + r.status));
-      return false;
-    }
-    return true;
-  } catch (e) {
-    log('提权助手派发异常: ' + e.message);
-    return false;
-  }
 }
 
 function portOpen(port) {
@@ -181,9 +211,9 @@ function httpGet(port, p) {
   });
 }
 
-function httpPost(port, p) {
+function httpPost(port, p, timeoutMs = INJECT_REQUEST_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const req = http.request({ host: HOST, port, path: p, method: 'POST', timeout: 1500 }, (res) => {
+    const req = http.request({ host: HOST, port, path: p, method: 'POST', timeout: timeoutMs }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; if (body.length > 20000) body = body.slice(0, 20000); });
@@ -205,19 +235,24 @@ async function isWorkBuddyCdpAt(port, binary = null) {
     httpGet(port, '/json/list'),
   ]);
   if (!version || version.status !== 200 || !targets || targets.status !== 200) return false;
+  let list;
   try {
-    const info = JSON.parse(version.body || '{}');
-    const list = JSON.parse(targets.body || '[]');
-    if (Array.isArray(list) && list.some((target) => isTargetForProfile(target, PROFILE))) return true;
-    // 某些版本隐藏页面强信号；只有同安装目录进程的精确参数带着该端口时才允许兜底。
-    return Boolean(binary && workBuddyProcesses(binary).some((p) => processCdpPort(p) === Number(port)));
-  } catch (_) { return false; }
+    JSON.parse(version.body || '{}');
+    list = JSON.parse(targets.body || '[]');
+  } catch (_) {
+    return false;
+  }
+  if (Array.isArray(list) && list.some((target) => isTargetForProfile(target, PROFILE))) return true;
+  // 某些版本隐藏页面强信号；只有同安装目录进程的精确参数带着该端口时才允许兜底。
+  // CIM 查询错误由共享边界直接抛出，不能伪装成“没有目标进程”。
+  return Boolean(binary && workBuddyProcesses(binary).some((p) => processCdpPort(p) === Number(port)));
 }
 
 async function configureCdpPort() {
   for (const port of cdpPortCandidates()) {
     if (await isWorkBuddyCdpAt(port)) {
       CDP_PORT = port;
+      process.env.WBSWITCH_CDP_PORT = String(port);
       writeCdpPortFile(port);
       log('发现 WorkBuddy CDP 端口: ' + port);
       return port;
@@ -227,124 +262,81 @@ async function configureCdpPort() {
     // TCP connect 对无响应的残留 socket 可能返回超时并误报空闲；bind 才能确认新进程能否监听。
     if (await isLocalPortAvailable(port)) {
       CDP_PORT = port;
+      process.env.WBSWITCH_CDP_PORT = String(port);
       writeCdpPortFile(port);
       log('选择可绑定 CDP 端口: ' + port);
       return port;
     }
   }
-  throw new Error('9222-9232、9333 均被占用，无法启动 WorkBuddy CDP');
+  throw new Error('当前 profile 的 CDP 端口均被占用，无法启动 WorkBuddy');
 }
 
-function psOut(cmd) {
-  try {
-    return spawnSync('powershell', ['-NoProfile', '-Command', cmd], {
-      encoding: 'utf8', timeout: 10000, windowsHide: true,
-    }).stdout || '';
-  } catch (_) { return ''; }
+function strictPowerShellLines(cmd) {
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd], {
+    encoding: 'utf8', timeout: 10000, windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`PowerShell 路径发现失败: ${String(result.stderr || '').trim()}`);
+  return String(result.stdout || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
-// 进程名并不总是可靠：Electron 的单实例宿主可能以 CodeBuddy.exe 或辅助进程名存在。
-// 通过 CIM 同时拿到路径、父 PID 和命令行，只在本地诊断使用；命令行正文绝不写入日志/Sentry。
-function getWorkBuddyProcessesViaCim() {
-  const command = [
-    '$names=@("WorkBuddy.exe","CodeBuddy.exe","WorkBuddyAI.exe")',
-    'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue',
-    '| Where-Object { $names -contains $_.Name }',
-    '| Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine',
-    '| ConvertTo-Json -Compress',
-  ].join(' ');
-  const raw = psOut(command).trim();
-  if (!raw) return [];
+function bestEffortPowerShellLines(cmd, label) {
   try {
-    const parsed = JSON.parse(raw);
-    return (Array.isArray(parsed) ? parsed : [parsed]).filter((p) => p && Number(p.ProcessId) > 0);
-  } catch (_) {
+    return strictPowerShellLines(cmd);
+  } catch (error) {
+    log(`跳过 ${label} PowerShell 路径发现: ${error.message}`);
     return [];
   }
 }
 
-function parseTasklistOutput(raw) {
-  const processes = [];
-  for (const line of String(raw || '').split(/\r?\n/)) {
-    const match = line.match(/^"([^"]+)","(\d+)"/);
-    if (!match) continue;
-    processes.push({
-      ProcessId: Number(match[2]),
-      ParentProcessId: null,
-      Name: match[1],
-      ExecutablePath: null,
-      CommandLine: '',
-      processSource: 'tasklist',
-    });
-  }
-  return processes;
+function powershellLiteral(value) {
+  return "'" + String(value).replace(/'/g, "''") + "'";
 }
 
-function getWorkBuddyProcessesViaTasklist() {
-  const processes = [];
-  for (const name of PROFILE_PROCESS_NAMES) {
-    try {
-      const result = spawnSync('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], {
-        encoding: 'utf8', timeout: 5000, windowsHide: true,
-      });
-      processes.push(...parseTasklistOutput(result.stdout));
-    } catch (_) {}
-  }
-  return processes;
-}
-
+// 通过 CIM 查询当前 profile 主程序的路径、父 PID 和命令行；命令行正文绝不写入日志/Sentry。
 function getWorkBuddyProcesses() {
-  const cimProcesses = getWorkBuddyProcessesViaCim();
-  // CIM 偶发返回空或不可解析时，tasklist 仍能提供 PID，避免把运行中的客户端误判为不存在。
-  return cimProcesses.length ? cimProcesses : getWorkBuddyProcessesViaTasklist();
-}
-
-function sameWindowsPath(a, b) {
-  if (!a || !b) return false;
-  return String(a).replace(/[\\/]+$/, '').toLowerCase() === String(b).replace(/[\\/]+$/, '').toLowerCase();
-}
-
-function workBuddyProcesses(binary = null) {
-  return getWorkBuddyProcesses().filter((p) => {
-    if (!PROFILE_PROCESS_NAMES.has(String(p.Name || '').toLowerCase())) return false;
-    if (!binary) return true;
-    // tasklist 回退没有路径，只接受与目标二进制同名的主进程，避免跨客户端误杀。
-    if (!p.ExecutablePath) return String(p.Name || '').toLowerCase() === path.basename(binary).toLowerCase();
-    // WorkBuddy 可能把 Electron 主进程拆成同目录下的 CodeBuddy.exe/辅助宿主；按安装目录归组。
-    return sameWindowsPath(p.ExecutablePath, binary) ||
-      sameWindowsPath(path.dirname(p.ExecutablePath), path.dirname(binary));
+  if (process.platform !== 'win32') return [];
+  const names = [...PROFILE_PROCESS_NAMES].map((name) => `\"${name}\"`).join(',');
+  const command = buildNativeProcessQuery(
+    path.join(SCRIPTS_DIR, 'windows-process-boundary.ps1'),
+    `$names=@(${names}); Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $names -contains $_.Name }`
+  );
+  const result = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    encoding: 'utf8', timeout: 10000, windowsHide: true,
+  });
+  return parseCimProcessResult(result, {
+    requireCommandLine: true,
+    requireCurrentOwner: true,
+    requireNativeArguments: true,
   });
 }
 
-function targetProcessNames(binary = null) {
-  const names = new Set();
-  const normalized = String(binary || '').toLowerCase();
-  for (const p of getWorkBuddyProcesses()) {
-    if (!PROFILE_PROCESS_NAMES.has(String(p.Name || '').toLowerCase())) continue;
-    if (binary) {
-      if (!p.ExecutablePath && String(p.Name || '').toLowerCase() !== path.basename(binary).toLowerCase()) continue;
-      if (p.ExecutablePath && !(
-        sameWindowsPath(p.ExecutablePath, binary) ||
-        sameWindowsPath(path.dirname(p.ExecutablePath), path.dirname(binary))
-      )) continue;
-    }
-    names.add(String(p.Name).toLowerCase());
-  }
-  if (names.size) return names;
-  if (normalized.endsWith('workbuddyai.exe') || PROFILE.id === 'workbuddy-ai') return new Set(['workbuddyai.exe']);
-  return new Set(['workbuddy.exe']);
+// 仅保留为本地端口诊断；daemon 启动成功必须走 exactDaemonStatus 完整身份校验。
+function daemonRunning() {
+  return portOpen(UI_PORT);
 }
 
+function workBuddyProcesses(binary = null) {
+  const processes = getWorkBuddyProcesses();
+  if (!binary) return processes;
+  const verified = filterVerifiedWindowsProcesses(binary, processes);
+  if (processes.length !== verified.length) {
+    throw new Error('存在当前 profile 进程，但没有进程属于已验证安装目录，请先手动退出后重试');
+  }
+  return verified;
+}
+
+// 只读诊断：tasklist 结果仅写入失败快照，绝不进入任何 taskkill 参数或退出判定。
 function tasklistProcessIds(names = PROFILE_PROCESS_NAMES) {
   const ids = new Set();
   for (const name of names) {
     try {
-      const r = spawnSync('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], {
+      const result = spawnSync('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], {
         encoding: 'utf8', timeout: 5000, windowsHide: true,
       });
-      for (const line of String(r.stdout || '').split(/\r?\n/)) {
-        const m = line.match(/^"[^"]+","(\d+)"/);
-        if (m) ids.add(m[1]);
+      for (const line of String(result.stdout || '').split(/\r?\n/)) {
+        const match = line.match(/^"[^"]+","(\d+)"/);
+        if (match) ids.add(match[1]);
       }
     } catch (_) {}
   }
@@ -362,22 +354,48 @@ function processHasCdpArg(process, port = CDP_PORT) {
 }
 
 function processDiagnostics(binary = null) {
-  return workBuddyProcesses(binary).map((p) => ({
-    pid: Number(p.ProcessId),
-    parentPid: Number(p.ParentProcessId) || null,
-    name: String(p.Name || ''),
-    executable: path.basename(String(p.ExecutablePath || '')),
-    hasCommandLine: Boolean(String(p.CommandLine || '').trim()),
-    hasCdpArg: processCdpPort(p) > 0,
-    cdpPort: processCdpPort(p) || null,
-    hasExpectedCdpArg: processHasCdpArg(p),
-  }));
+  try {
+    return workBuddyProcesses(binary).map((p) => ({
+      pid: Number(p.ProcessId),
+      parentPid: Number(p.ParentProcessId) || null,
+      name: String(p.Name || ''),
+      executable: path.basename(String(p.ExecutablePath || '')),
+      hasCommandLine: Boolean(String(p.CommandLine || '').trim()),
+      hasCdpArg: processCdpPort(p) > 0,
+      cdpPort: processCdpPort(p) || null,
+      hasExpectedCdpArg: processHasCdpArg(p),
+    }));
+  } catch (error) {
+    // CIM is a live snapshot. A process exiting between enumeration and parsing
+    // must not turn the diagnostic path into a launcher failure. Lifecycle and
+    // termination authorization still call workBuddyProcesses directly.
+    log('WorkBuddy 进程诊断暂不可用（进程可能刚刚退出）: ' + error.message);
+    return [];
+  }
 }
 
 function logProcessDiagnostics(binary, prefix = 'WorkBuddy 进程诊断') {
   const rows = processDiagnostics(binary);
   log(prefix + ': ' + (rows.length ? JSON.stringify(rows) : '无匹配进程'));
   return rows;
+}
+
+// 桌面快捷方式是“冷启动”入口：已有 WorkBuddy 时不结束用户进程，也不抢占其窗口。
+// 进程查询失败同样按无法确认处理，避免在边界状态误重启官方应用。
+function requireWorkBuddyClosedBeforeLaunch() {
+  if (process.platform !== 'win32') return false;
+  let rows;
+  try {
+    rows = workBuddyProcesses();
+  } catch (error) {
+    log('无法确认 WorkBuddy 是否已退出: ' + error.message);
+    showWindowsMessageBox(WBS_BRAND, '无法确认 WorkBuddy 当前状态，请先完全退出 WorkBuddy 后再重试。');
+    return true;
+  }
+  if (!rows.length) return false;
+  log('检测到 WorkBuddy 已在运行，停止本次冷启动请求');
+  showWindowsMessageBox(WBS_BRAND, '请先完全退出 WorkBuddy，再重新点击桌面快捷方式。');
+  return true;
 }
 
 function readDaemonVersion() {
@@ -388,8 +406,21 @@ function readDaemonVersion() {
   } catch (_) { return ''; }
 }
 
-// ---------- 定位 node（托管优先：.workbuddy\binaries\node\versions\<v>\node.exe，其次 PATH） ----------
+function readDaemonIdentity() {
+  try {
+    const src = fs.readFileSync(path.join(SCRIPTS_DIR, 'daemon.js'), 'utf8');
+    return {
+      version: (src.match(/DAEMON_VERSION\s*=\s*'([^']+)'/) || [])[1] || '',
+      buildId: (src.match(/DAEMON_BUILD_ID\s*=\s*'([^']+)'/) || [])[1] || '',
+    };
+  } catch (_) {
+    return { version: '', buildId: '' };
+  }
+}
+
+// ---------- 定位 node（安装包内置优先，WorkBuddy 托管运行时次之，最后 PATH） ----------
 function findNode() {
+  const bundled = path.join(SCRIPTS_DIR, 'runtime', 'node', 'node.exe');
   const base = path.join(os.homedir(), '.workbuddy', 'binaries', 'node', 'versions');
   let verDirs = [];
   try {
@@ -398,10 +429,21 @@ function findNode() {
       .filter((p) => fs.existsSync(p))
       .sort();
   } catch (_) {}
-  if (verDirs.length) return verDirs[verDirs.length - 1];
+  // Existing installs may have a watchdog/daemon still running under WorkBuddy's
+  // managed Node. Reuse that runtime first so identity checks can see the old
+  // process during an upgrade; fresh installs still prefer the bundled runtime.
+  const hasExistingWatchdogState = fs.existsSync(path.join(DATA_DIR, 'watchdog.pid'));
+  if (hasExistingWatchdogState && verDirs.length) {
+    return resolveWindowsExecutable(verDirs[verDirs.length - 1]);
+  }
   try {
-    const r = spawnSync('node', ['-v'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
-    if (r.status === 0) return 'node';
+    if (fs.existsSync(bundled)) return resolveWindowsExecutable(bundled);
+  } catch (_) {}
+  if (verDirs.length) return resolveWindowsExecutable(verDirs[verDirs.length - 1]);
+  try {
+    const r = spawnSync('where.exe', ['node.exe'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+    const candidate = String(r.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (r.status === 0 && candidate) return resolveWindowsExecutable(candidate);
   } catch (_) {}
   return null;
 }
@@ -413,38 +455,44 @@ function findWorkBuddy() {
   const tryFile = (p) => {
     try {
       const candidate = String(p || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
-      if (candidate && fs.existsSync(candidate)) return candidate;
+      if (!candidate || !fs.existsSync(candidate)) return null;
+      const resolved = resolveWindowsExecutable(candidate);
+      return PROFILE_BINARY_NAMES.has(path.win32.basename(resolved).toLowerCase()) ? resolved : null;
     } catch (_) {}
     return null;
   };
+  const runningBin = selectRunningProfileBinary([...PROFILE_BINARY_NAMES], getWorkBuddyProcesses());
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
-  if (envBin) return (wbBinaryCache = envBin);
-  const profileBin = tryFile(PROFILE.appPath);
-  if (profileBin) return (wbBinaryCache = profileBin);
-  try {
-    const p = psOut('Get-Process WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path').split(/\r?\n/).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
-  try {
-    const p = psOut("Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(WorkBuddy|CodeBuddy|WorkBuddyAI)\\.exe$' -and $_.ExecutablePath } | Select-Object -First 1 -ExpandProperty ExecutablePath").split(/\r?\n/).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
+  if (process.env.WBSWITCH_WORKBUDDY_BIN && !envBin) {
+    throw new Error('WBSWITCH_WORKBUDDY_BIN 不是可验证的当前 profile 主程序');
+  }
+  if (envBin) {
+    if (runningBin && !sameWindowsPath(runningBin, envBin)) {
+      throw new Error('检测到当前 profile 正从另一安装目录运行，请先手动退出后重试');
+    }
+    return (wbBinaryCache = envBin);
+  }
+  if (runningBin) return (wbBinaryCache = runningBin);
+  const discovered = [];
+  const addCandidate = (candidate) => {
+    const hit = tryFile(candidate);
+    if (hit) discovered.push(hit);
+  };
+  addCandidate(PROFILE.appPath);
   // 便携版通常没有卸载项，但可能注册了 App Paths；优先读取其真实可执行路径。
-  try {
-    const p = psOut("$k=@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe'); Get-ItemProperty $k -ErrorAction SilentlyContinue | ForEach-Object { if ($_.'(default)') { $_.'(default)' } elseif ($_.Path) { $_.Path } } | Select-Object -First 1").split(/\r?\n/).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
-  try {
-    const p = psOut("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | Select-Object -First 1 DisplayIcon,InstallLocation | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }").split(/\r?\n/).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
+  for (const candidate of bestEffortPowerShellLines("$k=@('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe','HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CodeBuddy.exe'); Get-ItemProperty $k -ErrorAction SilentlyContinue | ForEach-Object { if ($_.'(default)') { $_.'(default)' } elseif ($_.Path) { $_.Path } }", 'App Paths')) {
+    addCandidate(candidate);
+  }
+  for (const candidate of bestEffortPowerShellLines("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }", '卸载注册表')) {
+    addCandidate(candidate);
+  }
   const roots = [
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy', 'CodeBuddy.exe'),
     path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(process.env.ProgramFiles || '', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+    path.join(process.env.ProgramFiles || '', 'CodeBuddy', 'CodeBuddy.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.APPDATA || '', 'WorkBuddy', 'WorkBuddy.exe'),
@@ -460,159 +508,294 @@ function findWorkBuddy() {
       path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI', 'WorkBuddyAI.exe')
     );
   }
-  if (process.env.WBSWITCH_WORKBUDDY_DIR) roots.push(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, 'WorkBuddy.exe'));
-  for (const candidate of roots) {
-    const hit = tryFile(candidate);
-    if (hit) return (wbBinaryCache = hit);
+  if (process.env.WBSWITCH_WORKBUDDY_DIR) {
+    roots.push(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, [...PROFILE_BINARY_NAMES][0]));
   }
-  // 兼容 Electron/Squirrel 把 exe 放在 app-5.3.14 等版本子目录的安装方式；
-  // 只扫描明确的客户端目录，避免递归扫描整盘或整个用户目录。
+  // 兼容类似 D:\\Software\\workbuddy\\WorkBuddy.exe 的便携目录，不递归扫描整盘。
+  const driveRoots = bestEffortPowerShellLines('(Get-PSDrive -PSProvider FileSystem).Root', '磁盘根目录');
+  for (const root of driveRoots) {
+    roots.push(path.join(root, 'Software', 'workbuddy', 'WorkBuddy.exe'));
+    roots.push(path.join(root, 'Software', 'workbuddy-ai', 'WorkBuddyAI.exe'));
+    roots.push(path.join(root, 'Software', 'codebuddy', 'CodeBuddy.exe'));
+    roots.push(path.join(root, 'workbuddy', 'WorkBuddy.exe'));
+    roots.push(path.join(root, 'WorkBuddy', 'WorkBuddy.exe'));
+  }
+  for (const candidate of roots) addCandidate(candidate);
+  // 兼容 Electron/Squirrel 的 app-<version> 子目录；收集全部命中后再要求唯一真实路径。
+  const scanDirs = [
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy'),
+    path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy'),
+    path.join(process.env.APPDATA || '', 'WorkBuddy'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy'),
+    path.join(process.env.LOCALAPPDATA || '', 'CodeBuddy'),
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI'),
+    path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI'),
+  ];
+  const psLiteral = (value) => "'" + String(value).replace(/'/g, "''") + "'";
+  const scanCommand = [
+    '$roots=@(' + scanDirs.map(psLiteral).join(', ') + ')',
+    '$names=@(' + [...PROFILE_BINARY_NAMES].map(psLiteral).join(', ') + ')',
+    'foreach($root in $roots){',
+    'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
+    'Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } | Select-Object -ExpandProperty FullName',
+    '}',
+  ].join('; ');
+  for (const candidate of bestEffortPowerShellLines(scanCommand, '安装目录扫描')) addCandidate(candidate);
+  const selected = selectUniqueDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  return selected ? (wbBinaryCache = selected) : null;
+}
+
+// ---------- 1. 确保 daemon 运行 ----------
+const WATCHDOG_PID_FILE = path.join(DATA_DIR, 'watchdog.pid');
+const WATCHDOG_SCRIPT = path.join(SCRIPTS_DIR, 'watchdog.js');
+const DAEMON_SCRIPT = path.join(SCRIPTS_DIR, 'daemon.js');
+
+function listenerPids(port) {
+  const result = spawnSync('netstat', ['-ano', '-p', 'tcp'], {
+    encoding: 'utf8', timeout: 8000, windowsHide: true,
+  });
+  if (result.error || result.status !== 0) throw new Error('无法查询 daemon 监听进程');
+  const pids = new Set();
+  for (const line of String(result.stdout || '').split(/\r?\n/)) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 5 || !/LISTENING/i.test(fields[3]) || !fields[1].endsWith(':' + port)) continue;
+    const pid = Number(fields[fields.length - 1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('daemon 监听 PID 无效');
+    pids.add(pid);
+  }
+  return [...pids];
+}
+
+function queryNodeProcesses(nodeBin, pids = null) {
+  if (!nodeBin) throw new Error('Node 运行时路径缺失，无法验证进程');
+  const expectedNode = powershellLiteral(nodeBin);
+  let source = `Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" -ErrorAction Stop | Where-Object { $_.ExecutablePath -ieq ${expectedNode} }`;
+  if (pids !== null) {
+    const safePids = [...new Set(pids.map(Number))];
+    if (!safePids.length) return [];
+    if (safePids.some((pid) => !Number.isSafeInteger(pid) || pid <= 0)) throw new Error('目标 Node PID 无效');
+    source = `$ids=@(${safePids.join(',')}); ${source} | Where-Object { $ids -contains [int]$_.ProcessId }`;
+  }
+  const command = buildNativeProcessQuery(
+    path.join(SCRIPTS_DIR, 'windows-process-boundary.ps1'), source
+  );
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    encoding: 'utf8', timeout: 10000, windowsHide: true,
+  });
+  return parseCimProcessResult(result, {
+    requireCommandLine: true,
+    requireCurrentOwner: true,
+    requireNativeArguments: true,
+  });
+}
+
+function uniqueNodeProcess(nodeBin, expectedScript) {
+  const matches = filterVerifiedNodeProcesses(nodeBin, expectedScript, queryNodeProcesses(nodeBin));
+  if (matches.length > 1) throw new Error(`目标 Node 入口存在多个进程: ${expectedScript}`);
+  return matches[0] || null;
+}
+
+function readWatchdogPid() {
   try {
-    const scanDirs = [
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy'),
-      path.join(process.env.LOCALAPPDATA || '', 'WorkBuddy'),
-      path.join(process.env.APPDATA || '', 'WorkBuddy'),
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'CodeBuddy'),
-      path.join(process.env.LOCALAPPDATA || '', 'CodeBuddy'),
-    ];
-    if (PROFILE.id === 'workbuddy-ai') {
-      scanDirs.unshift(
-        path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI'),
-        path.join(process.env.LOCALAPPDATA || '', 'WorkBuddyAI')
-      );
-    }
-    const names = PROFILE.id === 'workbuddy-ai'
-      ? ['WorkBuddyAI.exe', 'WorkBuddy.exe']
-      : ['WorkBuddy.exe', 'CodeBuddy.exe'];
-    const rootArgs = scanDirs.map(psQuote).join(', ');
-    const nameArgs = names.map(psQuote).join(', ');
-    const command = [
-      '$roots=@(' + rootArgs + ')',
-      '$names=@(' + nameArgs + ')',
-      'foreach($root in $roots){',
-      'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
-      '$hit=Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } | Select-Object -First 1 -ExpandProperty FullName',
-      'if($hit){$hit;break}',
-      '}',
-    ].join('; ');
-    const p = psOut(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop();
-    const hit = tryFile(p);
-    if (hit) return (wbBinaryCache = hit);
-  } catch (_) {}
-  // 兼容类似 D:\Software\workbuddy\WorkBuddy.exe 的便携目录。
-  try {
-    const driveRoots = psOut('(Get-PSDrive -PSProvider FileSystem).Root').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-    for (const root of driveRoots) {
-      roots.push(path.join(root, 'Software', 'workbuddy', 'WorkBuddy.exe'));
-      roots.push(path.join(root, 'workbuddy', 'WorkBuddy.exe'));
-      roots.push(path.join(root, 'WorkBuddy', 'WorkBuddy.exe'));
-    }
-  } catch (_) {}
-  for (const candidate of roots) {
-    const hit = tryFile(candidate);
-    if (hit) return (wbBinaryCache = hit);
+    const text = fs.readFileSync(WATCHDOG_PID_FILE, 'utf8').trim();
+    const pid = Number(text);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || String(pid) !== text) throw new Error('watchdog.pid 内容无效');
+    return pid;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function watchdogState(nodeBin) {
+  const pid = readWatchdogPid();
+  const exact = uniqueNodeProcess(nodeBin, WATCHDOG_SCRIPT);
+  if (!pid) return exact ? { kind: 'untracked', pid: null, process: exact } : { kind: 'absent', pid: null };
+  const processes = queryNodeProcesses(nodeBin, [pid]);
+  if (processes.length === 0) {
+    if (exact) throw new Error('watchdog.pid 指向不存在的 PID，但发现了另一个精确 watchdog 进程');
+    return { kind: 'stale', pid };
+  }
+  const process = assertVerifiedNodeProcess(pid, nodeBin, WATCHDOG_SCRIPT, processes);
+  if (!exact || exact.ProcessId !== pid) throw new Error('watchdog.pid 与枚举到的精确 watchdog 进程不一致');
+  assertSameProcessIdentity(exact, process);
+  return { kind: 'verified', pid, process };
+}
+
+function validateDaemonProcess(nodeBin, status = null) {
+  const listeners = listenerPids(UI_PORT);
+  if (listeners.length !== 1) throw new Error('daemon 监听 PID 不唯一或不存在');
+  if (status && status.pid != null &&
+      (!Number.isSafeInteger(status.pid) || status.pid <= 0 || status.pid !== listeners[0])) {
+    throw new Error('daemon 状态 PID 无效或与监听 PID 不一致');
+  }
+  const processes = queryNodeProcesses(nodeBin, listeners);
+  assertVerifiedNodeProcess(listeners[0], nodeBin, DAEMON_SCRIPT, processes);
+  return { listenerPids: listeners, nodeProcesses: processes };
+}
+
+function exactDaemonStatus(nodeBin, status) {
+  const identity = readDaemonIdentity();
+  const processIdentity = validateDaemonProcess(nodeBin, status);
+  assertDaemonServiceIdentity({
+    status,
+    expectedVersion: identity.version,
+    expectedBuildId: identity.buildId,
+    expectedProfileId: PROFILE.id,
+    listenerPids: processIdentity.listenerPids,
+    expectedNode: nodeBin,
+    expectedScript: DAEMON_SCRIPT,
+    nodeProcesses: processIdentity.nodeProcesses,
+  });
+  return status;
+}
+
+async function readStatus() {
+  const response = await httpGet(UI_PORT, '/api/status');
+  if (!response) return null;
+  if (response.status !== 200) throw new Error(`daemon 状态接口返回 ${response.status}`);
+  try { return JSON.parse(response.body); } catch (_) { throw new Error('daemon 状态接口返回无效 JSON'); }
+}
+
+async function waitForExactDaemon(nodeBin, attempts) {
+  for (let i = 0; i < attempts; i++) {
+    await sleep(400);
+    const status = await readStatus();
+    const listeners = listenerPids(UI_PORT);
+    // The daemon can bind its socket before /api/status is ready. Treat that
+    // transient half-ready state like any other startup retry instead of
+    // passing null into the identity validator and aborting cold launch.
+    if (!status || listeners.length !== 1) continue;
+    return exactDaemonStatus(nodeBin, status);
   }
   return null;
 }
 
-// ---------- 1. 确保 daemon 运行 ----------
-function watchdogAlive() {
-  try {
-    const pid = parseInt(fs.readFileSync(path.join(DATA_DIR, 'watchdog.pid'), 'utf8').trim(), 10);
-    if (!pid) return false;
-    const r = spawnSync('tasklist', ['/FI', 'PID eq ' + pid, '/FO', 'CSV', '/NH'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
-    return r.status === 0 && /node/i.test(r.stdout);
-  } catch (_) { return false; }
+function killVerifiedNodeProcess(process, nodeBin, expectedScript) {
+  const pid = Number(process.ProcessId);
+  const rows = queryNodeProcesses(nodeBin, [pid]);
+  if (rows.length === 0) return false;
+  const current = assertVerifiedNodeProcess(pid, nodeBin, expectedScript, rows);
+  assertSameProcessIdentity(process, current);
+  const result = spawnSync('taskkill', ['/F', '/PID', String(pid)], {
+    stdio: 'ignore', windowsHide: true, timeout: 10000,
+  });
+  if (result.error || result.status !== 0) throw new Error(`无法结束已验证进程 PID=${pid}`);
+  if (queryNodeProcesses(nodeBin, [pid]).length !== 0) throw new Error(`已验证进程 PID=${pid} 未退出`);
+  return true;
 }
 
-function daemonRunning() {
-  return portOpen(UI_PORT);
+function authorizeDaemonTermination(nodeBin, status) {
+  const processIdentity = validateDaemonProcess(nodeBin, status);
+  return assertDaemonTerminationIdentity({
+    status,
+    expectedProfileId: PROFILE.id,
+    listenerPids: processIdentity.listenerPids,
+    expectedNode: nodeBin,
+    expectedScript: DAEMON_SCRIPT,
+    nodeProcesses: processIdentity.nodeProcesses,
+  });
+}
+
+function removeWatchdogPidIf(pid) {
+  const current = readWatchdogPid();
+  if (current === null) return;
+  if (current !== pid) throw new Error('watchdog.pid 在清理前发生变化');
+  fs.unlinkSync(WATCHDOG_PID_FILE);
+}
+
+async function stopDaemonByPort(nodeBin) {
+  const watchdog = watchdogState(nodeBin);
+  if (watchdog.kind === 'untracked') {
+    throw new Error('发现没有当前 profile PID 文件的 watchdog 进程，拒绝复用或结束');
+  }
+  if (watchdog.kind === 'stale') {
+    removeWatchdogPidIf(watchdog.pid);
+    log('已清理确认不存在的旧 watchdog.pid');
+  }
+  const listeners = listenerPids(UI_PORT);
+  if (listeners.length > 1) throw new Error('daemon 监听 PID 不唯一');
+  const daemon = uniqueNodeProcess(nodeBin, DAEMON_SCRIPT);
+  let authorizedDaemon = null;
+  if (daemon || listeners.length) {
+    const status = await readStatus();
+    if (!status || listeners.length !== 1) {
+      throw new Error('daemon 未绑定当前 UI 端口与当前 profile 状态，拒绝结束');
+    }
+    authorizedDaemon = authorizeDaemonTermination(nodeBin, status);
+    if (!daemon || daemon.ProcessId !== authorizedDaemon.ProcessId) {
+      throw new Error('daemon 监听 PID 与枚举到的精确 daemon 进程不一致');
+    }
+    const identity = readDaemonIdentity();
+    if (status.version === identity.version && status.buildId === identity.buildId) {
+      throw new Error('daemon 版本与构建已匹配，拒绝结束当前实例');
+    }
+  }
+  if (watchdog.kind === 'verified') {
+    killVerifiedNodeProcess(watchdog.process, nodeBin, WATCHDOG_SCRIPT);
+    removeWatchdogPidIf(watchdog.pid);
+  }
+  if (authorizedDaemon) killVerifiedNodeProcess(authorizedDaemon, nodeBin, DAEMON_SCRIPT);
+  await sleep(300);
+  // 终止窗口内出现的 daemon 没有独立的端口与 status 绑定证据，绝不自动结束。
+  const remainingDaemon = uniqueNodeProcess(nodeBin, DAEMON_SCRIPT);
+  if (remainingDaemon) {
+    throw new Error('发现未绑定当前 profile 状态的新 daemon 进程，拒绝结束');
+  }
+  await sleep(300);
+  if (uniqueNodeProcess(nodeBin, DAEMON_SCRIPT) || listenerPids(UI_PORT).length || await portOpen(UI_PORT)) {
+    throw new Error('daemon 停止失败，端口仍被占用');
+  }
 }
 
 async function ensureDaemon(nodeBin) {
   fs.mkdirSync(path.join(DATA_DIR, 'accounts'), { recursive: true });
-  // 已有 daemon：检查版本一致性（旧版本代码继续注入会出兼容问题）
-  const st = await httpGet(UI_PORT, '/api/status');
-  if (st && st.status === 200) {
-    let runningVer = '';
-    try { runningVer = (JSON.parse(st.body).version || ''); } catch (_) {}
-    const want = readDaemonVersion();
-    if (runningVer === want) {
-      log('daemon 已在运行且版本一致 (' + runningVer + ')，跳过启动');
+  const status = await readStatus();
+  const listeners = listenerPids(UI_PORT);
+  if (status || listeners.length) {
+    authorizeDaemonTermination(nodeBin, status);
+    const identity = readDaemonIdentity();
+    if (status.version === identity.version && status.buildId === identity.buildId) {
+      exactDaemonStatus(nodeBin, status);
+      log('daemon 身份、版本、构建和权限均已验证，跳过启动');
       return true;
     }
-    log('检测到旧版 daemon (' + runningVer + ' != ' + want + ')，强制重启');
-    stopDaemonByPort();
-  } else if (watchdogAlive()) {
-    log('watchdog 在运行但 daemon 未就绪，等待其拉起...');
-    for (let i = 0; i < 20; i++) {
-      await sleep(500);
-      if (daemonRunning()) { log('daemon 已就绪'); return true; }
-    }
-    log('等待超时，主动拉起 watchdog');
+    log('daemon 版本或构建不匹配，停止已绑定当前 profile 的旧进程');
+    await stopDaemonByPort(nodeBin);
   }
-  // 启动 watchdog（它负责启动 daemon + 崩溃拉起）
-  if (!watchdogAlive()) {
-    log('启动 watchdog: ' + nodeBin);
-    const child = spawn(nodeBin, [path.join(SCRIPTS_DIR, 'watchdog.js')], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.unref();
-  }
-  for (let i = 0; i < 30; i++) {
-    await sleep(400);
-    if (daemonRunning()) { log('daemon 已就绪'); return true; }
-  }
-  log('等待 daemon 就绪超时');
-  return daemonRunning();
-}
 
-function stopDaemonByPort() {
-  // 杀 watchdog（会连带杀 daemon）→ 兜底按端口杀
-  try {
-    const pid = parseInt(fs.readFileSync(path.join(DATA_DIR, 'watchdog.pid'), 'utf8').trim(), 10);
-    if (pid) spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
-    try { fs.unlinkSync(path.join(DATA_DIR, 'watchdog.pid')); } catch (_) {}
-  } catch (_) {}
-  // 兜底：杀监听 UI 端口的进程
-  const out = spawnSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 8000, windowsHide: true }).stdout || '';
-  const lines = out.split(/\r?\n/).filter((l) => l.includes(':' + UI_PORT) && /LISTENING/i.test(l));
-  const pids = new Set();
-  for (const l of lines) {
-    const m = l.trim().split(/\s+/);
-    const pid = m[m.length - 1];
-    if (pid && /^\d+$/.test(pid)) pids.add(pid);
+  let watchdog = watchdogState(nodeBin);
+  if (watchdog.kind === 'untracked') {
+    throw new Error('发现没有当前 profile PID 文件的 watchdog 进程，拒绝复用或结束');
   }
-  for (const pid of pids) {
-    spawnSync('taskkill', ['/F', '/T', '/PID', pid], { stdio: 'ignore', windowsHide: true });
+  if (watchdog.kind === 'verified') {
+    const ready = await waitForExactDaemon(nodeBin, 20);
+    if (ready) return true;
+    await stopDaemonByPort(nodeBin);
+    watchdog = { kind: 'absent', pid: null };
   }
-  return pids.size > 0;
+  if (watchdog.kind === 'stale') {
+    removeWatchdogPidIf(watchdog.pid);
+    log('已清理确认不存在的旧 watchdog.pid，继续启动');
+    watchdog = { kind: 'absent', pid: null };
+  }
+  const orphanDaemon = uniqueNodeProcess(nodeBin, DAEMON_SCRIPT);
+  if (orphanDaemon) {
+    throw new Error('发现未绑定当前 UI 端口与当前 profile 状态的 daemon 进程，拒绝结束或启动重复实例');
+  }
+  log('启动 watchdog: ' + nodeBin);
+  const child = spawn(nodeBin, [WATCHDOG_SCRIPT], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+  if (await waitForExactDaemon(nodeBin, 30)) {
+    log('daemon 已通过完整身份校验');
+    return true;
+  }
+  throw new Error('等待 daemon 完整身份校验超时');
 }
 
 // ---------- 2/3. WorkBuddy CDP 处理 ----------
 function workBuddyRunning(binary = null) {
-  const processes = workBuddyProcesses(binary);
-  if (processes.length) return true;
-  if (binary) {
-    // CIM 能看到同族进程但路径明确属于另一个安装目录时，不应把它当成当前客户端仍在运行。
-    // 路径未知则保守认为仍在运行，后续 tasklist/PID 回退会尝试结束并写出诊断。
-    const unknownPath = getWorkBuddyProcesses().some((p) =>
-      PROFILE_PROCESS_NAMES.has(String(p.Name || '').toLowerCase()) && !p.ExecutablePath
-    );
-    if (!unknownPath) return false;
-  }
-  // CIM 失败时保守回退到 tasklist，避免误判为已退出后把启动参数交给旧实例。
-  try {
-    const names = binary ? targetProcessNames(binary) : PROFILE_PROCESS_NAMES;
-    const filters = Array.from(names).map((name) =>
-      spawnSync('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], {
-        encoding: 'utf8', timeout: 5000, windowsHide: true,
-      })
-    );
-    return filters.some((r) => r.status === 0 && names.has(
-      String(r.stdout || '').match(/"([^"]+\.exe)"/i)?.[1]?.toLowerCase() || ''
-    ));
-  } catch (_) {
-    return true;
-  }
+  return workBuddyProcesses(binary).length > 0;
 }
 
 function runTaskkill(args) {
@@ -632,29 +815,6 @@ function runTaskkill(args) {
   });
 }
 
-function runElevatedTaskkillPids(pids) {
-  const clean = Array.from(new Set(pids.map((pid) => String(pid)).filter((pid) => /^\d+$/.test(pid))));
-  if (!clean.length) return { code: 0, error: null };
-  const args = ['/F', '/T'];
-  for (const pid of clean) args.push('/PID', pid);
-  const command = [
-    '$p = Start-Process -FilePath ' + psQuote('taskkill.exe') +
-      ' -ArgumentList @(' + args.map(psQuote).join(', ') + ') -Verb RunAs -WindowStyle Hidden -Wait -PassThru',
-    'exit $p.ExitCode',
-  ].join('; ');
-  try {
-    const result = spawnSync('powershell', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command,
-    ], { encoding: 'utf8', windowsHide: true, timeout: 30000, stdio: 'ignore' });
-    return {
-      code: result.status,
-      error: result.error ? result.error.message : null,
-    };
-  } catch (e) {
-    return { code: null, error: e.message };
-  }
-}
-
 async function waitForWorkBuddyExit(timeoutMs, binary = null) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -668,7 +828,7 @@ function exitSnapshot(binary = null) {
   return {
     binary: binary ? path.basename(binary) : null,
     processes: processDiagnostics(binary),
-    tasklistPids: Array.from(tasklistProcessIds(targetProcessNames(binary))),
+    unverifiedTasklistPids: Array.from(tasklistProcessIds()),
   };
 }
 
@@ -676,108 +836,62 @@ async function killForExit(args, stage) {
   const result = await runTaskkill(args);
   const error = result.error ? result.error.message : '';
   log(`[exit] ${stage} taskkill=${args.join(' ')} code=${result.code == null ? 'null' : result.code}${error ? ' error=' + error : ''}`);
+  if (result.error || result.code !== 0) {
+    throw result.error || new Error(`${stage} taskkill 失败 (code=${result.code})`);
+  }
   return result;
+}
+
+async function killVerifiedWorkBuddyProcess(binary, process, force, stage) {
+  const pid = Number(process.ProcessId);
+  const current = workBuddyProcesses(binary).find((item) => Number(item.ProcessId) === pid);
+  if (!current) return false;
+  assertSameProcessIdentity(process, current);
+  await killForExit([...(force ? ['/F'] : []), '/PID', String(pid)], stage);
+  return true;
 }
 
 async function quitWorkBuddy(binary) {
   const initial = workBuddyProcesses(binary);
-  const targetNames = targetProcessNames(binary);
   if (!initial.length && !workBuddyRunning(binary)) return true;
 
+  if (!initial.length) {
+    throw new Error(`${PROFILE.name} 正在运行，但无法验证其绝对可执行路径；为避免误杀，已停止重启`);
+  }
+
   log(`[exit] 开始确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
-  // 按实际 PID 精确结束安装目录中的进程树；CIM 不可用时退回 tasklist，避免
-  // “检测到仍在运行但没有 PID”导致无条件等待后上报无法退出。
-  const pids = new Set(initial.map((p) => String(Number(p.ProcessId))).filter((pid) => pid !== '0'));
-  if (!pids.size) for (const pid of tasklistProcessIds(targetNames)) pids.add(pid);
-  for (const pid of pids) {
-    await killForExit(['/T', '/PID', pid], '优雅结束进程树');
+  // 按实际 PID 精确结束安装目录中的进程树：每个成员都先经 CIM 路径验证，
+  // 再逐 PID 结束，不按镜像名或未验证 PID 兜底。
+  for (const process of initial) {
+    await killVerifiedWorkBuddyProcess(binary, process, false, '结束已验证进程');
   }
   if (await waitForWorkBuddyExit(2500, binary)) {
     log(`[exit] 已确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
     return true;
   }
 
-  // 单实例宿主可能在第一次 taskkill 后重新生成辅助进程；刷新 PID 集合再强杀两轮。
+  // 单实例宿主可能在第一次 taskkill 后重新生成辅助进程；刷新并重新验证 PID 后强杀两轮。
   for (let round = 1; round <= 2; round++) {
-    const current = new Set(workBuddyProcesses(binary).map((p) => String(Number(p.ProcessId))).filter((pid) => pid !== '0'));
-    if (!current.size) for (const pid of tasklistProcessIds(targetNames)) current.add(pid);
+    const current = workBuddyProcesses(binary);
     log(`[exit] 强制结束第 ${round} 轮 snapshot=${JSON.stringify(exitSnapshot(binary))}`);
-    for (const pid of current) await killForExit(['/F', '/T', '/PID', pid], `强制结束第${round}轮`);
+    for (const process of current) {
+      await killVerifiedWorkBuddyProcess(binary, process, true, `强制结束第${round}轮`);
+    }
     if (await waitForWorkBuddyExit(2500, binary)) {
       log(`[exit] 强制结束后已确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
       return true;
     }
   }
 
-  // CIM 无法返回 PID 时按 PR#8 的两个精确镜像名兜底；最终结果仍必须经过检测确认。
-  for (const name of targetNames) await killForExit(['/F', '/T', '/IM', name], '镜像名兜底');
-  if (await waitForWorkBuddyExit(5000, binary)) {
-    log(`[exit] 镜像名兜底后已确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
-    return true;
-  }
-  // 进程路径/CIM 信息缺失时，普通 taskkill 可能因旧 WorkBuddy 以管理员权限运行而失败。
-  // 最后只对已确认属于目标镜像的剩余 PID 请求一次 UAC，避免按名称误杀其他客户端。
-  const beforeElevated = exitSnapshot(binary);
-  const remainingPids = new Set([
-    ...beforeElevated.tasklistPids,
-    ...beforeElevated.processes.map((p) => p.pid).filter(Boolean),
-  ]);
-  if (remainingPids.size) {
-    const elevated = runElevatedTaskkillPids(Array.from(remainingPids));
-    log(`[exit] 提权 PID 兜底 taskkill=${Array.from(remainingPids).join(',')} code=${elevated.code == null ? 'null' : elevated.code}${elevated.error ? ' error=' + elevated.error : ''}`);
-    if (await waitForWorkBuddyExit(10000, binary)) {
-      log(`[exit] 提权 PID 兜底后已确认退出 profile=${PROFILE.id} snapshot=${JSON.stringify(exitSnapshot(binary))}`);
-      return true;
-    }
-  }
   const final = exitSnapshot(binary);
   log(`[exit] 无法确认退出 profile=${PROFILE.id} final=${JSON.stringify(final)}`);
   const names = final.processes.map((p) => p.name).filter(Boolean).join(',') || 'unknown';
-  const pidsLeft = final.processes.map((p) => p.pid).filter(Boolean).join(',') || final.tasklistPids.join(',') || 'unknown';
-  throw new Error(`${PROFILE.name} 无法确认已退出（剩余镜像=${names}; PID=${pidsLeft}）`);
+  const pidsLeft = final.processes.map((p) => p.pid).filter(Boolean).join(',') || 'unknown';
+  throw new Error(`${PROFILE.name} 无法以普通用户权限安全退出（剩余镜像=${names}; PID=${pidsLeft}）。请手动关闭该程序；若它以管理员身份运行，请先退出后再重试`);
 }
 
-function psQuote(value) {
-  return "'" + String(value).replace(/'/g, "''") + "'";
-}
-
-/**
- * 从管理员 launcher 启动 WorkBuddy 时，不能直接 spawn 子进程：Electron/Chromium
- * 在部分 Windows 环境以高完整性令牌启动会出现白屏。通过 Explorer 的 ShellExecute
- * 让桌面 shell 以当前用户令牌创建 GUI 进程；普通权限 launcher 仍走同一条路径。
- */
 function launchWorkBuddy(wb) {
   const args = '--remote-debugging-port=' + CDP_PORT;
-  if (isElevated()) {
-    const command = [
-      '$shell = New-Object -ComObject Shell.Application',
-      '$shell.ShellExecute(' + [
-        psQuote(wb),
-        psQuote(args),
-        psQuote(path.dirname(wb)),
-        "'open'",
-        '1',
-      ].join(', ') + ')',
-    ].join('; ');
-    const result = spawnSync(
-      'powershell',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
-      { stdio: 'ignore', windowsHide: true, timeout: 15000 }
-    );
-    if (result.status === 0) {
-      log('WorkBuddy 已通过 Explorer ShellExecute 以当前用户权限启动');
-      return { method: 'shell-execute' };
-    }
-    log('ShellExecute 启动 WorkBuddy 失败，改用 explorer.exe 兜底 (code=' + result.status + ')');
-    try {
-      const shell = spawn('explorer.exe', [wb, args], { detached: true, stdio: 'ignore', windowsHide: true });
-      shell.unref();
-      return { method: 'explorer-fallback' };
-    } catch (e) {
-      log('explorer.exe 启动 WorkBuddy 失败: ' + e.message);
-    }
-  }
-
   const child = spawn(wb, [args], {
     cwd: path.dirname(wb), detached: true, stdio: 'ignore', windowsHide: true,
   });
@@ -807,14 +921,14 @@ async function waitForWorkBuddyCdp(binary) {
 
     const elapsed = Date.now() - launchStartedAt;
     const diagnostics = processDiagnostics(binary);
-    const hasProcessWithoutArg = diagnostics.length > 0 && diagnostics.every((p) => p.hasCommandLine) &&
-      !diagnostics.some((p) => p.hasCdpArg);
-    if (!retryOnNextPort && Date.now() - launchStartedAt >= 5000 && diagnostics.length === 0 &&
+    const hasProcessWithoutArg = diagnostics.length > 0 && !diagnostics.some((p) => p.hasCdpArg);
+    if (!retryOnNextPort && Date.now() - launchStartedAt >= CDP_PORT_RETRY_GRACE_MS && diagnostics.length === 0 &&
         await isLocalPortAvailable(CDP_PORT)) {
       const nextPort = await findNextAvailableCdpPort(CDP_PORT);
       if (nextPort) {
         retryOnNextPort = true;
         CDP_PORT = nextPort;
+        process.env.WBSWITCH_CDP_PORT = String(nextPort);
         writeCdpPortFile(nextPort);
         log('当前 CDP 端口未成功监听，改用备用端口重试: ' + nextPort);
         start();
@@ -843,6 +957,7 @@ async function waitForWorkBuddyCdp(binary) {
     if (port === CDP_PORT) continue;
     if (await isWorkBuddyCdpAt(port, binary)) {
       CDP_PORT = port;
+      process.env.WBSWITCH_CDP_PORT = String(port);
       writeCdpPortFile(port);
       log('超时前发现 WorkBuddy 使用备用 CDP 端口: ' + port);
       return true;
@@ -862,16 +977,43 @@ async function findNextAvailableCdpPort(exclude) {
 }
 
 async function injectNow() {
-  // daemon 的 /api/inject 是 POST
-  const response = await httpPost(UI_PORT, '/api/inject');
-  if (!response) throw new Error('注入请求无响应');
-  let payload = null;
-  try { payload = JSON.parse(response.body || '{}'); } catch (_) {}
-  if (response.status !== 200 || !payload || payload.ok !== true || payload.mounted !== true) {
-    const detail = payload && payload.error ? ': ' + payload.error : ` (HTTP ${response.status})`;
-    throw new Error('WorkDaddy 组件注入失败' + detail);
+  // daemon 的 /api/inject 可能需要等待 renderer 完成首屏；客户端断开不代表 daemon 停止注入。
+  let lastError = '注入请求无响应';
+  for (let attempt = 1; attempt <= INJECT_MAX_ATTEMPTS; attempt += 1) {
+    const response = await httpPost(UI_PORT, '/api/inject');
+    if (!response) {
+      lastError = '注入请求超时，daemon 仍可能在后台重试';
+    } else {
+      let payload = null;
+      try { payload = JSON.parse(response.body || '{}'); } catch (_) {}
+      if (response.status === 200 && payload && payload.ok === true && payload.mounted === true) {
+        return payload;
+      }
+      if (response.status === 401 || response.status === 404) {
+        const detail = payload && payload.error ? ': ' + payload.error : ` (HTTP ${response.status})`;
+        throw new Error('WorkDaddy 组件注入失败' + detail);
+      }
+      lastError = payload && payload.error
+        ? payload.error
+        : `注入响应未完成 (HTTP ${response.status})`;
+    }
+    if (attempt < INJECT_MAX_ATTEMPTS) {
+      log(`[inject] 第 ${attempt}/${INJECT_MAX_ATTEMPTS} 次未完成：${lastError}；${INJECT_RETRY_DELAY_MS}ms 后重试`);
+      await sleep(INJECT_RETRY_DELAY_MS);
+    }
   }
-  return payload;
+  return { pending: true, error: lastError };
+}
+
+async function injectNowOrPending() {
+  const result = await injectNow();
+  if (!result || result.pending) {
+    const detail = result && result.error ? `（${result.error}）` : '';
+    log(`[inject] launcher 放弃等待，后台继续注入${detail}`);
+    console.log(WBS_BRAND + '：后台正在注入组件，WorkBuddy 页面就绪后会自动生效。');
+    return false;
+  }
+  return true;
 }
 
 // ---------- main ----------
@@ -889,18 +1031,13 @@ if (require.main === module) (async () => {
   }
   await configureCdpPort();
 
-  // 提权助手接管时，先停掉普通权限启动的 watchdog/daemon，避免两个权限级别的
-  // daemon 同时占用端口；WorkBuddy GUI 后续仍由 ShellExecute 以用户权限启动。
-  if (ELEVATED_HELPER_MODE) {
-    log('提权流程：接管普通权限 daemon');
-    stopDaemonByPort();
-    await sleep(800);
-  }
   await ensureDaemon(nodeBin);
+
+  if (requireWorkBuddyClosedBeforeLaunch()) process.exit(0);
 
   // 已在 CDP 模式 → 幂等注入
   if (await isWorkBuddyCdp()) {
-    await injectNow();
+    if (!(await injectNowOrPending())) process.exit(0);
     log('WorkBuddy 已在调试模式（端口 ' + CDP_PORT + '），组件已注入');
     console.log(WBS_BRAND + '：WorkBuddy 已在调试模式，组件已注入 ✓');
     process.exit(0);
@@ -915,29 +1052,18 @@ if (require.main === module) (async () => {
     return;
   }
 
-  // WorkBuddy 常装在 C:\Program Files（受保护特权目录），结束已提升的旧进程可能需要管理员权限。
-  // 若当前非管理员：派发提权助手（触发一次 UAC）后立即退出，由助手完成重启+注入，
-  // 避免普通双击时卡在黑屏空转等 20 秒。
-  if (!isElevated()) {
-    log('非管理员权限：派发提权助手重启 WorkBuddy（唤醒 UAC）');
-    console.log('需要管理员权限以重启 WorkBuddy 进入调试模式，正在请求授权...');
-    if (spawnElevatedHelper()) {
-      console.log('已发起提权请求，点击 UAC「是」后将自动完成重启与注入。');
-      process.exit(0);
-    }
-    // 派发失败则仍退回当前进程尝试（容错）
-    log('提权派发失败，退回当前进程直接重启');
-  }
-
   log('重启 WorkBuddy（带 --remote-debugging-port=' + CDP_PORT + '，GUI 使用当前用户权限）: ' + wb);
   console.log('正在以调试模式重启 WorkBuddy（约几秒）...');
+  showWindowsNotification('WorkBuddy', '正在打开 WorkBuddy，请稍等…');
 
+  // 只在当前普通权限上下文中结束经过绝对路径验证的 PID。若目标以更高完整性
+  // 运行或 CIM 无法证明路径，quitWorkBuddy 会 fail closed，不再执行用户可写的 UAC 脚本。
   await quitWorkBuddy(wb);
   await sleep(1000);
   const ok = await waitForWorkBuddyCdp(wb);
   if (ok) {
     await sleep(1500);
-    await injectNow();
+    if (!(await injectNowOrPending())) process.exit(0);
     log('WorkBuddy 已启动（调试模式），组件已注入');
     console.log(WBS_BRAND + '：WorkBuddy 已启动（调试模式），组件已注入 ✓');
   } else {
@@ -957,12 +1083,11 @@ if (require.main === module) (async () => {
 
 module.exports = {
   getWorkBuddyProcesses,
-  getWorkBuddyProcessesViaCim,
-  getWorkBuddyProcessesViaTasklist,
-  parseTasklistOutput,
   workBuddyProcesses,
+  requireWorkBuddyClosedBeforeLaunch,
+  showWindowsMessageBox,
+  showWindowsNotification,
   tasklistProcessIds,
-  targetProcessNames,
   workBuddyRunning,
-  isElevated,
+  cdpPortCandidates,
 };

@@ -19,9 +19,12 @@ The repository is deliberately lightweight:
 1. Diagnose the reported behavior against the current code before changing it. A historical report is evidence, not proof that the current version is broken.
 2. Keep changes narrow. Do not refactor unrelated code, rename public API routes, or change the account-file format without a concrete compatibility reason.
 3. Preserve WorkBuddy's installation, signature, and official app bundle. WorkDaddy should operate through CDP and local files rather than modifying `app.asar`.
-4. Never log, upload, or paste access tokens, cookies, account backup contents, or private keys. Sentry breadcrumbs and errors must remain redacted.
+4. Never log, upload, or paste access tokens, cookies, account backup contents, or private keys. Sentry breadcrumbs and errors must remain redacted; composer input, full logs, database contents, and API keys are also out of scope.
 5. Account switching is intentionally smooth: replace the selected JSON backup and refresh the running renderer through CDP. Do not call `quitWorkBuddy()` or `relaunchWorkBuddy()` from the normal `/api/switch` path.
 6. When changing daemon behavior, increment `DAEMON_VERSION` and `DAEMON_BUILD_ID` in `scripts/daemon.js`. Launchers use these values to replace stale daemon processes that still have old code in memory.
+7. Diagnostic telemetry defaults to enabled. The About-page 「发送错误诊断」 switch controls both remote Sentry events and local redacted renderer diagnostics; `WORKDADDY_TELEMETRY=0/1` is an explicit startup override. Do not restore the removed `WORKDADDY_DIAGNOSTIC_LOGS` or composer-capture interfaces.
+8. The only telemetry override that may bypass the About-page switch is a user-initiated repair-agent run that has read `安装失败自主解决提示词.txt` and uses `--force-send --require-sent`. That report must remain redacted, and only `sent=true` is success; `queued=true` or a non-zero exit must never be presented as sent.
+9. WorkDaddy and WorkBuddy lifecycle control must run at standard user privilege. If WorkBuddy is elevated, launcher operations must fail closed with manual guidance; never reintroduce UAC helpers, broad image-name kills, or cross-integrity process termination.
 
 ## UI Direction (Highest Priority)
 
@@ -62,6 +65,34 @@ The injected panel is a compact WorkBuddy-native tool surface, not a marketing p
 - Escape user/account/session text before assigning it to `innerHTML`; use text nodes or the existing escaping helper where possible.
 - Do not use private WorkBuddy RPCs or reorder operations in a session-switching path unless there is a regression test and a documented reason. These paths have historically caused renderer crashes.
 
+## Client Type Judgment (WorkDaddy vs WorkDaddy AI)
+
+The injected panel must distinguish the client type before any UI or functional branching. The single source of truth is the daemon profile id injected as `__WBS_PROFILE__` → `PROFILE_ID` in `scripts/inject.js`:
+
+- `PROFILE_ID === 'workbuddy-ai'` → **WorkDaddy AI** (WorkBuddy AI / international client).
+- Any other profile (`workbuddy-cn`, codebuddy-*) → **WorkDaddy** (WorkBuddy default client).
+
+Use the dedicated flag `WBS_PROFILE_IS_AI` (defined next to `WBS_BRAND`) for these branches; do not reinvent per-profile checks. `WBS_BRAND` mirrors the same decision for visible branding ("WorkDaddy AI" vs "WorkDaddy"). Per-profile feature gates live in `scripts/profiles.js` `capabilities` (accounts/models/theme/stashPrompt/...), injected as `__WBS_CAPS__` → `CAPS`.
+
+### Input-box plugin buttons (stash prompt + quick phrase)
+
+The two composer-adjacent plugin buttons are `stashBtn`（暂存提示词）and `exploreBtn`（快捷短语/探索）. Their placement is decided by client type (see `insertStash` / `findAiToolbar` in `scripts/inject.js`):
+
+- **WorkDaddy (default client)**: keep the existing placement untouched — `voice-mic-wrap` present → fixed positioning anchored to the action row; otherwise the legacy `_inputBottom_` toolbar inline or fixed fallback.
+- **WorkDaddy AI**: insert both buttons inline into `div.cr-input-toolbar__right` (the parent of the input box's bottom-right button group, new teams layout, e.g. `...div.conversation-input > div.cr-theme > div.cr-theme.cr-input-box > div.cr-input-box__main > div.cr-input-container-wrapper > div.cr-input-container > div.cr-input-toolbar > div.cr-input-toolbar__right`) — at the leftmost position, i.e. to the left of the official buttons (上下文用量 / 增强 / 模型 / 发送), using the `wbs-stash-inline-inline` class so the buttons participate in the flex row. If the new container is absent, fall back to the legacy AI toolbar selectors.
+
+Rule of thumb: when only the AI client's DOM changes, gate the new selector on `WBS_PROFILE_IS_AI` so the default client's behavior is never altered by an AI-specific layout fix.
+
+### Queue adapter & stash behavior (暂存提示词)
+
+The stash button's actual "stash into WorkBuddy's message queue" capability depends on the official queue adapter, and the two clients expose it differently (see `findWbsAdapter` / `findAiSessionsAdapter` in `scripts/inject.js`):
+
+- **WorkDaddy (default client)**: the queue methods (`enqueueConversationMessageQueueItem`, `pauseConversationMessageQueue`, ...) hang directly on a React fiber props adapter object; discovered by walking up from legacy roots (`.voice-mic-wrap`, `_cbChat_`, `.chat-container`).
+- **WorkDaddy AI** (new teams layout): the queue API lives on the official adapter itself — the methods sit on its **prototype chain** (`typeof adapter.enqueueConversationMessageQueueItem === 'function'` matches even though `Object.keys` hides them), and those wrappers internally call `_notifyQueueUpdate` (refreshes the official panel + returns a real snapshot). The legacy discovery roots no longer exist, and `adapter.sessionsResource` must NOT be used as the target — it is a low-level passthrough that returns `null` snapshots and never refreshes the panel. `findWbsAdapter` must DFS the render tree for `props.adapter` whose prototype exposes the queue methods, then builds a shim exposing the same method names the rest of the module expects, with `currentActiveSessionId` falling back to the visible conversation DOM (`.cr-document[data-root-id]`, active `.conversation-item[data-conversation-id]`). Without this shim the AI client silently falls into the local `/api/stash` fallback and nothing appears in the queue panel.
+- **Cache invalidation trap**: the top-of-file cleanup must `delete window.__wbsAdapter`. `findWbsAdapter`'s cache check passes as long as the methods exist on the cached object, so a stale shim wrapping the wrong adapter is silently reused after reinjection — code fixes appear to do nothing until the cache is cleared (this exact bug made the AI stash look "dead" for a full debugging round on 2026-08-26).
+
+The queue item's 暂存提示词 tag is rendered by `syncQueueTags` (in `scripts/inject.js`): it inserts a `span.wbs-queue-tag` as the **first child of `.cb-message-queue-item-actions`** — i.e. the leftmost sibling among that row's icon buttons, exactly the placement the AI new layout expects (`...div.conversation-input-area > div.conversation-queue-panel > div.cb-message-queue.cb-expand > div.cb-message-queue-content > div.cb-message-queue-item > div.cb-message-queue-item-actions`). This tag code is client-agnostic; only the adapter discovery differs per client.
+
 ## Backend and Platform Rules
 
 - The daemon binds to loopback only. Keep local API routes on `127.0.0.1`; validate request bodies and file paths before acting.
@@ -69,13 +100,16 @@ The injected panel is a compact WorkBuddy-native tool surface, not a marketing p
 - Normal account switching must be JSON replacement plus CDP reload. Fake logout is the exceptional flow that may exit/relaunch WorkBuddy to reach the login page.
 - macOS uses launchd and the WorkDaddy app launcher; Windows uses the watchdog, `win-launcher.js`, `launcher.cmd`, and PowerShell scripts. Keep platform-specific process handling in the platform-specific files.
 - Windows file replacement must account for locks held by running `launcher.cmd`/`cmd.exe`. Do not kill broad process names such as every `Electron` process; match the intended executable/path narrowly.
+- Windows launcher injection must tolerate a renderer that is slower than the CDP port: retry transient `/api/inject` failures, reuse the daemon's in-flight manual injection, and report background processing with exit code `0` instead of a false launcher error. Real authorization or route errors must still fail.
 - If a launcher or daemon update changes code loaded into a long-running process, use a version/build bump so the launcher cannot reuse stale in-memory code.
 
 ## Release Version Consistency
 
 - A release version must be identical in the package filename, macOS `Info.plist` (`CFBundleShortVersionString`/`CFBundleVersion`), and the packaged `scripts/daemon.js` `DAEMON_VERSION`. A package named `1.0.10` that runs daemon code reporting `1.0.6` is invalid.
 - Build scripts must always rewrite the staged daemon version from the release `VERSION`; never rely on the version embedded in the reusable `WorkDaddy.app` shell or on a conditional test-only override.
-- Before publishing or handing off a package, inspect the actual DMG/ZIP contents and record the daemon version, app metadata version, profile branding, and required update scripts. Do not infer package correctness from the filename alone.
+- Windows releases are `Setup.exe` only. The `*-win64.zip` created by the installer pipeline is temporary staging and must be deleted before artifact upload or GitHub Release publication; ZIP remains supported only as an updater fallback for historical releases.
+- Before publishing or handing off a package, inspect the actual DMG/Setup.exe payload and record the daemon version, app metadata version, profile branding, and required update scripts. Do not infer package correctness from the filename alone.
+- Every Windows Setup.exe payload and macOS DMG staging directory must include `安装失败自主解决提示词.txt`; `scripts/verify-win.cmd` must treat the Windows copy as required. Inspect the packaged prompt filename/encoding along with the other release contents.
 - The updater must reject an artifact whose internal daemon version does not match the GitHub release target, and must leave a local diagnostic trail showing the selected asset, expected version, internal version, and installation attempt ID.
 
 ## Change Workflow

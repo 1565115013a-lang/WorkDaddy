@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -12,7 +13,9 @@ const {
   getAutoCopyRules,
   setAutoCopyRule,
   getAutoCopySession,
+  getAutoCopySessionMembers,
   addAutoCopySessionMember,
+  removeAutoCopySessionMember,
   moveAutoCopySession,
   removeAutoCopySession,
   removeAutoCopyAccount,
@@ -40,6 +43,16 @@ function writeMeta(dataDir, value) {
   fs.writeFileSync(metaFile(dataDir), JSON.stringify(value, null, 2), { mode: 0o600 });
 }
 
+test('Windows workspace keys retain the renderer-provided path spelling', () => {
+  const result = childProcess.spawnSync(
+    process.execPath,
+    ['-e', "Object.defineProperty(process, 'platform', { value: 'win32' }); const { canonicalWorkspace } = require(process.argv[1]); process.stdout.write(canonicalWorkspace('/Users/example/Repo/'));", path.join(__dirname, '..', 'scripts', 'lib.js')],
+    { encoding: 'utf8' }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, '/Users/example/Repo');
+});
+
 test('legacy account-scoped rules migrate to global lineages and workspace paths', () => {
   const dataDir = tempDataDir();
   const oldKey = JSON.stringify(['h', 's', 'session-a']);
@@ -56,7 +69,8 @@ test('legacy account-scoped rules migrate to global lineages and workspace paths
   const rules = getAutoCopyRules(dataDir, 'h');
   assert.deepEqual(rules.sessionIds, ['session-a']);
   assert.equal(rules.workspaces.length, 1);
-  assert.equal(canonicalWorkspace('/Users/example/Repo/'), '/Users/example/Repo');
+  const expectedWorkspace = '/Users/example/Repo';
+  assert.equal(canonicalWorkspace('/Users/example/Repo/'), expectedWorkspace);
   const lineage = getAutoCopySession(dataDir, 'h', 'session-a');
   assert.ok(lineage.lineageId);
   assert.equal(lineage.enabled, true);
@@ -98,11 +112,25 @@ test('deleting the last lineage member removes mappings, while other members ret
   assert.equal(getAutoCopyMapping(dataDir, lineageId, 's'), null);
 });
 
+test('lineage member lookup is deduplicated and one member can be removed without deleting the lineage', () => {
+  const dataDir = tempDataDir();
+  setAutoCopyRule(dataDir, { uid: 'source', kind: 'session', key: 'source-session', enabled: true });
+  const lineageId = getAutoCopySession(dataDir, 'source', 'source-session').lineageId;
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old');
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old');
+  addAutoCopySessionMember(dataDir, lineageId, 'target', 'target-new');
+  assert.deepEqual(getAutoCopySessionMembers(dataDir, lineageId, 'target'), ['target-old', 'target-new']);
+  assert.equal(removeAutoCopySessionMember(dataDir, lineageId, 'target', 'target-old'), true);
+  assert.deepEqual(getAutoCopySessionMembers(dataDir, lineageId, 'target'), ['target-new']);
+  assert.equal(getAutoCopySession(dataDir, 'source', 'source-session').lineageId, lineageId);
+});
+
 test('workspace rules are global across source accounts', () => {
   const dataDir = tempDataDir();
+  const expectedWorkspace = '/Users/h/Repo';
   setAutoCopyRule(dataDir, { uid: 'h', kind: 'workspace', key: '/Users/h/Repo/', enabled: true });
-  assert.deepEqual(getAutoCopyRules(dataDir, 'h').workspaces, ['/Users/h/Repo']);
-  assert.deepEqual(getAutoCopyRules(dataDir, 's').workspaces, ['/Users/h/Repo']);
+  assert.deepEqual(getAutoCopyRules(dataDir, 'h').workspaces, [expectedWorkspace]);
+  assert.deepEqual(getAutoCopyRules(dataDir, 's').workspaces, [expectedWorkspace]);
   setAutoCopyRule(dataDir, { uid: 's', kind: 'workspace', key: '/Users/h/Repo', enabled: false });
   assert.deepEqual(getAutoCopyRules(dataDir, 'h').workspaces, []);
 });
@@ -153,14 +181,43 @@ test('model backups preserve full local config while enabling one id removes off
   const copied = copyModelBackup(dataDir, backup.backupId);
   assert.notEqual(copied.backupId, backup.backupId);
   assert.equal(copied.apiKey, '••••••');
-  const edited = editModelBackup(dataDir, copied.backupId, { name: 'Edited label', url: 'https://edited.invalid', apiKey: 'secret-edited' });
-  assert.equal(edited.name, 'Edited label');
+  const edited = editModelBackup(dataDir, copied.backupId, { id: 'deepseek-v4-flash', name: '我的 DeepSeek', url: 'https://edited.invalid', apiKey: 'secret-edited' });
+  assert.equal(edited.id, 'deepseek-v4-flash');
+  assert.equal(edited.name, '我的 DeepSeek');
+  const editedRecord = JSON.parse(fs.readFileSync(path.join(dataDir, 'models', copied.backupId + '.json'), 'utf8'));
+  assert.equal(editedRecord.model.id, 'deepseek-v4-flash');
+  assert.equal(editedRecord.model.name, '我的 DeepSeek');
   assert.equal(edited.url, 'https://edited.invalid');
+  const nameOnlyGroup = listModelBackups(dataDir).find((group) => group.id === 'deepseek-v4-flash');
+  assert.equal(nameOnlyGroup.id, 'deepseek-v4-flash');
+  assert.equal(nameOnlyGroup.items[0].name, '我的 DeepSeek');
+  assert.equal(Object.prototype.hasOwnProperty.call(nameOnlyGroup.items[0], '_groupId'), false);
   assert.equal(edited.apiKey, 'sec••••••ited');
-  assert.equal(listModelBackups(dataDir).find((group) => group.id === 'same-id').items.length, 2);
+  const otherBackup = backupOfficialModel(dataDir, 1, modelsFile);
+  editModelBackup(dataDir, otherBackup.backupId, { id: 'deepseek-v4-flash' });
+  const editedGroup = listModelBackups(dataDir).find((group) => group.id === 'deepseek-v4-flash');
+  assert.equal(editedGroup.items.length, 2);
+  assert.equal(listModelBackups(dataDir).find((group) => group.id === 'same-id').items.length, 1);
+  assert.equal(editedGroup.name, undefined);
 
-  assert.equal(deleteModelBackups(dataDir, [backup.backupId, copied.backupId]), 2);
+  assert.equal(deleteModelBackups(dataDir, [backup.backupId, copied.backupId, otherBackup.backupId]), 3);
   assert.equal(listModelBackups(dataDir).length, 0);
+});
+
+test('same model id with different custom names stays in one id-named group', () => {
+  const dataDir = tempDataDir();
+  const modelsFile = path.join(dataDir, 'models.json');
+  fs.writeFileSync(modelsFile, JSON.stringify([
+    { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash2 aaa' },
+    { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash2 bbb' },
+  ]));
+  backupOfficialModel(dataDir, 0, modelsFile);
+  backupOfficialModel(dataDir, 1, modelsFile);
+  const groups = listModelBackups(dataDir);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].id, 'deepseek-v4-flash');
+  assert.equal(groups[0].items.length, 2);
+  assert.deepEqual(groups[0].items.map((item) => item.name).sort(), ['deepseek-v4-flash2 aaa', 'deepseek-v4-flash2 bbb']);
 });
 
 test('official model batch deletion only changes official config and leaves backups intact', () => {

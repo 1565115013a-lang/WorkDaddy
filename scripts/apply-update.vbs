@@ -16,7 +16,7 @@ Option Explicit
 '   因此这里固定写死 powershell.exe 裸名（System32 恒在 PATH），后续所有参数一律加双引号。
 '
 ' 用法（由 daemon.js applyUpdate() 调用）：
-'   wscript.exe //nologo apply-update.vbs <apply-update.ps1> <srcZip> <appDir> <port> <applyLog> <attemptId>
+'   wscript.exe //nologo apply-update.vbs <apply-update.ps1> <srcPackage> <appDir> <port> <applyLog> <attemptId>
 
 Dim shell, i, cmd
 Set shell = CreateObject("WScript.Shell")

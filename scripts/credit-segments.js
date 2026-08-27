@@ -152,4 +152,48 @@ function mergeCreditSegments(segments) {
   return sortCreditSegments(Array.from(merged.values()));
 }
 
-module.exports = { extractCreditSegments, sortCreditSegments, mergeCreditSegments };
+// 官方企业版判定（agent-ui hooks 的 ENTERPRISE_EDITIONS）：enterpriseId 之外的兜底类型判断
+const ENTERPRISE_EDITIONS = ['ultimate', 'exclusive'];
+
+/**
+ * 解析企业积分接口（POST /v2/billing/meter/get-enterprise-user-usage）返回值。
+ * 官方实现（WorkBuddy 主进程 AuthProductCoordinator.getEnterpriseUsage）响应结构：
+ *   { code, msg, data: { credit, limitNum, cycleResetTime, cycleStartTime, cycleEndTime } }
+ * - limitNum === -1 表示企业无限量（UI 显示「不限量」）
+ * - 否则剩余 = limitNum - credit，cycleResetTime 为下个权益周期重置时间
+ * 兼容 data 直接传入（payload 就是 data 对象）或带 { data: {...} } 包装。
+ */
+function parseEnterpriseUsage(payload, source) {
+  if (!payload || typeof payload !== 'object') return null;
+  // 兼容三种形态：直接传 data / { data: {...} } / { data: { data: {...} } }
+  let data = payload;
+  if (payload.data && typeof payload.data === 'object') {
+    if ('limitNum' in payload.data) data = payload.data;
+    else if (payload.data.data && typeof payload.data.data === 'object') data = payload.data.data;
+  }
+  const limitNum = Number(data.limitNum);
+  if (!Number.isFinite(limitNum)) return null;
+  const reset = firstTimestamp(data, ['CycleResetTime', 'cycleResetTime', 'CycleResetTimeMs']);
+  if (limitNum === -1) {
+    return { unlimited: true, credits: 0, total: 0, count: 0, segments: [], cycleResetTime: reset };
+  }
+  const credit = Number.isFinite(Number(data.credit)) ? Number(data.credit) : 0;
+  const credits = Math.max(0, limitNum - credit);
+  const segments = sortCreditSegments([{
+    remaining: credits,
+    total: limitNum,
+    expiresAt: reset,
+    source: source || '企业配额',
+    packageCode: '',
+  }]).filter((segment) => Number(segment.remaining) > 0);
+  return {
+    unlimited: false,
+    credits: Number(credits.toFixed(2)),
+    total: Number(limitNum.toFixed(2)),
+    count: 1,
+    segments,
+    cycleResetTime: reset,
+  };
+}
+
+module.exports = { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS };

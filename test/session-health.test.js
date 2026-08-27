@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const { classifySessionHealth } = require('../scripts/inject.js');
+const { classifySessionHealth, classifyAutoContinueReply } = require('../scripts/inject.js');
 
 test('session health keeps selectors for the current WorkBuddy message and error DOM', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
@@ -73,5 +73,32 @@ test('session health flags a long response that ends without completion evidence
   assert.deepEqual(
     classifySessionHealth({ observed: true, hasAssistant: true, assistantTextLength: 2000, looksTruncated: true, idleForMs: 9000 }),
     { status: 'suspected', confidence: 'low', reason: 'truncated-assistant' },
+  );
+});
+
+test('auto-continue does not resend after a normal response when its marker is lost', () => {
+  assert.deepEqual(
+    classifyAutoContinueReply({ observed: true, hasCompletionActions: true, assistantTextLength: 240 }),
+    { trigger: false, reason: 'completion-actions' },
+  );
+});
+
+test('auto-continue still triggers for explicit error or truncation evidence', () => {
+  assert.deepEqual(
+    classifyAutoContinueReply({ observed: true, error: true, assistantTextLength: 240 }),
+    { trigger: true, reason: 'error-ui' },
+  );
+  assert.deepEqual(
+    classifyAutoContinueReply({ observed: true, looksTruncated: true, assistantTextLength: 240 }),
+    { trigger: true, reason: 'truncated-reply' },
+  );
+});
+
+test('ordinary terminal punctuation is not treated as truncation evidence', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
+  assert.doesNotMatch(source, /结果如下\[:：\]\?\$\|\[,，:：\]\$\)/);
+  assert.deepEqual(
+    classifyAutoContinueReply({ observed: true, hasCompletionActions: false, looksTruncated: false }),
+    { trigger: false, reason: 'no-incomplete-evidence' },
   );
 });
