@@ -67,11 +67,8 @@
 ### Windows
 
 1. 在 [Releases](../../releases) 下载对应客户端的 `WorkDaddy-Setup-x.y.z.exe` 或 `WorkDaddy-AI-Setup-x.y.z.exe`
-2. 双击安装器，按向导完成安装；默认安装到当前用户目录，不需要管理员权限、Node.js 或 PowerShell 操作
-3. 安装完成后从桌面或开始菜单打开 WorkDaddy；如果 WorkBuddy 正在以管理员权限运行，请先关闭它，再从普通用户入口启动
-4. 安装器会把固定版本 Node.js 一起安装，并在启动失败时保留 `%APPDATA%\WorkDaddy\launcher.log`
-
-高级用户仍可下载 `-win64.zip`，解压后在顶层运行 `Install-WorkDaddy.cmd`；该入口用于排障和开发测试。
+2. 双击安装器完成安装
+3. 双击打开 `WorkDaddy` 或 `WorkDaddy AI` 桌面快捷方式
 
 
 ### 从源码运行（开发者）
@@ -167,10 +164,6 @@ WorkBuddy 右下角的机器人按钮 → 弹出面板 → 选你要的操作：
 
 - **本地数据优先**：账号备份、主题和本地配置不会在后台上传；登录、积分等功能会访问 WorkBuddy 官方 API，自动更新会访问 GitHub Releases；显式执行模型连通测试时，会向你配置的第三方模型地址发送请求及对应 API Key。
 - **发送错误诊断默认开启**：关于页的「发送错误诊断」开关同时控制 Sentry 远程错误诊断和本地脱敏渲染器日志，帮助定位版本和兼容性问题；处理内容经过脱敏、截断，远程上报不包含账号、会话内容、Token 或 API Key。随时可以在关于页关闭；`WORKDADDY_TELEMETRY=0`/`1` 可作为启动时的明确关闭/开启覆盖。
-- **登录信息含明文 token**：备份目录权限 `700`、文件 `600`；请勿上传/分享。
-- **token 会过期**：长时间不用的账号切换后可能需重新登录。
-- **不改 WorkBuddy 安装包**：仅启动时多带 `--remote-debugging-port` 参数，二进制、签名原封不动。
-- **debug 端口 = 仅本机**：`9222` 只绑定 loopback，不会被同 WiFi 其他人访问到。
 
 完整威胁模型见 [`SECURITY.md`](SECURITY.md)（可选；未提供时本节即为完整说明）。
 
