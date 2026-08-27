@@ -208,7 +208,7 @@ test('Windows entry points detect and expose a matching daemon privilege mode', 
 
 test('Windows installer stops the verified profile lifecycle before replacing or launching files', () => {
   const stopIndex = installerSource.indexOf('Stop-VerifiedWorkDaddyLifecycle');
-  const copyIndex = installerSource.indexOf('robocopy $SrcDir $targetScripts');
+  const copyIndex = installerSource.indexOf('& robocopy @copyArgs');
   const launchIndex = installerSource.indexOf('# 4) 启动');
   assert.ok(stopIndex >= 0, 'installer must stop an existing verified lifecycle');
   assert.ok(stopIndex < copyIndex, 'lifecycle must stop before files are replaced');
@@ -216,6 +216,8 @@ test('Windows installer stops the verified profile lifecycle before replacing or
   assert.match(installerSource, /\$uiPort\s*=\s*if \(\$Profile -eq 'workbuddy-ai'\) \{ 47833 \} else \{ 47832 \}/);
   assert.match(installerSource, /-ExpectedWatchdogScript \(Join-Path \$AppDir 'scripts\\watchdog\.js'\)/);
   assert.match(installerSource, /-ExpectedDaemonScript \(Join-Path \$AppDir 'scripts\\daemon\.js'\)/);
+  assert.match(installerSource, /\$preserveExistingLifecycle/);
+  assert.match(installerSource, /runtime\\node/);
 });
 
 test('PowerShell lifecycle scopes daemon discovery to a verified watchdog parent', () => {

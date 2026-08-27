@@ -107,7 +107,7 @@ test('Windows install and update release a locked launcher before replacing it',
   assert.match(boundary, /Get-CimInstance\s+Win32_Process/);
   assert.match(boundary, /Test-ExactCmdLauncherCommandLine/);
   assert.doesNotMatch(boundary, /taskkill[^\r\n]*\/T\b/i);
-  assert.ok(install.indexOf('Release-VerifiedLauncherLock') < install.indexOf('robocopy $SrcDir $targetScripts'), 'install must release launcher before robocopy');
+  assert.ok(install.indexOf('Release-VerifiedLauncherLock') < install.indexOf('& robocopy @copyArgs'), 'install must release launcher before robocopy');
   assert.match(update, /launcher\.cmd/);
   assert.ok(update.indexOf('Release-VerifiedLauncherLock') < update.indexOf('Move-Item -LiteralPath $AppDir'), 'update must release launcher before moving the old app');
 });
@@ -481,7 +481,9 @@ test('Windows launcher searches app-data roots and versioned WorkBuddy installs'
 
 test('Windows release package includes the troubleshooting prompt as UTF-8', () => {
   const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
+  const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'win', 'workdaddy.iss'), 'utf8');
   assert.match(build, /安装失败自主解决提示词\.txt/);
+  assert.match(installer, /Source: "\{#StageRoot\}\\安装失败自主解决提示词\.txt"/);
   assert.match(build, /Python zipfile/);
   assert.match(build, /ZIP_DEFLATED/);
 });
@@ -560,7 +562,7 @@ test('Windows release publishes Setup.exe only and removes temporary ZIP staging
   assert.match(guide, /temporary staging/);
 });
 
-test('Windows Setup stops a verified lifecycle before replacing bundled Node', () => {
+test('Windows Setup stops a verified lifecycle or preserves an authenticated elevated runtime', () => {
   const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'win', 'workdaddy.iss'), 'utf8');
   const prepare = fs.readFileSync(path.join(repoRoot, 'scripts', 'prepare-win-install.ps1'), 'utf8');
   const verify = fs.readFileSync(path.join(repoRoot, 'scripts', 'verify-win.cmd'), 'utf8');
@@ -569,9 +571,16 @@ test('Windows Setup stops a verified lifecycle before replacing bundled Node', (
   assert.match(installer, /ExtractTemporaryFile\('windows-process-boundary\.ps1'\)/);
   assert.match(installer, /ewWaitUntilTerminated/);
   assert.match(prepare, /Stop-VerifiedWorkDaddyLifecycle/);
+  assert.match(prepare, /Get-AuthenticatedWorkDaddyStatus/);
+  assert.match(prepare, /-AllowVersionMismatch/);
+  assert.match(prepare, /exit 10/);
   assert.match(prepare, /\$privilege = if \(\$principal\.IsInRole/);
   assert.doesNotMatch(prepare, /Refusing to prepare WorkDaddy installation with elevated privileges/);
   assert.match(installer, /ResultCode = 5/);
+  assert.match(installer, /ResultCode = 10/);
+  assert.match(installer, /ShouldReplaceRuntime/);
+  assert.match(installer, /runtime\\node\\\*/);
+  assert.match(installer, /管理员权限运行的旧版 WorkDaddy/);
   assert.match(prepare, /WorkDaddy-prepare-install\.log/);
   assert.match(prepare, /-ExpectedWatchdogScript \(Join-Path \$AppDir 'scripts\\watchdog\.js'\)/);
   assert.match(verify, /prepare-win-install\.ps1/);

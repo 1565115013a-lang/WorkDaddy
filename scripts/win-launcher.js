@@ -8,8 +8,8 @@
  *   3) 否则以自动选择的 CDP 端口启动 → 等端口 → 注入
  *
  * 由 launcher.cmd 调用（cmd 负责兜底找 node），也可 node win-launcher.js 直接运行。
- * 默认按普通用户运行；用户明确以管理员身份启动时，整条 launcher/daemon
- * 链路继承 elevated 模式并在状态中校验，避免混用两个权限层级。
+ * 默认按普通用户运行；用户明确以管理员身份启动时，先通过桌面 Shell
+ * 重启为标准权限。真正关闭 UAC、没有过滤 token 时才继续当前权限。
  */
 'use strict';
 
@@ -20,6 +20,7 @@ const net = require('net');
 const http = require('http');
 const { spawn, spawnSync } = require('child_process');
 const {
+  assertAuthenticatedDaemonCapability,
   assertDaemonServiceIdentity,
   assertDaemonTerminationIdentity,
   assertSameProcessIdentity,
@@ -56,6 +57,8 @@ const WBS_BRAND = PROFILE.appName || 'WorkDaddy'; // 品牌显示名跟随 profi
 const DATA_DIR =
   process.env.WBSWITCH_DATA_DIR ||
   profileDataDir(PROFILE);
+const API_TOKEN_FILE = path.join(DATA_DIR, '.api-token');
+const DESKTOP_RELAUNCH_ARG = '--desktop-shell-relaunch';
 const DEFAULT_UI_PORT = { 'workbuddy-cn': 47832, 'workbuddy-ai': 47833, 'codebuddy-cn': 47834, 'codebuddy-intl': 47835 }[PROFILE.id] || 47832;
 const UI_PORT = parseInt(process.env.WBSWITCH_PORT || String(DEFAULT_UI_PORT), 10);
 // watchdog/daemon inherit process.env. Persist the resolved profile port so an
@@ -98,6 +101,35 @@ function log(...args) {
 
 // ---------- 小工具 ----------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function readApiToken() {
+  try {
+    const token = fs.readFileSync(API_TOKEN_FILE, 'utf8').trim();
+    return /^[a-f0-9]{64}$/i.test(token) ? token : '';
+  } catch (_) { return ''; }
+}
+
+function localApiHeaders() {
+  const token = readApiToken();
+  return token ? { 'X-WorkDaddy-Token': token } : {};
+}
+
+function relaunchWithDesktopShell(nodeBin) {
+  const helper = path.join(SCRIPTS_DIR, 'windows-relaunch-standard.ps1');
+  if (!fs.existsSync(helper)) throw new Error('缺少标准权限重启脚本 windows-relaunch-standard.ps1');
+  const powershell = path.join(
+    process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'
+  );
+  const result = spawnSync(powershell, [
+    '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+    '-File', helper, '-NodePath', nodeBin, '-LauncherPath', __filename,
+  ], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = String(result.stderr || result.stdout || '').trim();
+    throw new Error(`无法通过桌面 Shell 重新启动${detail ? ': ' + detail : ''}`);
+  }
+}
 
 function runHiddenPowerShell(script) {
   if (process.platform !== 'win32') return;
@@ -201,9 +233,9 @@ function isLocalPortAvailable(port) {
   });
 }
 
-function httpGet(port, p) {
+function httpGet(port, p, headers = {}) {
   return new Promise((resolve) => {
-    const req = http.get({ host: HOST, port, path: p, timeout: 1500 }, (res) => {
+    const req = http.get({ host: HOST, port, path: p, headers, timeout: 1500 }, (res) => {
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => resolve({ status: res.statusCode, body }));
@@ -213,9 +245,9 @@ function httpGet(port, p) {
   });
 }
 
-function httpPost(port, p, timeoutMs = INJECT_REQUEST_TIMEOUT_MS) {
+function httpPost(port, p, timeoutMs = INJECT_REQUEST_TIMEOUT_MS, headers = {}) {
   return new Promise((resolve) => {
-    const req = http.request({ host: HOST, port, path: p, method: 'POST', timeout: timeoutMs }, (res) => {
+    const req = http.request({ host: HOST, port, path: p, method: 'POST', headers, timeout: timeoutMs }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; if (body.length > 20000) body = body.slice(0, 20000); });
@@ -679,10 +711,22 @@ function exactDaemonStatus(nodeBin, status, allowPrivilegeMismatch = false) {
 }
 
 async function readStatus() {
-  const response = await httpGet(UI_PORT, '/api/status');
+  const response = await httpGet(UI_PORT, '/api/status', localApiHeaders());
   if (!response) return null;
   if (response.status !== 200) throw new Error(`daemon 状态接口返回 ${response.status}`);
   try { return JSON.parse(response.body); } catch (_) { throw new Error('daemon 状态接口返回无效 JSON'); }
+}
+
+function authenticatedElevatedDaemonStatus(status) {
+  const identity = readDaemonIdentity();
+  return assertAuthenticatedDaemonCapability({
+    status,
+    expectedProfileId: PROFILE.id,
+    expectedVersion: identity.version,
+    expectedDataDir: DATA_DIR,
+    listenerPids: listenerPids(UI_PORT),
+    allowVersionMismatch: true,
+  });
 }
 
 async function waitForExactDaemon(nodeBin, attempts) {
@@ -794,15 +838,12 @@ async function ensureDaemon(nodeBin) {
         await stopDaemonByPort(nodeBin, true);
         upgradedPrivilege = true;
       } else if (WINDOWS_PRIVILEGE === 'standard' && status && status.privilege === 'elevated') {
-        // 普通权限无法安全终止 elevated daemon。若其身份、版本和构建均已
-        // 匹配，则复用这个同用户、同 profile 的服务，让桌面快捷方式可幂等打开。
-        const identity = readDaemonIdentity();
-        if (status.version === identity.version && status.buildId === identity.buildId) {
-          exactDaemonStatus(nodeBin, status, true);
-          log('检测到已匹配的 elevated daemon，普通权限 launcher 复用现有服务');
-          return true;
-        }
-        throw error;
+        // Windows intentionally hides an elevated process's executable and
+        // command line from this standard process. The per-profile API token
+        // provides a non-termination capability proof for safe reuse.
+        authenticatedElevatedDaemonStatus(status);
+        log('普通权限 launcher 复用已验证的 elevated 服务；不会跨权限结束进程');
+        return true;
       } else {
         throw error;
       }
@@ -1035,7 +1076,7 @@ async function injectNow() {
   // daemon 的 /api/inject 可能需要等待 renderer 完成首屏；客户端断开不代表 daemon 停止注入。
   let lastError = '注入请求无响应';
   for (let attempt = 1; attempt <= INJECT_MAX_ATTEMPTS; attempt += 1) {
-    const response = await httpPost(UI_PORT, '/api/inject');
+    const response = await httpPost(UI_PORT, '/api/inject', INJECT_REQUEST_TIMEOUT_MS, localApiHeaders());
     if (!response) {
       lastError = '注入请求超时，daemon 仍可能在后台重试';
     } else {
@@ -1084,11 +1125,17 @@ if (require.main === module) (async () => {
     await reportAndExit(1, '未找到 Node.js（WorkBuddy 托管运行时或 PATH）', 'windows-launcher-node');
     return;
   }
+  if (process.platform === 'win32' && WINDOWS_PRIVILEGE === 'elevated') {
+    if (!process.argv.includes(DESKTOP_RELAUNCH_ARG)) {
+      relaunchWithDesktopShell(nodeBin);
+      log('管理员入口已通过桌面 Shell 重新派发；当前 elevated launcher 退出');
+      process.exit(0);
+    }
+    log('桌面 Shell 仍返回 elevated token（可能已关闭 UAC），继续使用当前系统权限');
+  }
   await configureCdpPort();
 
   await ensureDaemon(nodeBin);
-
-  if (requireWorkBuddyClosedBeforeLaunch()) process.exit(0);
 
   // 已在 CDP 模式 → 幂等注入
   if (await isWorkBuddyCdp()) {
@@ -1097,6 +1144,8 @@ if (require.main === module) (async () => {
     console.log(WBS_BRAND + '：WorkBuddy 已在调试模式，组件已注入 ✓');
     process.exit(0);
   }
+
+  if (requireWorkBuddyClosedBeforeLaunch()) process.exit(0);
 
   // 未开 CDP → 需要重启 WorkBuddy 带调试端口
   const wb = findWorkBuddy();

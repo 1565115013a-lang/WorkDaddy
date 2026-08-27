@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [string]$Version = '',
   [string]$OutputDirectory = '',
@@ -90,7 +90,7 @@ function Invoke-WindowsInstallerBuild {
     -Profile $Profile `
     -Version $ReleaseVersion `
     -OutputDirectory $OutputDirectory `
-    -IsccPath $Compiler
+    -IsccPath $Compiler | Out-Host
   if ($LASTEXITCODE -ne 0) {
     throw "$Profile Setup.exe 生成失败（退出码 $LASTEXITCODE）。"
   }

@@ -198,7 +198,7 @@ const DATA_DIR = defaultDataDir();
 // 1.0.18：主题应用在页面刷新/切换期间自动重连 CDP，并补充失败诊断。
 // 1.1.0：Windows launcher 固定传递 profile UI 端口；显式端口冲突时不再递增到相邻 profile。
 const DAEMON_VERSION = '1.1.1';
-const DAEMON_BUILD_ID = 'release-1.1.1-20260827-windows-privilege-path-fixes';
+const DAEMON_BUILD_ID = 'release-1.1.1-20260827-windows-standard-launch-normalization';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app

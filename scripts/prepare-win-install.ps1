@@ -1,7 +1,8 @@
 param(
   [Parameter(Mandatory = $true)][string]$BoundaryPath,
   [Parameter(Mandatory = $true)][string]$AppDir,
-  [ValidateSet('workbuddy-cn', 'workbuddy-ai')][string]$Profile = 'workbuddy-cn'
+  [ValidateSet('workbuddy-cn', 'workbuddy-ai')][string]$Profile = 'workbuddy-cn',
+  [Parameter(Mandatory = $true)][string]$ExpectedVersion
 )
 
 try {
@@ -33,12 +34,34 @@ try {
     -ExpectedDaemonScript (Join-Path $AppDir 'scripts\daemon.js')
   exit 0
 } catch {
+  $stopError = $_.Exception.Message
+  if ($privilege -eq 'standard') {
+    try {
+      [void](Get-AuthenticatedWorkDaddyStatus `
+        -DataDir $dataDir `
+        -Port $uiPort `
+        -ExpectedProfile $Profile `
+        -ExpectedVersion $ExpectedVersion `
+        -AllowVersionMismatch)
+      [IO.File]::AppendAllText(
+        $diagnosticFile,
+        ('[' + [DateTime]::UtcNow.ToString('o') + '] preserved authenticated elevated lifecycle profile=' + $Profile +
+          ' expectedVersion=' + $ExpectedVersion + [Environment]::NewLine),
+        (New-Object Text.UTF8Encoding($false)))
+      # Inno treats 10 as a verified compatibility path and skips only the
+      # locked bundled runtime. No cross-integrity termination is attempted.
+      exit 10
+    } catch {
+      $capabilityError = $_.Exception.Message
+    }
+  }
   try {
     [IO.File]::AppendAllText(
       $diagnosticFile,
-      ('[' + [DateTime]::UtcNow.ToString('o') + '] failed profile=' + $Profile + ' error=' + $_.Exception.Message + [Environment]::NewLine),
+      ('[' + [DateTime]::UtcNow.ToString('o') + '] failed profile=' + $Profile + ' error=' + $stopError +
+        $(if ($capabilityError) { ' capability=' + $capabilityError } else { '' }) + [Environment]::NewLine),
       (New-Object Text.UTF8Encoding($false)))
   } catch {}
-  [Console]::Error.WriteLine('Cannot safely stop the existing WorkDaddy lifecycle: ' + $_.Exception.Message)
+  [Console]::Error.WriteLine('Cannot safely stop the existing WorkDaddy lifecycle: ' + $stopError)
   exit 2
 }

@@ -36,6 +36,7 @@ $uiPort = if ($Profile -eq 'workbuddy-ai') { 47833 } else { 47832 }
 $env:WBSWITCH_PORT = [string]$uiPort
 $sentryReporter = Join-Path $SrcDir 'sentry-report.js'
 $nodeBin = $null
+$preserveExistingLifecycle = $false
 
 # WorkBuddy 通常自带 Node；安装失败上报不依赖 npm 或 Electron。
 try {
@@ -80,9 +81,30 @@ try {
     -ExpectedDaemonScript (Join-Path $AppDir 'scripts\daemon.js')
   Write-InstallLine '  已停止并清理当前 profile 的旧守护进程。'
 } catch {
-  Write-InstallLine ('错误：无法安全停止当前 profile 的旧守护进程: ' + $_.Exception.Message)
-  Send-Sentry 'windows-install-stop-lifecycle' $_.Exception.Message 2
-  exit 2
+  $stopError = $_.Exception.Message
+  if (-not $isElevated) {
+    try {
+      $sourceDaemon = Get-Content -LiteralPath (Join-Path $SrcDir 'daemon.js') -Raw -Encoding UTF8 -ErrorAction Stop
+      $versionMatch = [regex]::Match($sourceDaemon, "const DAEMON_VERSION = '([^']+)'")
+      if (-not $versionMatch.Success) { throw '安装源 daemon.js 缺少版本号' }
+      [void](Get-AuthenticatedWorkDaddyStatus `
+        -DataDir $dataDir `
+        -Port $uiPort `
+        -ExpectedProfile $Profile `
+        -ExpectedVersion $versionMatch.Groups[1].Value `
+        -AllowVersionMismatch)
+      $preserveExistingLifecycle = $true
+      Write-InstallLine '  检测到已验证的管理员权限旧服务：保留当前运行实例，并继续安装。'
+    } catch {
+      Write-InstallLine ('错误：安装被后台进程阻止。无法确认并停止当前 WorkDaddy；请先退出 WorkBuddy。详情: ' + $stopError)
+      Send-Sentry 'windows-install-stop-lifecycle' $stopError 2
+      exit 2
+    }
+  } else {
+    Write-InstallLine ('错误：无法停止当前 WorkDaddy 后台进程。请先退出 WorkBuddy 后重试。详情: ' + $stopError)
+    Send-Sentry 'windows-install-stop-lifecycle' $stopError 2
+    exit 2
+  }
 }
 
 # 1) 复制（排除开发/临时文件；node_modules/ws 随包带入）
@@ -105,7 +127,9 @@ if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
     Send-Sentry 'windows-install-launcher-lock' "无法释放 launcher.cmd 文件锁: $launcherToReplace" 2
     exit 2
   }
-  robocopy $SrcDir $targetScripts /E /XF *.log .DS_Store /XD win\probe /R:2 /W:1
+  $copyArgs = @($SrcDir, $targetScripts, '/E', '/XF', '*.log', '.DS_Store', '/XD', (Join-Path $SrcDir 'win\probe'), '/R:2', '/W:1')
+  if ($preserveExistingLifecycle) { $copyArgs += @('/XD', (Join-Path $SrcDir 'runtime\node')) }
+  & robocopy @copyArgs
   $rc = $LASTEXITCODE
   if ($rc -ge 8) {
     Write-InstallLine "复制失败（robocopy=$rc）"

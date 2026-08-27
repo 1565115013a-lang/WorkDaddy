@@ -310,6 +310,56 @@ function Get-UniqueListeningProcessId {
   return [int]$ids[0]
 }
 
+function Get-AuthenticatedWorkDaddyStatus {
+  param(
+    [Parameter(Mandatory = $true)][string]$DataDir,
+    [Parameter(Mandatory = $true)][int]$Port,
+    [Parameter(Mandatory = $true)][string]$ExpectedProfile,
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [switch]$AllowVersionMismatch
+  )
+  $tokenFile = Join-Path $DataDir '.api-token'
+  if (-not (Test-Path -LiteralPath $tokenFile -PathType Leaf)) {
+    throw '当前 profile 缺少本地 API 身份凭证'
+  }
+  $token = (Get-Content -LiteralPath $tokenFile -Raw -ErrorAction Stop).Trim()
+  if ($token -notmatch '^[A-Fa-f0-9]{64}$') { throw '当前 profile 的本地 API 身份凭证无效' }
+  try {
+    $response = Invoke-WebRequest `
+      -UseBasicParsing `
+      -Uri ("http://127.0.0.1:$Port/api/status") `
+      -Headers @{ 'X-WorkDaddy-Token' = $token } `
+      -TimeoutSec 3 `
+      -ErrorAction Stop
+    $status = $response.Content | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw ('无法通过本地身份凭证确认正在运行的 WorkDaddy: ' + $_.Exception.Message)
+  }
+  $statusPid = 0
+  if ($null -eq $status -or $status.ok -ne $true -or
+      -not [int]::TryParse([string]$status.pid, [ref]$statusPid) -or $statusPid -le 0) {
+    throw '本地 WorkDaddy 状态中的 PID 无效'
+  }
+  if ([string]$status.profile.id -cne $ExpectedProfile) { throw '本地 WorkDaddy profile 不匹配' }
+  if (-not $AllowVersionMismatch -and [string]$status.version -cne $ExpectedVersion) {
+    throw '本地 WorkDaddy version 不匹配'
+  }
+  if ([string]$status.privilege -cne 'elevated') { throw '本地 WorkDaddy 不是管理员权限进程' }
+  if ([string]::IsNullOrWhiteSpace([string]$status.dataDir)) {
+    throw '本地 WorkDaddy 未接受当前 profile 身份凭证'
+  }
+  $expectedDataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
+  $actualDataDir = [IO.Path]::GetFullPath([string]$status.dataDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
+  if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expectedDataDir, $actualDataDir)) {
+    throw '本地 WorkDaddy 数据目录不匹配'
+  }
+  $listenerPid = Get-UniqueListeningProcessId -Port $Port
+  if ($null -eq $listenerPid -or $listenerPid -ne $statusPid) {
+    throw '本地 WorkDaddy 状态 PID 与监听 PID 不匹配'
+  }
+  return $status
+}
+
 function Stop-VerifiedProcess {
   param([Parameter(Mandatory = $true)]$Process)
   $targetPid = [int]$Process.ProcessId

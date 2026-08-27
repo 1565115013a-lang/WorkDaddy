@@ -330,8 +330,42 @@ function assertDaemonServiceIdentity(options) {
   return process;
 }
 
+// A standard process cannot read ExecutablePath/CommandLine for an elevated
+// Node process. Reuse (never termination) may instead rely on the per-profile
+// API capability token: authenticated /api/status exposes dataDir, which is
+// omitted from public status responses. Bind that proof to the exact listener.
+function assertAuthenticatedDaemonCapability(options) {
+  const status = options && options.status;
+  if (!status || typeof status !== 'object' || status.ok !== true) {
+    throw new Error('authenticated daemon status is missing');
+  }
+  if (!status.profile || status.profile.id !== options.expectedProfileId) {
+    throw new Error('authenticated daemon profile mismatch');
+  }
+  if (!options.allowVersionMismatch && status.version !== options.expectedVersion) {
+    throw new Error('authenticated daemon version mismatch');
+  }
+  if (status.privilege !== 'elevated') {
+    throw new Error('authenticated daemon is not elevated');
+  }
+  const pid = status.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error('authenticated daemon PID is invalid');
+  }
+  const listenerPids = Array.from(new Set((options.listenerPids || []).map(Number)));
+  if (listenerPids.length !== 1 || listenerPids[0] !== pid) {
+    throw new Error('authenticated daemon listener PID does not match status PID');
+  }
+  if (typeof status.dataDir !== 'string' || !status.dataDir.trim() ||
+      !sameWindowsPath(status.dataDir, options.expectedDataDir)) {
+    throw new Error('authenticated daemon data directory mismatch');
+  }
+  return status;
+}
+
 module.exports = {
   ALLOWED_WORKBUDDY_PROCESS_NAMES,
+  assertAuthenticatedDaemonCapability,
   assertDaemonServiceIdentity,
   assertDaemonTerminationIdentity,
   assertSameProcessIdentity,

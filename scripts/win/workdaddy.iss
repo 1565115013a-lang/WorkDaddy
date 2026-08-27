@@ -60,8 +60,9 @@ Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 [Files]
 Source: "{#StageRoot}\scripts\prepare-win-install.ps1"; Flags: dontcopy
 Source: "{#StageRoot}\scripts\windows-process-boundary.ps1"; Flags: dontcopy
-Source: "{#StageRoot}\scripts\*"; DestDir: "{app}\scripts"; Excludes: "prepare-win-install.ps1"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#StageRoot}\troubleshooting.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageRoot}\scripts\*"; DestDir: "{app}\scripts"; Excludes: "prepare-win-install.ps1,runtime\node\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageRoot}\scripts\runtime\node\*"; DestDir: "{app}\scripts\runtime\node"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: ShouldReplaceRuntime
+Source: "{#StageRoot}\安装失败自主解决提示词.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\scripts\launcher-hidden.vbs"""; WorkingDir: "{app}\scripts"; IconFilename: "{app}\scripts\WorkDaddy.ico"
@@ -77,6 +78,14 @@ Filename: "{#PowerShellPath}"; Parameters: "-NoProfile -WindowStyle Hidden -Exec
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+var
+  PreserveExistingLifecycle: Boolean;
+
+function ShouldReplaceRuntime(): Boolean;
+begin
+  Result := not PreserveExistingLifecycle;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
@@ -91,15 +100,20 @@ begin
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
     ExpandConstant('{tmp}\prepare-win-install.ps1') + '" -BoundaryPath "' +
     ExpandConstant('{tmp}\windows-process-boundary.ps1') + '" -AppDir "' +
-    ExpandConstant('{app}') + '" -Profile "{#ProfileId}"';
+    ExpandConstant('{app}') + '" -Profile "{#ProfileId}" -ExpectedVersion "{#AppVersion}"';
   if not Exec(ExpandConstant('{#PowerShellPath}'), Parameters, '', SW_HIDE,
       ewWaitUntilTerminated, ResultCode) then
   begin
     Result := '无法启动安装前的 WorkDaddy 进程检查。';
     exit;
   end;
-  if ResultCode = 5 then
-    Result := '安装前检查无法确认 Windows 权限模式。请直接双击安装程序重试；如使用了企业安全策略，请联系管理员。'
+  if ResultCode = 10 then
+  begin
+    PreserveExistingLifecycle := True;
+    Result := '';
+  end
+  else if ResultCode = 5 then
+    Result := '无法判断安装程序的权限。请关闭安全软件对 PowerShell 的拦截后，重新打开安装包。'
   else if ResultCode <> 0 then
-    Result := '无法安全停止现有 WorkDaddy 进程（退出码 ' + IntToStr(ResultCode) + '）。请完全退出客户端后重试。';
+    Result := '安装被后台进程阻止：可能存在管理员权限运行的旧版 WorkDaddy，当前安装程序无法确认并停止它。请先退出 WorkBuddy；仍无法安装时，请右键以管理员身份运行本安装包一次完成迁移。';
 end;

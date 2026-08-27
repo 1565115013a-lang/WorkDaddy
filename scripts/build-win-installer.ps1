@@ -65,8 +65,6 @@ try {
   if (-not (Test-Path -LiteralPath $prompt -PathType Leaf)) {
     throw 'The ZIP payload is missing 安装失败自主解决提示词.txt.'
   }
-  Copy-Item -LiteralPath $prompt -Destination (Join-Path $stageRoot 'troubleshooting.txt') -Force
-
   $iss = Join-Path $scriptsRoot 'win\workdaddy.iss'
   $args = @(
     "/DAppVersion=$version",

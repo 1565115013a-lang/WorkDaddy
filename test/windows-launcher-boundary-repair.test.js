@@ -14,6 +14,7 @@ const installerSource = fs.readFileSync(path.join(root, 'scripts', 'win', 'workd
 const chineseLanguageSource = fs.readFileSync(path.join(root, 'scripts', 'win', 'ChineseSimplified.isl'), 'utf8');
 const boundarySource = fs.readFileSync(path.join(root, 'scripts', 'windows-process-boundary.js'), 'utf8');
 const powershellSource = fs.readFileSync(path.join(root, 'scripts', 'windows-process-boundary.ps1'), 'utf8');
+const standardRelaunchSource = fs.readFileSync(path.join(root, 'scripts', 'windows-relaunch-standard.ps1'), 'utf8');
 const boundary = require('../scripts/windows-process-boundary.js');
 
 const resolveWindows = (value) => path.win32.normalize(value);
@@ -118,8 +119,8 @@ test('launcher enumerates exact lifecycle entries and never kills process trees'
   assert.match(launcherSource, /uniqueNodeProcess\(nodeBin, DAEMON_SCRIPT\)/);
   assert.match(launcherSource, /queryNodeProcesses\(nodeBin, null, path\.basename\(expectedScript\)\)/);
   assert.match(launcherSource, /watchdog\.pid 已从陈旧 PID=/);
-  assert.match(launcherSource, /普通权限 launcher 复用现有服务/);
-  assert.match(launcherSource, /exactDaemonStatus\(nodeBin, status, true\)/);
+  assert.match(launcherSource, /普通权限 launcher 复用已验证的 elevated 服务/);
+  assert.match(launcherSource, /assertAuthenticatedDaemonCapability/);
   assert.match(launcherSource, /assertSameProcessIdentity/);
   assert.match(launcherSource, /requireCurrentOwner:\s*true/);
   for (const source of [launcherSource, daemonSource, watchdogSource]) {
@@ -127,6 +128,47 @@ test('launcher enumerates exact lifecycle entries and never kills process trees'
     assert.match(source, /windows-process-boundary\.ps1/);
     assert.match(source, /-ExecutionPolicy['"],\s*['"]Bypass/);
   }
+});
+
+test('elevated launcher relaunches through the desktop shell before starting lifecycle processes', () => {
+  assert.match(launcherSource, /windows-relaunch-standard\.ps1/);
+  assert.match(launcherSource, /--desktop-shell-relaunch/);
+  assert.ok(
+    launcherSource.indexOf('relaunchWithDesktopShell') < launcherSource.indexOf('await ensureDaemon(nodeBin)'),
+    'privilege normalization must happen before the daemon lifecycle starts'
+  );
+  assert.match(standardRelaunchSource, /Shell\.Application/);
+  assert.match(standardRelaunchSource, /ShellExecute/);
+  assert.doesNotMatch(standardRelaunchSource, /runas/i);
+});
+
+test('authenticated daemon capability binds token-only status to profile, data directory, and listener PID', () => {
+  const status = {
+    ok: true,
+    pid: 716,
+    version: '1.1.1',
+    buildId: 'old-build',
+    privilege: 'elevated',
+    dataDir: 'C:\\Users\\alice\\AppData\\Roaming\\WorkDaddy',
+    profile: { id: 'workbuddy-cn' },
+  };
+  const input = {
+    status,
+    expectedProfileId: 'workbuddy-cn',
+    expectedVersion: '1.1.1',
+    expectedDataDir: status.dataDir,
+    listenerPids: [716],
+  };
+  assert.equal(boundary.assertAuthenticatedDaemonCapability(input).pid, 716);
+  assert.throws(() => boundary.assertAuthenticatedDaemonCapability({ ...input, listenerPids: [717] }), /listener|PID/i);
+  assert.throws(() => boundary.assertAuthenticatedDaemonCapability({ ...input, status: { ...status, dataDir: 'C:\\Other' } }), /data|目录/i);
+  assert.throws(() => boundary.assertAuthenticatedDaemonCapability({ ...input, status: { ...status, profile: { id: 'workbuddy-ai' } } }), /profile/i);
+  assert.throws(() => boundary.assertAuthenticatedDaemonCapability({ ...input, status: { ...status, version: '1.1.0' } }), /version/i);
+  assert.equal(boundary.assertAuthenticatedDaemonCapability({
+    ...input,
+    status: { ...status, version: '1.1.0' },
+    allowVersionMismatch: true,
+  }).version, '1.1.0');
 });
 
 test('launcher retries while daemon listener is ready before status', () => {
@@ -273,6 +315,10 @@ test('Windows cold-start guards an already running WorkBuddy and sends a native 
   assert.match(launcherSource, /NotifyIcon/);
   assert.match(launcherSource, /spawnSync\(powershell/);
   assert.match(launcherSource, /if \(requireWorkBuddyClosedBeforeLaunch\(\)\) process\.exit\(0\)/);
+  assert.ok(
+    launcherSource.indexOf('if (await isWorkBuddyCdp())') < launcherSource.indexOf('if (requireWorkBuddyClosedBeforeLaunch())'),
+    'an already-debuggable WorkBuddy must be injected before the cold-start guard'
+  );
   assert.match(launcherSource, /showWindowsNotification\('WorkBuddy', '正在打开 WorkBuddy，请稍等…'\)/);
 });
 
