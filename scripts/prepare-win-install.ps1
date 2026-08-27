@@ -7,12 +7,9 @@ param(
 try {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-  if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -ne $false) {
-    [Console]::Error.WriteLine('Refusing to prepare WorkDaddy installation with elevated privileges.')
-    exit 5
-  }
+  $privilege = if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { 'elevated' } else { 'standard' }
 } catch {
-  [Console]::Error.WriteLine('Cannot verify that the installer is running as a standard user.')
+  [Console]::Error.WriteLine('Cannot determine the Windows privilege mode for the installer.')
   exit 5
 }
 
@@ -23,7 +20,7 @@ $diagnosticFile = Join-Path ([IO.Path]::GetTempPath()) 'WorkDaddy-prepare-instal
 try {
   [IO.File]::AppendAllText(
     $diagnosticFile,
-    ('[' + [DateTime]::UtcNow.ToString('o') + '] start profile=' + $Profile + ' appDir=' + $AppDir + [Environment]::NewLine),
+    ('[' + [DateTime]::UtcNow.ToString('o') + '] start profile=' + $Profile + ' privilege=' + $privilege + ' appDir=' + $AppDir + [Environment]::NewLine),
     (New-Object Text.UTF8Encoding($false)))
   . $BoundaryPath
   $dataRoot = Join-Path $env:APPDATA 'WorkDaddy'

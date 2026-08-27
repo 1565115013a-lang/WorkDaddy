@@ -17,7 +17,7 @@ const os = require('os');
 const { spawn, spawnSync } = require('child_process');
 const {
   assertSameProcessIdentity,
-  assertStandardWindowsPrivilege,
+  detectWindowsPrivilege,
   assertVerifiedNodeProcess,
   buildNativeProcessQuery,
   filterVerifiedNodeProcesses,
@@ -25,7 +25,7 @@ const {
 } = require('./windows-process-boundary.js');
 const { getProfile, profileDataDir } = require('./profiles.js');
 
-if (process.platform === 'win32') assertStandardWindowsPrivilege();
+const WINDOWS_PRIVILEGE = process.platform === 'win32' ? detectWindowsPrivilege() : 'standard';
 
 const SCRIPTS_DIR = __dirname;
 const PROFILE_ID = process.env.WBSWITCH_PROFILE || 'workbuddy-cn';

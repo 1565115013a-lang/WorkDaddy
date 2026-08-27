@@ -98,6 +98,8 @@ begin
     Result := '无法启动安装前的 WorkDaddy 进程检查。';
     exit;
   end;
-  if ResultCode <> 0 then
+  if ResultCode = 5 then
+    Result := '安装前检查无法确认 Windows 权限模式。请直接双击安装程序重试；如使用了企业安全策略，请联系管理员。'
+  else if ResultCode <> 0 then
     Result := '无法安全停止现有 WorkDaddy 进程（退出码 ' + IntToStr(ResultCode) + '）。请完全退出客户端后重试。';
 end;

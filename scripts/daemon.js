@@ -29,17 +29,17 @@ const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 const {
   assertSameProcessIdentity,
-  assertStandardWindowsPrivilege,
+  detectWindowsPrivilege,
   buildNativeProcessQuery,
   filterVerifiedWindowsProcesses,
   parseCimProcessResult,
   resolveWindowsExecutable,
   sameWindowsPath,
   selectRunningProfileBinary,
-  selectUniqueDiscoveredBinary,
+  selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
 const DAEMON_PRIVILEGE = process.platform === 'win32'
-  ? assertStandardWindowsPrivilege()
+  ? detectWindowsPrivilege()
   : 'standard';
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
@@ -1755,7 +1755,10 @@ function resolveWorkBuddyBinary() {
     '}',
   ].join('; ');
   for (const candidate of psCmd(command).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) addCandidate(candidate);
-  const selected = selectUniqueDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  const selected = selectPreferredDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  if (discovered.length > 1) {
+    log('检测到多个 dormant WorkBuddy 安装目录，按发现优先级选择: ' + selected);
+  }
   return selected ? (wbBinaryCache = selected) : null;
 }
 
@@ -3186,7 +3189,7 @@ function replaceFileWithRetry(file, content, mode) {
   const tmp = `${file}.wbs-tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   fs.writeFileSync(tmp, content, 'utf8');
   if (mode !== undefined) fs.chmodSync(tmp, mode);
-  const maxAttempts = process.platform === 'win32' ? 15 : 1;
+  const maxAttempts = process.platform === 'win32' ? 80 : 1;
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -3195,10 +3198,17 @@ function replaceFileWithRetry(file, content, mode) {
     } catch (error) {
       lastError = error;
       const retryable = process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error && error.code);
-      if (!retryable || attempt === maxAttempts) throw error;
-      sleepSync(75);
+      if (!retryable || attempt === maxAttempts) break;
+      // A stale read-only attribute can surface as EPERM independently of a
+      // sharing violation. Clearing it is limited to this known config file;
+      // the atomic rename remains the only successful write path.
+      if (attempt === 1 && error && error.code === 'EPERM') {
+        try { fs.chmodSync(file, 0o666); } catch (_) {}
+      }
+      sleepSync(Math.min(250, 50 + attempt * 10));
     }
   }
+  try { fs.unlinkSync(tmp); } catch (_) {}
   throw lastError;
 }
 

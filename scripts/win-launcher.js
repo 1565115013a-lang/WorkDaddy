@@ -8,7 +8,8 @@
  *   3) 否则以自动选择的 CDP 端口启动 → 等端口 → 注入
  *
  * 由 launcher.cmd 调用（cmd 负责兜底找 node），也可 node win-launcher.js 直接运行。
- * 所有操作用户态完成（HKCU / %LOCALAPPDATA% / %APPDATA%），无需管理员权限。
+ * 默认按普通用户运行；用户明确以管理员身份启动时，整条 launcher/daemon
+ * 链路继承 elevated 模式并在状态中校验，避免混用两个权限层级。
  */
 'use strict';
 
@@ -22,7 +23,7 @@ const {
   assertDaemonServiceIdentity,
   assertDaemonTerminationIdentity,
   assertSameProcessIdentity,
-  assertStandardWindowsPrivilege,
+  detectWindowsPrivilege,
   assertVerifiedNodeProcess,
   buildNativeProcessQuery,
   filterVerifiedNodeProcesses,
@@ -31,11 +32,12 @@ const {
   resolveWindowsExecutable,
   sameWindowsPath,
   selectRunningProfileBinary,
-  selectUniqueDiscoveredBinary,
+  selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
+let WINDOWS_PRIVILEGE = 'standard';
 if (process.platform === 'win32') {
   try {
-    assertStandardWindowsPrivilege();
+    WINDOWS_PRIVILEGE = detectWindowsPrivilege();
   } catch (error) {
     console.error(error.message);
     process.exit(5);
@@ -439,7 +441,9 @@ function findNode() {
   try {
     if (fs.existsSync(bundled)) return resolveWindowsExecutable(bundled);
   } catch (_) {}
-  if (verDirs.length) return resolveWindowsExecutable(verDirs[verDirs.length - 1]);
+  if (verDirs.length) {
+    try { return resolveWindowsExecutable(verDirs[verDirs.length - 1]); } catch (_) {}
+  }
   try {
     const r = spawnSync('where.exe', ['node.exe'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
     const candidate = String(r.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
@@ -541,7 +545,10 @@ function findWorkBuddy() {
     '}',
   ].join('; ');
   for (const candidate of bestEffortPowerShellLines(scanCommand, '安装目录扫描')) addCandidate(candidate);
-  const selected = selectUniqueDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  const selected = selectPreferredDiscoveredBinary(PROFILE_BINARY_NAMES, discovered);
+  if (discovered.length > 1) {
+    log('检测到多个 dormant WorkBuddy 安装目录，按发现优先级选择: ' + selected);
+  }
   return selected ? (wbBinaryCache = selected) : null;
 }
 
@@ -566,10 +573,14 @@ function listenerPids(port) {
   return [...pids];
 }
 
-function queryNodeProcesses(nodeBin, pids = null) {
+function queryNodeProcesses(nodeBin, pids = null, commandLineHint = '') {
   if (!nodeBin) throw new Error('Node 运行时路径缺失，无法验证进程');
   const expectedNode = powershellLiteral(nodeBin);
   let source = `Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" -ErrorAction Stop | Where-Object { $_.ExecutablePath -ieq ${expectedNode} }`;
+  if (commandLineHint) {
+    const hint = String(commandLineHint).replace(/'/g, "''");
+    source += ` | Where-Object { $_.CommandLine -like '*${hint}*' }`;
+  }
   if (pids !== null) {
     const safePids = [...new Set(pids.map(Number))];
     if (!safePids.length) return [];
@@ -590,7 +601,11 @@ function queryNodeProcesses(nodeBin, pids = null) {
 }
 
 function uniqueNodeProcess(nodeBin, expectedScript) {
-  const matches = filterVerifiedNodeProcesses(nodeBin, expectedScript, queryNodeProcesses(nodeBin));
+  const matches = filterVerifiedNodeProcesses(
+    nodeBin,
+    expectedScript,
+    queryNodeProcesses(nodeBin, null, path.basename(expectedScript))
+  );
   if (matches.length > 1) throw new Error(`目标 Node 入口存在多个进程: ${expectedScript}`);
   return matches[0] || null;
 }
@@ -611,9 +626,21 @@ function watchdogState(nodeBin) {
   const pid = readWatchdogPid();
   const exact = uniqueNodeProcess(nodeBin, WATCHDOG_SCRIPT);
   if (!pid) return exact ? { kind: 'untracked', pid: null, process: exact } : { kind: 'absent', pid: null };
-  const processes = queryNodeProcesses(nodeBin, [pid]);
+  let processes;
+  try {
+    processes = queryNodeProcesses(nodeBin, [pid], path.basename(WATCHDOG_SCRIPT));
+  } catch (error) {
+    if (!exact || exact.ProcessId === pid) throw error;
+    processes = [];
+  }
   if (processes.length === 0) {
-    if (exact) throw new Error('watchdog.pid 指向不存在的 PID，但发现了另一个精确 watchdog 进程');
+    if (exact) {
+      const current = readWatchdogPid();
+      if (current !== pid) throw new Error('watchdog.pid 在修复前发生变化');
+      fs.writeFileSync(WATCHDOG_PID_FILE, String(exact.ProcessId), 'utf8');
+      log(`watchdog.pid 已从陈旧 PID=${pid} 修复为精确 PID=${exact.ProcessId}`);
+      return { kind: 'verified', pid: exact.ProcessId, process: exact };
+    }
     return { kind: 'stale', pid };
   }
   const process = assertVerifiedNodeProcess(pid, nodeBin, WATCHDOG_SCRIPT, processes);
@@ -634,7 +661,7 @@ function validateDaemonProcess(nodeBin, status = null) {
   return { listenerPids: listeners, nodeProcesses: processes };
 }
 
-function exactDaemonStatus(nodeBin, status) {
+function exactDaemonStatus(nodeBin, status, allowPrivilegeMismatch = false) {
   const identity = readDaemonIdentity();
   const processIdentity = validateDaemonProcess(nodeBin, status);
   assertDaemonServiceIdentity({
@@ -645,6 +672,7 @@ function exactDaemonStatus(nodeBin, status) {
     listenerPids: processIdentity.listenerPids,
     expectedNode: nodeBin,
     expectedScript: DAEMON_SCRIPT,
+    expectedPrivilege: allowPrivilegeMismatch ? '' : WINDOWS_PRIVILEGE,
     nodeProcesses: processIdentity.nodeProcesses,
   });
   return status;
@@ -685,7 +713,7 @@ function killVerifiedNodeProcess(process, nodeBin, expectedScript) {
   return true;
 }
 
-function authorizeDaemonTermination(nodeBin, status) {
+function authorizeDaemonTermination(nodeBin, status, allowLowerPrivilege = false) {
   const processIdentity = validateDaemonProcess(nodeBin, status);
   return assertDaemonTerminationIdentity({
     status,
@@ -693,6 +721,7 @@ function authorizeDaemonTermination(nodeBin, status) {
     listenerPids: processIdentity.listenerPids,
     expectedNode: nodeBin,
     expectedScript: DAEMON_SCRIPT,
+    expectedPrivilege: allowLowerPrivilege ? '' : WINDOWS_PRIVILEGE,
     nodeProcesses: processIdentity.nodeProcesses,
   });
 }
@@ -704,7 +733,7 @@ function removeWatchdogPidIf(pid) {
   fs.unlinkSync(WATCHDOG_PID_FILE);
 }
 
-async function stopDaemonByPort(nodeBin) {
+async function stopDaemonByPort(nodeBin, allowLowerPrivilege = false) {
   const watchdog = watchdogState(nodeBin);
   if (watchdog.kind === 'untracked') {
     throw new Error('发现没有当前 profile PID 文件的 watchdog 进程，拒绝复用或结束');
@@ -722,12 +751,12 @@ async function stopDaemonByPort(nodeBin) {
     if (!status || listeners.length !== 1) {
       throw new Error('daemon 未绑定当前 UI 端口与当前 profile 状态，拒绝结束');
     }
-    authorizedDaemon = authorizeDaemonTermination(nodeBin, status);
+    authorizedDaemon = authorizeDaemonTermination(nodeBin, status, allowLowerPrivilege);
     if (!daemon || daemon.ProcessId !== authorizedDaemon.ProcessId) {
       throw new Error('daemon 监听 PID 与枚举到的精确 daemon 进程不一致');
     }
     const identity = readDaemonIdentity();
-    if (status.version === identity.version && status.buildId === identity.buildId) {
+    if (!allowLowerPrivilege && status.version === identity.version && status.buildId === identity.buildId) {
       throw new Error('daemon 版本与构建已匹配，拒绝结束当前实例');
     }
   }
@@ -753,15 +782,41 @@ async function ensureDaemon(nodeBin) {
   const status = await readStatus();
   const listeners = listenerPids(UI_PORT);
   if (status || listeners.length) {
-    authorizeDaemonTermination(nodeBin, status);
-    const identity = readDaemonIdentity();
-    if (status.version === identity.version && status.buildId === identity.buildId) {
-      exactDaemonStatus(nodeBin, status);
-      log('daemon 身份、版本、构建和权限均已验证，跳过启动');
-      return true;
+    let upgradedPrivilege = false;
+    try {
+      authorizeDaemonTermination(nodeBin, status);
+    } catch (error) {
+      // An explicitly elevated launcher may replace an older standard daemon.
+      // The inverse transition is refused because a standard process cannot
+      // safely terminate an elevated one.
+      if (WINDOWS_PRIVILEGE === 'elevated' && status && status.privilege === 'standard') {
+        log('检测到旧 daemon 为 standard，当前 launcher 为 elevated，准备升级权限模式');
+        await stopDaemonByPort(nodeBin, true);
+        upgradedPrivilege = true;
+      } else if (WINDOWS_PRIVILEGE === 'standard' && status && status.privilege === 'elevated') {
+        // 普通权限无法安全终止 elevated daemon。若其身份、版本和构建均已
+        // 匹配，则复用这个同用户、同 profile 的服务，让桌面快捷方式可幂等打开。
+        const identity = readDaemonIdentity();
+        if (status.version === identity.version && status.buildId === identity.buildId) {
+          exactDaemonStatus(nodeBin, status, true);
+          log('检测到已匹配的 elevated daemon，普通权限 launcher 复用现有服务');
+          return true;
+        }
+        throw error;
+      } else {
+        throw error;
+      }
     }
-    log('daemon 版本或构建不匹配，停止已绑定当前 profile 的旧进程');
-    await stopDaemonByPort(nodeBin);
+    if (!upgradedPrivilege) {
+      const identity = readDaemonIdentity();
+      if (status.version === identity.version && status.buildId === identity.buildId) {
+        exactDaemonStatus(nodeBin, status);
+        log('daemon 身份、版本、构建和权限均已验证，跳过启动');
+        return true;
+      }
+      log('daemon 版本或构建不匹配，停止已绑定当前 profile 的旧进程');
+      await stopDaemonByPort(nodeBin);
+    }
   }
 
   let watchdog = watchdogState(nodeBin);
@@ -887,7 +942,7 @@ async function quitWorkBuddy(binary) {
   log(`[exit] 无法确认退出 profile=${PROFILE.id} final=${JSON.stringify(final)}`);
   const names = final.processes.map((p) => p.name).filter(Boolean).join(',') || 'unknown';
   const pidsLeft = final.processes.map((p) => p.pid).filter(Boolean).join(',') || 'unknown';
-  throw new Error(`${PROFILE.name} 无法以普通用户权限安全退出（剩余镜像=${names}; PID=${pidsLeft}）。请手动关闭该程序；若它以管理员身份运行，请先退出后再重试`);
+  throw new Error(`${PROFILE.name} 无法在当前权限模式下安全退出（剩余镜像=${names}; PID=${pidsLeft}）。请手动关闭该程序，并用相同权限重新启动 WorkDaddy`);
 }
 
 function launchWorkBuddy(wb) {
@@ -1052,7 +1107,7 @@ if (require.main === module) (async () => {
     return;
   }
 
-  log('重启 WorkBuddy（带 --remote-debugging-port=' + CDP_PORT + '，GUI 使用当前用户权限）: ' + wb);
+  log('重启 WorkBuddy（带 --remote-debugging-port=' + CDP_PORT + '，GUI 继承当前启动权限）: ' + wb);
   console.log('正在以调试模式重启 WorkBuddy（约几秒）...');
   showWindowsNotification('WorkBuddy', '正在打开 WorkBuddy，请稍等…');
 
