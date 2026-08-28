@@ -123,11 +123,22 @@ test('launcher enumerates exact lifecycle entries and never kills process trees'
   assert.match(launcherSource, /assertAuthenticatedDaemonCapability/);
   assert.match(launcherSource, /assertSameProcessIdentity/);
   assert.match(launcherSource, /requireCurrentOwner:\s*true/);
+  assert.match(launcherSource, /taskkill 非零但目标 PID 已消失，按竞态成功处理/);
+  assert.match(launcherSource, /verifyGone && await verifyGone\(\)/);
+  assert.match(launcherSource, /queryNodeProcesses\(nodeBin, \[pid\]\)\.length === 0/);
   for (const source of [launcherSource, daemonSource, watchdogSource]) {
     assert.match(source, /buildNativeProcessQuery/);
     assert.match(source, /windows-process-boundary\.ps1/);
     assert.match(source, /-ExecutionPolicy['"],\s*['"]Bypass/);
   }
+});
+
+test('installer boundary releases the exact profile launcher and waits for its runtime lock', () => {
+  assert.match(powershellSource, /Get-VerifiedNodeProcessesForScript -ExpectedScript \$expectedLauncherScript/);
+  assert.match(powershellSource, /foreach \(\$launcher in \$launchers\) \{ Stop-VerifiedProcess -Process \$launcher \}/);
+  assert.match(powershellSource, /function Wait-VerifiedFileUnlocked/);
+  assert.match(powershellSource, /Wait-VerifiedFileUnlocked -Path \(Join-Path \$scriptsDir 'runtime\\node\\node\.exe'\)/);
+  assert.match(powershellSource, /function Get-VerifiedNodeProcessesForScript/);
 });
 
 test('elevated launcher relaunches through the desktop shell before starting lifecycle processes', () => {
@@ -137,9 +148,33 @@ test('elevated launcher relaunches through the desktop shell before starting lif
     launcherSource.indexOf('relaunchWithDesktopShell') < launcherSource.indexOf('await ensureDaemon(nodeBin)'),
     'privilege normalization must happen before the daemon lifecycle starts'
   );
-  assert.match(standardRelaunchSource, /Shell\.Application/);
+  assert.match(standardRelaunchSource, /\.Windows\(\)/);
+  assert.match(standardRelaunchSource, /FindWindowSW/);
+  assert.match(standardRelaunchSource, /\.Document\.Application/);
   assert.match(standardRelaunchSource, /ShellExecute/);
   assert.doesNotMatch(standardRelaunchSource, /runas/i);
+  assert.match(launcherSource, /仍返回 elevated token[\s\S]*showWindowsMessageBox[\s\S]*拒绝启动管理员权限/);
+});
+
+test('hidden Windows launch failures remain visible to the desktop user', () => {
+  const hiddenSource = hiddenLauncherSource;
+  const catchSource = launcherSource.slice(launcherSource.indexOf('})().catch((e) =>'));
+  assert.match(catchSource, /showWindowsMessageBox/);
+  assert.match(hiddenSource, /If status <> 0 And status <> 4 Then/);
+  assert.match(hiddenSource, /MsgBox/);
+});
+
+test('Windows launcher derives and propagates its real installation root', () => {
+  assert.match(launcherSource, /const WORKDADDY_APP_DIR = path\.resolve\(SCRIPTS_DIR, '\.\.'\)/);
+  assert.match(launcherSource, /process\.env\.WBSWITCH_APP_DIR = WORKDADDY_APP_DIR/);
+  assert.match(daemonSource, /process\.env\.WBSWITCH_APP_DIR \|\| path\.resolve\(__dirname, '\.\.'\)/);
+});
+
+test('CIM process disappearance is treated as an empty snapshot, not a launcher failure', () => {
+  assert.match(boundarySource, /allowTransientNotFound/);
+  assert.match(boundarySource, /0x80041002/);
+  assert.match(launcherSource, /allowTransientNotFound:\s*true/);
+  assert.match(watchdogSource, /allowTransientNotFound:\s*true/);
 });
 
 test('authenticated daemon capability binds token-only status to profile, data directory, and listener PID', () => {
@@ -225,7 +260,7 @@ test('daemon termination authorization is bound to current profile status and li
   );
 });
 
-test('launcher never adopts untracked watchdogs or kills unbound daemon entries', () => {
+test('launcher repairs a missing PID file only for one exact watchdog and never kills unbound daemon entries', () => {
   const stateSource = launcherSource.slice(
     launcherSource.indexOf('function watchdogState'),
     launcherSource.indexOf('function validateDaemonProcess')
@@ -238,9 +273,11 @@ test('launcher never adopts untracked watchdogs or kills unbound daemon entries'
     launcherSource.indexOf('async function ensureDaemon'),
     launcherSource.indexOf('// ---------- 2/3.')
   );
-  assert.match(stateSource, /!pid[\s\S]*kind:\s*'untracked'/);
+  assert.match(stateSource, /!pid[\s\S]*fs\.writeFileSync\(WATCHDOG_PID_FILE, String\(exact\.ProcessId\)/);
+  assert.match(stateSource, /通过精确身份恢复缺失的 watchdog\.pid/);
   assert.match(stopSource, /watchdog\.kind === 'untracked'[\s\S]*throw new Error/);
   assert.match(ensureSource, /watchdog\.kind === 'untracked'[\s\S]*throw new Error/);
+  assert.match(ensureSource, /if \(watchdog\.kind === 'verified'\)/);
   assert.match(stopSource, /authorizeDaemonTermination/);
   assert.doesNotMatch(stopSource, /remainingDaemon[\s\S]*killVerifiedNodeProcess\(remainingDaemon/);
   const untrackedGuard = stopSource.indexOf("watchdog.kind === 'untracked'");
@@ -273,6 +310,19 @@ test('Windows launcher reconciles a reused PID file to an exact watchdog', () =>
   assert.match(stateSource, /watchdog\.pid 在修复前发生变化/);
 });
 
+test('Windows launcher waits for a watchdog PID file startup race before rejecting it', () => {
+  assert.match(launcherSource, /async function watchdogState\(nodeBin\)/);
+  assert.match(launcherSource, /for \(let attempt = 0; attempt < 10 && !pid; attempt \+= 1\)/);
+  assert.match(launcherSource, /await sleep\(250\)/);
+  assert.match(launcherSource, /if \(!pid && exact\)[\s\S]*通过精确身份恢复缺失的 watchdog\.pid/);
+});
+
+test('Windows launcher ignores WorkBuddy AI headless prewarm helpers during cold start', () => {
+  assert.match(launcherSource, /function isPrewarmProcess\(process\)/);
+  assert.match(launcherSource, /--prewarm/);
+  assert.match(launcherSource, /getWorkBuddyProcesses\(\)\.filter\(\(process\) => !isPrewarmProcess\(process\)\)/);
+});
+
 test('Windows process queries are scoped to the selected Node runtime', () => {
   assert.match(launcherSource, /ExecutablePath -ieq/);
   assert.match(watchdogSource, /ExecutablePath -ieq/);
@@ -293,8 +343,8 @@ test('verified launcher lock cleanup handles repeated hidden launches', () => {
   assert.match(hiddenLauncherSource, /shell\.Run\(command, 0, True\)/);
 });
 
-test('desktop launcher is silent and diagnostics tolerate a transient CIM failure', () => {
-  assert.doesNotMatch(hiddenLauncherSource, /MsgBox/i);
+test('desktop launcher only reports failures not already shown by Node', () => {
+  assert.match(hiddenLauncherSource, /If status <> 0 And status <> 4 Then/);
   assert.match(hiddenLauncherSource, /WScript\.Quit status/);
   assert.match(launcherSource, /function processDiagnostics\(binary = null\) \{[\s\S]*try \{[\s\S]*catch \(error\)[\s\S]*return \[\];[\s\S]*\}/);
   assert.match(launcherSource, /进程诊断暂不可用/);
@@ -308,22 +358,22 @@ test('Windows installer uses the bundled Simplified Chinese wizard and profile b
   assert.match(chineseLanguageSource, /LanguageName=简体中文/);
 });
 
-test('Windows cold-start guards an already running WorkBuddy and sends a native notification', () => {
+test('Windows cold-start restarts the verified current-profile WorkBuddy and sends a native notification', () => {
   assert.match(launcherSource, /function requireWorkBuddyClosedBeforeLaunch\(\)/);
   assert.match(launcherSource, /请先完全退出 WorkBuddy/);
   assert.match(launcherSource, /function showWindowsNotification\(title, message\)/);
   assert.match(launcherSource, /NotifyIcon/);
   assert.match(launcherSource, /spawnSync\(powershell/);
-  assert.match(launcherSource, /if \(requireWorkBuddyClosedBeforeLaunch\(\)\) process\.exit\(0\)/);
   assert.ok(
-    launcherSource.indexOf('if (await isWorkBuddyCdp())') < launcherSource.indexOf('if (requireWorkBuddyClosedBeforeLaunch())'),
-    'an already-debuggable WorkBuddy must be injected before the cold-start guard'
+    launcherSource.indexOf('const wb = findWorkBuddy()') < launcherSource.indexOf('await quitWorkBuddy(wb)'),
+    'cold start must resolve and verify the target before restarting it'
   );
+  assert.doesNotMatch(launcherSource, /if \(requireWorkBuddyClosedBeforeLaunch\(\)\) process\.exit\(0\)/);
   assert.match(launcherSource, /showWindowsNotification\('WorkBuddy', '正在打开 WorkBuddy，请稍等…'\)/);
 });
 
 test('Windows daemon repairs only missing cwd directories with stored session payloads', () => {
-  assert.match(daemonSource, /const DAEMON_VERSION = '1\.1\.1'/);
+  assert.match(daemonSource, /const DAEMON_VERSION = '\d+\.\d+\.\d+'/);
   assert.match(daemonSource, /function sessionPayloadExists\(wbHome, sessionId\)/);
   assert.match(daemonSource, /function createDirectoryNoFollow\(directory\)/);
   assert.match(daemonSource, /repairMissingSessionWorkspaces\(\)\.catch/);

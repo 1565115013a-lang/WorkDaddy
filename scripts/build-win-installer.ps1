@@ -61,10 +61,6 @@ try {
   if (-not $stagedVersionMatch.Success -or $stagedVersionMatch.Groups[1].Value -ne $version) {
     throw "ZIP 内部 daemon 版本与安装器版本不一致: $($stagedVersionMatch.Groups[1].Value) != $version"
   }
-  $prompt = Join-Path $stageRoot '安装失败自主解决提示词.txt'
-  if (-not (Test-Path -LiteralPath $prompt -PathType Leaf)) {
-    throw 'The ZIP payload is missing 安装失败自主解决提示词.txt.'
-  }
   $iss = Join-Path $scriptsRoot 'win\workdaddy.iss'
   $args = @(
     "/DAppVersion=$version",

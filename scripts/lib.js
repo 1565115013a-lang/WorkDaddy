@@ -145,7 +145,9 @@ function sanitizeModel(model, opts) {
 }
 
 function checkinDisplayValue(record, today, pending) {
-  if (pending || !record || record.date !== today) return null;
+  if (!record || record.date !== today) return null;
+  // 正在签到时保留已确认的成功标记；只有失败/未完成记录才暂不展示，避免首屏把已签到账号误显示为“签到中”。
+  if (pending && !record.ok) return null;
   return { ok: !!record.ok, already: !!record.already, code: record.code, message: record.message };
 }
 

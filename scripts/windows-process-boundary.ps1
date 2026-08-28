@@ -106,7 +106,12 @@ function ConvertTo-WorkDaddyProcessRecord {
       [string]::IsNullOrWhiteSpace([string]$Process.Name) -or
       [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath) -or
       [string]::IsNullOrWhiteSpace([string]$Process.CommandLine)) { throw 'CIM 进程身份字段不完整' }
-  $ownerResult = Invoke-CimMethod -InputObject $Process -MethodName GetOwner -ErrorAction Stop
+  try {
+    $ownerResult = Invoke-CimMethod -InputObject $Process -MethodName GetOwner -ErrorAction Stop
+  } catch {
+    if (Test-CimProcessDisappearedError $_) { return $null }
+    throw
+  }
   if ($ownerResult.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$ownerResult.User)) {
     throw "无法确认 PID $processId 的进程所有者"
   }
@@ -128,6 +133,21 @@ function ConvertTo-WorkDaddyProcessRecord {
     Arguments = $arguments
     Owner = $owner
     OwnerIsCurrent = [StringComparer]::OrdinalIgnoreCase.Equals($owner, $currentOwner)
+  }
+}
+
+function Test-CimProcessDisappearedError {
+  param([Parameter(Mandatory = $true)]$ErrorRecord)
+  $text = [string]$ErrorRecord.Exception + ' ' + [string]$ErrorRecord
+  return $text -match '(?i)(0x80041002|ObjectNotFound|not found|不存在)'
+}
+
+function ConvertTo-WorkDaddyProcessRecordIfPresent {
+  param([Parameter(Mandatory = $true)]$Process)
+  try { return ConvertTo-WorkDaddyProcessRecord -Process $Process }
+  catch {
+    if (Test-CimProcessDisappearedError $_) { return $null }
+    throw
   }
 }
 
@@ -190,6 +210,7 @@ function Get-StrictProcessRecord {
   if ($rows.Count -eq 0) { return $null }
   if ($rows.Count -ne 1) { throw "PID $ProcessId 的 CIM 记录不唯一" }
   $record = ConvertTo-WorkDaddyProcessRecord -Process $rows[0]
+  if ($null -eq $record) { return $null }
   if ([int]$record.ProcessId -ne $ProcessId) { throw "PID $ProcessId 的 CIM 记录不匹配" }
   return $record
 }
@@ -244,6 +265,17 @@ function Get-UniqueNodeProcessForScript {
     [Parameter(Mandatory = $true)][string]$ExpectedScript,
     [int]$ExpectedParentProcessId = 0
   )
+  $matches = @(Get-VerifiedNodeProcessesForScript -ExpectedScript $ExpectedScript -ExpectedParentProcessId $ExpectedParentProcessId)
+  if ($matches.Count -gt 1) { throw "目标 Node 入口存在多个进程: $ExpectedScript" }
+  if ($matches.Count -eq 0) { return $null }
+  return $matches[0]
+}
+
+function Get-VerifiedNodeProcessesForScript {
+  param(
+    [Parameter(Mandatory = $true)][string]$ExpectedScript,
+    [int]$ExpectedParentProcessId = 0
+  )
   $matches = @()
   $scriptName = [IO.Path]::GetFileName($ExpectedScript)
   if ([string]::IsNullOrWhiteSpace($scriptName) -or
@@ -275,9 +307,7 @@ function Get-UniqueNodeProcessForScript {
     if ($null -eq $record) { throw "目标 Node 进程 PID=$processId 在身份验证期间消失" }
     $matches += ,(Assert-NodeProcessIdentity -Process $record -ExpectedPid $processId -ExpectedScript $ExpectedScript)
   }
-  if ($matches.Count -gt 1) { throw "目标 Node 入口存在多个进程: $ExpectedScript" }
-  if ($matches.Count -eq 0) { return $null }
-  return $matches[0]
+  return $matches
 }
 
 function Get-ListeningProcessIdsFromLines {
@@ -401,6 +431,14 @@ function Stop-VerifiedWorkDaddyLifecycle {
     [Parameter(Mandatory = $true)][string]$ExpectedWatchdogScript,
     [Parameter(Mandatory = $true)][string]$ExpectedDaemonScript
   )
+  $scriptsDir = Split-Path -Parent $ExpectedDaemonScript
+  $expectedLauncherScript = Join-Path $scriptsDir 'win-launcher.js'
+  # The launcher itself runs from the packaged Node runtime and can keep
+  # runtime\node\node.exe locked while it waits for CDP or a retry window.
+  # Stop only exact launcher entries under this profile's installation path.
+  $launchers = @(Get-VerifiedNodeProcessesForScript -ExpectedScript $expectedLauncherScript)
+  foreach ($launcher in $launchers) { Stop-VerifiedProcess -Process $launcher }
+
   $pidFile = Join-Path $DataDir 'watchdog.pid'
   $pidFileExists = Test-Path -LiteralPath $pidFile
   $watchdogPid = $null
@@ -505,6 +543,7 @@ function Stop-VerifiedWorkDaddyLifecycle {
     }
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction Stop
   }
+  [void](Wait-VerifiedFileUnlocked -Path (Join-Path $scriptsDir 'runtime\node\node.exe'))
 }
 
 function Assert-DaemonStatusIdentity {
@@ -552,6 +591,16 @@ function Test-ExclusiveFile {
   } finally {
     if ($stream) { $stream.Dispose() }
   }
+}
+
+function Wait-VerifiedFileUnlocked {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $true }
+  for ($attempt = 0; $attempt -lt 30; $attempt++) {
+    if (Test-ExclusiveFile -Path $Path) { return $true }
+    Start-Sleep -Milliseconds 200
+  }
+  throw "文件锁未释放: $Path"
 }
 
 function Release-VerifiedLauncherLock {

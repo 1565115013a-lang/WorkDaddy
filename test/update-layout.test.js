@@ -285,7 +285,8 @@ test('Windows launcher rejects a persisted sibling-profile CDP port', { skip: pr
 test('explicit daemon UI ports never fall through into another profile port', () => {
   const daemon = read('daemon.js');
   assert.match(daemon, /const ALLOW_UI_PORT_FALLBACK = !process\.env\.WBSWITCH_PORT/);
-  assert.match(daemon, /e\.code === 'EADDRINUSE' && ALLOW_UI_PORT_FALLBACK && attempt < 7/);
+  assert.match(daemon, /profileUiPortCandidates\(PROFILE\.id/);
+  assert.match(daemon, /e\.code === 'EADDRINUSE' && attempt \+ 1 < ports\.length/);
 });
 
 test('Windows launcher does not report success when manual injection is not mounted', () => {
@@ -383,16 +384,10 @@ test('release scripts synchronize daemon version and build id', () => {
 
 test('daemon settings writes tolerate transient Windows file locks', () => {
   const daemon = read('daemon.js');
-  const helperStart = daemon.indexOf('function replaceFileWithRetry(');
-  const helperEnd = daemon.indexOf('\n}\n\nfunction writeWorkbuddySettings', helperStart);
-  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'atomic replacement helper must exist');
-  const helper = daemon.slice(helperStart, helperEnd);
-  assert.match(helper, /\.wbs-tmp-\$\{process\.pid\}-\$\{Date\.now\(\)\}-\$\{crypto\.randomBytes\(/);
-  assert.match(helper, /process\.platform === 'win32' \? 80 : 1/);
-  assert.match(helper, /\['EPERM', 'EACCES', 'EBUSY'\]/);
-  assert.match(helper, /sleepSync\(Math\.min\(250, 50 \+ attempt \* 10\)\)/);
-  assert.match(helper, /chmodSync\(file, 0o666\)/);
-  assert.match(helper, /unlinkSync\(tmp\)/);
+  const helper = fs.readFileSync(path.join(repoRoot, 'scripts', 'atomic-file-write.js'), 'utf8');
+  assert.match(helper, /UNKNOWN/);
+  assert.match(helper, /writeFileSync/);
+  assert.match(helper, /renameSync/);
   assert.doesNotMatch(helper, /unlinkSync\(file\)|rmSync\(file\)/);
 
   const settingsStart = daemon.indexOf('function writeWorkbuddySettings(');
@@ -479,11 +474,20 @@ test('Windows launcher searches app-data roots and versioned WorkBuddy installs'
   assert.match(daemon, /Get-ChildItem[\s\S]*-Recurse/);
 });
 
-test('Windows release package includes the troubleshooting prompt as UTF-8', () => {
+test('Windows launcher selects the Node runtime from an actual daemon or watchdog', () => {
+  const launcher = read('win-launcher.js');
+  const findNode = launcher.slice(launcher.indexOf('function findNode()'), launcher.indexOf('// ---------- 定位 WorkBuddy.exe'));
+  assert.match(findNode, /uniqueNodeProcess\(candidate, DAEMON_SCRIPT\)/);
+  assert.match(findNode, /uniqueNodeProcess\(candidate, WATCHDOG_SCRIPT\)/);
+  assert.match(findNode, /if \(candidates\.length\) return candidates\[0\]/);
+  assert.doesNotMatch(findNode, /hasExistingWatchdogState/);
+});
+
+test('Windows release package excludes the troubleshooting prompt', () => {
   const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
   const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'win', 'workdaddy.iss'), 'utf8');
-  assert.match(build, /安装失败自主解决提示词\.txt/);
-  assert.match(installer, /Source: "\{#StageRoot\}\\安装失败自主解决提示词\.txt"/);
+  assert.doesNotMatch(build, /cp\s+.*安装失败自主解决提示词/);
+  assert.doesNotMatch(installer, /Source:.*安装失败自主解决提示词/);
   assert.match(build, /Python zipfile/);
   assert.match(build, /ZIP_DEFLATED/);
 });
@@ -628,6 +632,14 @@ test('daemon lock falls back when the data-directory lock is not writable on Win
   assert.match(daemon, /releaseDaemonLock[\s\S]*daemonLockPath/);
 });
 
+test('Windows daemon lock validates the owner process instead of trusting a reused PID', () => {
+  const daemon = read('daemon.js');
+  const lockBlock = daemon.slice(daemon.indexOf('function isCurrentWindowsDaemonProcess'), daemon.indexOf('function acquireDaemonLock'));
+  assert.match(lockBlock, /Get-CimInstance Win32_Process -Filter/);
+  assert.match(lockBlock, /filterVerifiedNodeProcesses\(item\.ExecutablePath, __filename/);
+  assert.match(daemon, /if \(IS_WIN\) alive = isCurrentWindowsDaemonProcess\(ownerPid\)/);
+});
+
 test('session ranges use last-modified time and preserve standard WorkBuddy workspaces', () => {
   const daemon = read('daemon.js');
   const inject = read('inject.js');
@@ -648,14 +660,14 @@ test('account cards keep the compact three-row layout', () => {
   const script = read('inject.js');
   assert.match(script, /wbs-name-group/);
   assert.match(script, /wbs-secondary-row/);
-  assert.match(script, /剩余积分/);
+  assert.match(script, /剩余<\/span>/);
   assert.match(script, /今日已签到/);
   // 登录有效期展示：国际版也将 token 有效截止时间展示为「有效期至」而非歧义的「登录过期于」
   assert.match(script, /有效期至/);
   assert.doesNotMatch(script, /登录过期于/);
   assert.match(script, /var isUinMode = !a\.phone;/);
   assert.match(script, /var idLbl = a\.phone \? '手机' : \(a\.uin \? 'UIN' : '账号'\)/);
-  assert.match(script, /\.wbs-phone-cell\.wbs-uin-cell\{gap:8px\}/);
+  assert.match(script, /\.wbs-phone-cell\.wbs-uin-cell\{gap:4px\}/);
   // 国际版：签到标签不展示；暂存按钮内联进操作栏按钮组第一位（AI 端无 voice-mic-wrap）
   assert.match(script, /if \(PROFILE_ID === 'workbuddy-ai'\) return '';/);
   assert.match(script, /function findAiToolbar\(\)/);
@@ -686,10 +698,28 @@ test('account cards keep the compact three-row layout', () => {
   assert.match(script, /\.wbs-checkin-tag\.ok\{background:#edf9ef/);
   assert.match(script, /html\.cb-dark \.wbs-checkin-tag\.ok\{/);
   assert.match(script, /今日已签到✓/);
+  assert.match(script, /function accountStatusTagsHtml\(a\)/);
+  assert.match(script, /function checkinBadgeHtml\(a\)/);
+  assert.match(script, /badge \+ checkinBadge/);
+  assert.match(script, /if \(!usage \|\| usage\.synced !== true\) return '';/);
+  assert.match(script, /wbs-usage-tag/);
+  assert.match(script, /wbs-usage-tag[^\n]+今日已使用[^\n]+CREDIT_ICON/);
+  assert.match(script, /wbs-usage-tag[^\n]+<b>\x27 \+ fmtCredits\(used\) \+ \x27<\/b>/);
+  assert.match(script, /\.wbs-phone-cell \.wbs-lbl,\.wbs-credit-left \.wbs-lbl\{width:28px\}/);
+  assert.match(script, /if \(!isFinite\(used\) \|\| used <= 0\) return '';/);
+  assert.match(script, /wbs-credit-left/);
+  assert.doesNotMatch(script, /今日已用/);
   assert.doesNotMatch(script, /wbs-token-expired/);
   assert.doesNotMatch(script, /按到期时间排序/);
   assert.doesNotMatch(script, /个额度/);
   assert.doesNotMatch(script, /wbs-checkin-cell/);
+});
+
+test('account cards place the current logged-in account first', () => {
+  const script = read('inject.js');
+  assert.match(script, /state\.current = data\.current;\s*state\.accounts = \(data\.accounts \|\| \[\]\)\.slice\(\);/);
+  assert.match(script, /state\.accounts\.sort\(function \(left, right\) \{[\s\S]*left\.uid === state\.current\.uid[\s\S]*right\.uid === state\.current\.uid[\s\S]*return leftIsCurrent \? -1 : 1;[\s\S]*\}\);/);
+  assert.match(script, /function sortAccountsByCreditExpiry\(\) \{[\s\S]*isCurrent:[\s\S]*if \(a\.isCurrent !== b\.isCurrent\) return a\.isCurrent \? -1 : 1;[\s\S]*if \(a\.expiresAt !== b\.expiresAt\)/);
 });
 
 test('quick-phrase layering does not reposition WorkBuddy native chat toolbar', () => {
@@ -729,26 +759,19 @@ test('robot button decorations remain visible alongside the eye states', () => {
   assert.match(script, /\.wbs-fab \.click \.button \.speak~\.speak\{display:none\}/);
 });
 
-test('home composer keeps the robot button at the WorkBuddy bottom-right', () => {
+test('robot button defaults to the window bottom-right and snaps right after free dragging', () => {
   const script = read('inject.js');
-  assert.match(script, /\.wb-home-page \[class\*="_topRightSlotStandalone_"\] > div:nth-child\(1\) > div:nth-child\(3\)/);
-  assert.match(script, /fab\.style\.right = '22px';\s*fab\.style\.bottom = '22px';/);
-});
-
-test('WorkBuddy AI welcome composer keeps the robot at the window bottom-right', () => {
-  const script = read('inject.js');
-  assert.match(script, /PROFILE_ID === 'workbuddy-ai'/);
-  assert.match(script, /_topRightSlotStandalone_\"\] > div:nth-child\(1\) > div:nth-child\(2\)/);
-  assert.match(script, /aiHomeComposerCorner/);
-});
-
-test('WorkBuddy AI chat composer anchors the robot when the queue is absent', () => {
-  const script = read('inject.js');
-  assert.match(script, /if \(!target && WBS_PROFILE_IS_AI\)/);
-  assert.match(script, /\.conversation-input-area \.conversation-input \.cr-input-box \.cr-input-container/);
-  assert.match(script, /\.conversation-input-area \.cr-input-container/);
-  assert.match(script, /var air = aiInput\.getBoundingClientRect\(\)/);
-  assert.match(script, /if \(!target\) \{\s*var ma = document\.querySelector\('\[class\*="_input-area-container_"\]/);
+  assert.match(script, /FAB_POSITION_KEY = 'wbs-fab-bottom-' \+ PROFILE_ID/);
+  assert.match(script, /setPointerCapture\(e\.pointerId\)/);
+  assert.match(script, /FAB_DRAG_THRESHOLD = 6/);
+  assert.match(script, /fabDrag\.startRight - deltaX/);
+  assert.match(script, /fabDrag\.startBottom - deltaY/);
+  assert.match(script, /applyFabPosition\(fab, FAB_EDGE_GAP, bottom\)/);
+  assert.match(script, /localStorage\.setItem\(FAB_POSITION_KEY/);
+  assert.match(script, /touchAction = 'none'/);
+  assert.match(script, /is-snapping/);
+  assert.match(script, /cubic-bezier\(\.22,1\.35,\.36,1\)/);
+  assert.doesNotMatch(script, /homeComposerCorner|aiHomeComposerCorner|cb-message-queue\.cb-expand/);
 });
 
 test('installers disable login auto-start and clean prior registrations', () => {
@@ -1027,7 +1050,8 @@ test('session summary counts effective sessions and models tab only exposes sani
   assert.match(inject, /签到请求完成后再查询积分/);
   assert.match(inject, /fetchCreditsForAccounts\(\);/);
   assert.match(read('lib.js'), /function checkinDisplayValue\(record, today, pending\)/);
-  assert.match(daemon, /checkin: checkinDisplayValue\(c, today, checkinPending\)/);
+  assert.match(daemon, /CREDIT_USAGE_STORE\.listDailyCheckins/);
+  assert.match(daemon, /checkin: checkinDisplayValue\(checked, today, checkinPending\)/);
   assert.doesNotMatch(inject, /id="wbs-model-refresh"/);
   assert.match(inject, /wbs-model-group-title/);
   assert.match(inject, /delete-official/);

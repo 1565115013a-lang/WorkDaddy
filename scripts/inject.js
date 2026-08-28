@@ -426,7 +426,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var msg = c.message || '';
     // 国际版/活动空窗期：接口 code 10001 且文案表明「活动未开启/未开始/已过期」时，
     // 并不是“今日已签到”，不应展示绿色成功标签，改为中性「无签到活动」。
-    if (c.ok && /未开启|未开始|未开放|已过期|无.*活动|活动.*(结束|关闭|暂停)/i.test(msg)) {
+    if (c.inactive || (c.ok && /未开启|未开始|未开放|已过期|无.*活动|活动.*(结束|关闭|暂停)/i.test(msg))) {
       return '<span class="wbs-ck wbs-checkin-tag pending">无签到活动</span>';
     }
     // “本轮刚领取”和“今天已领取过”都是成功态，统一展示避免同一页面出现两套文案。
@@ -713,7 +713,6 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     var buildTimeouts = [];
     var buildIntervals = [];
     var buildFrames = [];
-    var fabPosTimer = null;
     var sleepSyncTimer = null;
     var avatarTimer = null;
     var debugTimer = null;
@@ -1010,7 +1009,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
     });
 
-    // 根节点（fixed 右下角，面板 absolute 定位，右下角与按钮重合）
+    // 根节点（面板保持右下角，按钮拖动后水平回到右侧）
     var root = el('div', 'wbs-root');
     root.setAttribute('data-wbs-profile', PROFILE_ID);
     if (!CAPS.theme) root.classList.add('wbs-no-theme');
@@ -1021,7 +1020,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       '<span class="wbs-fab-health-dot" title="会话状态" style="display:none"></span>',
       '<div class="click">',
       '<span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>',
-      '<button class="button up" type="button" aria-label="Codex 助手">',
+      '<button class="button up" type="button" aria-label="WorkDaddy，点击打开面板，可拖动">',
       '<span class="wbs-fab-antenna" aria-hidden="true"><span class="wbs-fab-antenna-dot"></span></span>',
       '<span class="wbs-fab-ear wbs-fab-ear-left" aria-hidden="true"></span>',
       '<span class="wbs-fab-ear wbs-fab-ear-right" aria-hidden="true"></span>',
@@ -1773,9 +1772,46 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     syncStash(); // 初始检查
     setBuildTimeout(wrapQueueReorder, 800);
 
-    // ===== 悬浮按钮动态定位：优先贴消息队列(cb-message-queue)右上角上方，否则贴输入框 mainArea 右上角上方 =====
-    // 监听 body DOM/class 变化（onDomChange/onInputSync） + 轮询兜底，实时跟随组件显隐
+    // ===== 悬浮按钮位置：拖动时可在窗口内移动，释放后水平吸附右边 =====
     var fabPosPending = false;
+    var fabDrag = null;
+    var fabDragMoved = false;
+    var fabDragSuppressClick = false;
+    var fabSnapTimer = null;
+    var FAB_DRAG_THRESHOLD = 6;
+    var FAB_EDGE_GAP = 22;
+    var FAB_POSITION_KEY = 'wbs-fab-bottom-' + PROFILE_ID;
+
+    function readFabBottom() {
+      try {
+        var value = Number(localStorage.getItem(FAB_POSITION_KEY));
+        return isFinite(value) ? value : null;
+      } catch (_) { return null; }
+    }
+
+    function clampFabBottom(bottom, height) {
+      var max = Math.max(FAB_EDGE_GAP, window.innerHeight - height - FAB_EDGE_GAP);
+      return Math.max(FAB_EDGE_GAP, Math.min(max, Number(bottom) || FAB_EDGE_GAP));
+    }
+
+    function clampFabRight(right, width) {
+      var max = Math.max(FAB_EDGE_GAP, window.innerWidth - width - FAB_EDGE_GAP);
+      return Math.max(FAB_EDGE_GAP, Math.min(max, Number(right) || FAB_EDGE_GAP));
+    }
+
+    function applyFabPosition(fab, right, bottom) {
+      if (!fab) return;
+      var rect = fab.getBoundingClientRect();
+      var nextRight = clampFabRight(right, rect.width || 52);
+      var nextBottom = clampFabBottom(bottom, rect.height || 32);
+      fab.style.position = 'fixed';
+      fab.style.left = 'auto';
+      fab.style.top = 'auto';
+      fab.style.right = nextRight + 'px';
+      fab.style.bottom = nextBottom + 'px';
+      return { right: nextRight, bottom: nextBottom };
+    }
+
     function scheduleFabPos() {
       if (fabPosPending) return;
       fabPosPending = true;
@@ -1788,75 +1824,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var fab = root.querySelector('.wbs-fab');
       if (!fab) return;
       if (fab.classList.contains('hidden')) return; // 面板打开时保持隐藏
-      // WorkBuddy 首页 composer 的右上插槽存在时，按钮放回 WorkBuddy 窗口右下角，
-      // 避免被首页输入区的内部定位挤到中间位置。
-      var homeComposerCorner = document.querySelector('.wb-home-page [class*="_topRightSlotStandalone_"] > div:nth-child(1) > div:nth-child(3)');
-      // WorkBuddy AI 欢迎页的右上插槽结构不同，第二个操作项出现时固定到窗口右下角。
-      var aiHomeComposerCorner = PROFILE_ID === 'workbuddy-ai'
-        ? document.querySelector('.wb-home-page [class*="_topRightSlotStandalone_"] > div:nth-child(1) > div:nth-child(2)')
-        : null;
-      if (homeComposerCorner || aiHomeComposerCorner) {
-        var cornerRect = (aiHomeComposerCorner || homeComposerCorner).getBoundingClientRect();
-        if (cornerRect.width > 0 && cornerRect.height > 0) {
-          fab.classList.remove('fab--solid');
-          fab.style.position = 'fixed';
-          fab.style.left = 'auto';
-          fab.style.top = 'auto';
-          fab.style.right = '22px';
-          fab.style.bottom = '22px';
-          return;
-        }
-      }
-      var target = null;
-      var solid = false; // 贴消息队列上方时纯色背景（不毛玻璃）
-      // 1) 消息队列展开时优先贴它
-      var q = document.querySelector('.cb-message-queue.cb-expand');
-      if (q) {
-        var qr = q.getBoundingClientRect();
-        if (qr.height > 1 && qr.width > 1) { target = qr; solid = true; }
-      }
-      // 2) WorkBuddy AI 新版聊天输入框不再使用旧的 _input-area-container/_mainArea_ 类名，
-      // 实际可定位元素是 conversation-input-area 下的 .cr-input-container。
-      // 必须在旧的生成类名兜底之前命中它，否则无队列时机器人只能落到默认右下角。
-      if (!target && WBS_PROFILE_IS_AI) {
-        var aiInput = document.querySelector(
-          '.conversation-input-area .conversation-input .cr-input-box .cr-input-container,' +
-          ' .conversation-input-area .cr-input-container,' +
-          ' .conversation-shell__main .cr-input-container'
-        );
-        if (aiInput) {
-          var air = aiInput.getBoundingClientRect();
-          if (air.height > 1 && air.width > 1) target = air;
-        }
-      }
-      // 3) 旧版/普通 WorkBuddy 兜底：输入框主体 _mainArea（聊天页 _input-area-container 内 /
-      // 主页 wb-home-composer 内）。
-      if (!target) {
-        var ma = document.querySelector('[class*="_input-area-container_"] [class*="_mainArea_"]');
-        if (!ma) ma = document.querySelector('.wb-home-composer [class*="_mainArea_"]');
-        if (ma) {
-          var mr = ma.getBoundingClientRect();
-          if (mr.height > 1 && mr.width > 1) target = mr;
-        }
-      }
-      if (!target) {
-        // 无目标（如登录页）：回落到默认右下角
-        fab.style.right = '22px';
-        fab.style.bottom = '22px';
-        return;
-      }
-      var GAP_R = 8;   // 右边留间距
-      var GAP_V = 0;   // 垂直完全贴合
-      // 贴 queue 时纯色背景，贴 mainArea 时毛玻璃
-      fab.classList.toggle('fab--solid', solid);
-      fab.style.position = 'fixed';
-      fab.style.left = 'auto';
-      fab.style.top = 'auto';
-      fab.style.right = (window.innerWidth - target.right + GAP_R) + 'px';
-      fab.style.bottom = (window.innerHeight - target.top + GAP_V) + 'px';
+      if (fabDrag) return;
+      var saved = readFabBottom();
+      applyFabPosition(fab, FAB_EDGE_GAP, saved == null ? FAB_EDGE_GAP : saved);
     }
-    // 轮询兜底：queue 显隐 / 输入框高度变化可能漏触发 observer
-    fabPosTimer = setBuildInterval(function () { if (alive) scheduleFabPos(); }, 1500);
     setBuildTimeout(scheduleFabPos, 600); // 首屏定位
 
     // ===== chat widget 预览 iframe 背景透明（用户要求）=====
@@ -4785,7 +4756,76 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }
     }
 
-    fab.addEventListener('click', function () { setOpen(true); });
+    function setupFabDrag() {
+      var handle = fab.querySelector('.wbs-fab .button.up');
+      if (!handle) return;
+      fab.style.touchAction = 'none';
+      fab.style.userSelect = 'none';
+      handle.style.touchAction = 'none';
+      listen(handle, 'pointerdown', function (e) {
+        if (e.button !== undefined && e.button !== 0) return;
+        var rect = fab.getBoundingClientRect();
+        fabDrag = {
+          pointerId: e.pointerId,
+          startY: e.clientY,
+          startX: e.clientX,
+          startRight: window.innerWidth - rect.right,
+          startBottom: window.innerHeight - rect.bottom,
+        };
+        fabDragMoved = false;
+        fabDragSuppressClick = false;
+        fab.classList.add('is-dragging');
+        try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+        if (e.preventDefault) e.preventDefault();
+      });
+      listen(handle, 'pointermove', function (e) {
+        if (!fabDrag || e.pointerId !== fabDrag.pointerId) return;
+        var deltaX = e.clientX - fabDrag.startX;
+        var deltaY = e.clientY - fabDrag.startY;
+        if (Math.max(Math.abs(deltaX), Math.abs(deltaY)) >= FAB_DRAG_THRESHOLD) {
+          fabDragMoved = true;
+          fabDragSuppressClick = true;
+        }
+        applyFabPosition(fab, fabDrag.startRight - deltaX, fabDrag.startBottom - deltaY);
+        if (e.preventDefault) e.preventDefault();
+      });
+      function finishFabDrag(e) {
+        if (!fabDrag || (e && e.pointerId !== fabDrag.pointerId)) return;
+        var rect = fab.getBoundingClientRect();
+        var bottom = clampFabBottom(window.innerHeight - rect.bottom, rect.height || 32);
+        // 释放后水平吸附回右边，垂直位置保留。
+        if (fabSnapTimer !== null) {
+          clearTimeout(fabSnapTimer);
+          fabSnapTimer = null;
+        }
+        fab.classList.remove('is-dragging');
+        fab.classList.add('is-snapping');
+        applyFabPosition(fab, FAB_EDGE_GAP, bottom);
+        try { localStorage.setItem(FAB_POSITION_KEY, String(Math.round(bottom))); } catch (_) {}
+        fabDrag = null;
+        fabSnapTimer = setBuildTimeout(function () {
+          fabSnapTimer = null;
+          fab.classList.remove('is-snapping');
+        }, 620);
+      }
+      listen(handle, 'pointerup', finishFabDrag);
+      listen(handle, 'pointercancel', finishFabDrag);
+      listen(handle, 'lostpointercapture', function () {
+        if (fabDrag) finishFabDrag();
+      });
+    }
+
+    setupFabDrag();
+    fab.addEventListener('click', function (e) {
+      if (fabDragSuppressClick || fabDragMoved) {
+        fabDragSuppressClick = false;
+        fabDragMoved = false;
+        if (e.preventDefault) e.preventDefault();
+        if (e.stopPropagation) e.stopPropagation();
+        return;
+      }
+      setOpen(true);
+    });
     root.querySelector('[data-act="close"]').addEventListener('click', function () { setOpen(false); });
 
 
@@ -7177,20 +7217,38 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return '<div class="wbs-credit-bar" role="img" aria-label="积分到期分布">' + cells + '</div>';
     }
 
+    function todayUsageHtml(a) {
+      var usage = a && a.todayUsage;
+      if (!usage || usage.synced !== true) return '';
+      var used = Number(usage.used);
+      if (!isFinite(used) || used <= 0) return '';
+      return '<span class="wbs-usage-tag"><span>今日已使用</span>' + CREDIT_ICON + '<b>' + fmtCredits(used) + '</b></span>';
+    }
+
+    function accountStatusTagsHtml(a) {
+      var tags = todayUsageHtml(a);
+      return tags ? '<span class="wbs-account-tags">' + tags + '</span>' : '';
+    }
+
+    function checkinBadgeHtml(a) {
+      var tag = checkinHtml(a);
+      return tag ? '<span class="wbs-checkin-slot">' + tag + '</span>' : '';
+    }
+
     function creditBlockHtml(credits, segments, account) {
       if (isIdentityExpired(account)) return '';
-      var checkin = checkinHtml(account);
+      var usage = accountStatusTagsHtml(account);
       // 企业账号不限量（官方 getEnterpriseUsage 返回 limitNum === -1）
       if (account && account.creditUnlimited) {
         return '<div class="wbs-credit-block">' +
-          '<div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-total">' + CREDIT_ICON + '<b>不限量</b></span></div>' +
+          '<div class="wbs-credit-line"><div class="wbs-credit-left"><span class="wbs-lbl">剩余</span><span class="wbs-credit-total">' + CREDIT_ICON + '<b>不限量</b></span></div>' + usage + '</div>' +
           '<div class="wbs-credit-hint">企业配额</div>' +
           '</div>';
       }
-      if (credits === undefined) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-loading">读取中…</span></div></div>';
-      if (credits === null) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-na">-</span></div></div>';
+      if (credits === undefined) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-left"><span class="wbs-lbl">剩余</span><span class="wbs-credit-loading">读取中…</span></div>' + usage + '</div></div>';
+      if (credits === null) return '<div class="wbs-credit-block"><div class="wbs-credit-line"><div class="wbs-credit-left"><span class="wbs-lbl">剩余</span><span class="wbs-credit-na">-</span></div>' + usage + '</div></div>';
       return '<div class="wbs-credit-block">' +
-        '<div class="wbs-credit-line"><div class="wbs-credit-label"><span class="wbs-lbl">剩余积分</span>' + checkin + '</div><span class="wbs-credit-total">' + CREDIT_ICON + '<b>' + fmtCredits(credits) + '</b></span></div>' +
+        '<div class="wbs-credit-line"><div class="wbs-credit-left"><span class="wbs-lbl">剩余</span><span class="wbs-credit-total">' + CREDIT_ICON + '<b>' + fmtCredits(credits) + '</b></span></div>' + usage + '</div>' +
         creditBarHtml(credits, segments) +
         '</div>';
     }
@@ -7209,8 +7267,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
     function sortAccountsByCreditExpiry() {
       state.accounts = state.accounts.map(function (account, index) {
-        return { account: account, index: index, expiresAt: nearestCreditExpiry(account) };
+        return {
+          account: account,
+          index: index,
+          isCurrent: !!(state.current && account && account.uid === state.current.uid),
+          expiresAt: nearestCreditExpiry(account),
+        };
       }).sort(function (a, b) {
+        if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
         if (a.expiresAt !== b.expiresAt) return a.expiresAt - b.expiresAt;
         return a.index - b.index;
       }).map(function (item) { return item.account; });
@@ -7268,8 +7332,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function render(data) {
-      state.accounts = data.accounts || [];
       state.current = data.current;
+      state.accounts = (data.accounts || []).slice();
+      if (state.current && state.current.uid) {
+        state.accounts.sort(function (left, right) {
+          var leftIsCurrent = !!(left && left.uid === state.current.uid);
+          var rightIsCurrent = !!(right && right.uid === state.current.uid);
+          if (leftIsCurrent === rightIsCurrent) return 0;
+          return leftIsCurrent ? -1 : 1;
+        });
+      }
       state.creditRemaining = state.accounts.length;
       updateAccountSummary();
       var list = accountsPane.querySelector('.wbs-acct-list');
@@ -7288,6 +7360,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         // 版本标签：个人账号显示「个人版」；企业账号显示企业名称（enterpriseName），缺省回退「企业」。
         var editionBadge = a.type === 'personal' ? '个人版' : (a.enterpriseName ? a.enterpriseName : (a.type ? '企业' : ''));
         var badge = editionBadge ? '<span class="wbs-badge">' + esc(editionBadge) + '</span>' : '';
+        var checkinBadge = checkinBadgeHtml(a);
         // 当前登录账号：卡片右上角对勾角标（替代原「当前」文字标签）
         var curMark = isCur ? '<span class="wbs-cur-marker" title="当前使用中">' + CUR_MARK_SVG + '</span>' : '';
         // 当前登录账号隐藏操作；认证已过期的账号保留删除，但隐藏切换，避免进入登录页。
@@ -7299,14 +7372,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             '<button class="wbs-icon-btn wbs-del" type="button" title="删除" data-uid="' + escAttr(a.uid) + '" data-name="' + escAttr(a.nickname || '未命名') + '">' + TRASH_SVG + '</button>' +
             '</div>';
         // 国际版没有手机号：用 UIN（账号唯一数字标识）替代展示；国内版仍显示手机。
-        // wbs-uin-cell 用于 UIN 模式下补齐标签与取值之间的间距（wbs-phone-cell 默认 gap:0 过于紧凑）。
+        // UIN 与手机号共用同一标签和值间距，确保与“剩余”额度列对齐。
         var isUinMode = !a.phone;
         var idLbl = a.phone ? '手机' : (a.uin ? 'UIN' : '账号');
         var idVal = a.phone ? esc(a.phone) : (a.uin ? esc(a.uin) : '-');
         card.innerHTML =
           curMark +
           '<div class="wbs-info">' +
-          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + esc(a.nickname || '(未命名)') + '</span>' + badge + '</div>' + ops + '</div>' +
+          '<div class="wbs-row1"><div class="wbs-name-group"><span class="wbs-name">' + esc(a.nickname || '(未命名)') + '</span>' + badge + checkinBadge + '</div>' + ops + '</div>' +
           '<div class="wbs-meta wbs-secondary-row">' +
           '<div class="wbs-mi wbs-phone-cell' + (isUinMode ? ' wbs-uin-cell' : '') + '"><span class="wbs-lbl">' + idLbl + '</span><span class="wbs-val">' + idVal + '</span></div>' +
           '<div class="wbs-mi wbs-token-cell"><span class="wbs-lbl">有效期至</span><span class="wbs-val' + (ts.warn ? ' wbs-warn' : '') + '">' + esc(ts.label) + '</span></div>' +
@@ -7446,10 +7519,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function updateCheckinCells(accounts) {
       var cards = accountsPane.querySelectorAll('.wbs-card');
       var byUid = {};
-      (accounts || []).forEach(function (a) { if (a && a.uid) byUid[a.uid] = a; });
       (accounts || []).forEach(function (a) {
         for (var j = 0; j < state.accounts.length; j++) {
-          if (state.accounts[j].uid === a.uid) { state.accounts[j].checkin = a.checkin; break; }
+          if (state.accounts[j].uid === a.uid) {
+            state.accounts[j].checkin = a.checkin;
+            if (Object.prototype.hasOwnProperty.call(a, 'todayUsage')) state.accounts[j].todayUsage = a.todayUsage;
+            byUid[a.uid] = state.accounts[j];
+            break;
+          }
         }
       });
       for (var i = 0; i < cards.length; i++) {
@@ -7457,8 +7534,17 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         var account = byUid[uid];
         if (!account) continue;
         var cell = cards[i].querySelector('.wbs-credit-cell');
-        var status = cell && cell.querySelector('.wbs-checkin-tag');
-        if (status) status.outerHTML = checkinHtml(account);
+        var status = cell && cell.querySelector('.wbs-account-tags');
+        if (status) status.outerHTML = accountStatusTagsHtml(account);
+        var nameGroup = cards[i].querySelector('.wbs-name-group');
+        var checkinSlot = nameGroup && nameGroup.querySelector('.wbs-checkin-slot');
+        var checkinBadge = checkinBadgeHtml(account);
+        if (checkinSlot) {
+          if (checkinBadge) checkinSlot.outerHTML = checkinBadge;
+          else checkinSlot.remove();
+        } else if (checkinBadge && nameGroup) {
+          nameGroup.insertAdjacentHTML('beforeend', checkinBadge);
+        }
         if (cell) {
           var hidden = isIdentityExpired(account);
           cell.classList.toggle('wbs-credit-hidden', hidden);
@@ -7551,8 +7637,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             var credits = r && typeof r.credits === 'number' && isFinite(r.credits) ? r.credits : null;
             var segments = r && Array.isArray(r.segments) ? r.segments : [];
             var unlimited = !!(r && r.unlimited);
+            var hasTodayUsage = !!(r && Object.prototype.hasOwnProperty.call(r, 'todayUsage'));
             for (var i = 0; i < state.accounts.length; i++) {
-              if (state.accounts[i].uid === a.uid) { state.accounts[i].credits = credits; state.accounts[i].creditSegments = segments; state.accounts[i].creditUnlimited = unlimited; break; }
+              if (state.accounts[i].uid === a.uid) {
+                state.accounts[i].credits = credits;
+                state.accounts[i].creditSegments = segments;
+                state.accounts[i].creditUnlimited = unlimited;
+                if (hasTodayUsage) state.accounts[i].todayUsage = r.todayUsage;
+                break;
+              }
             }
             updateCreditCell(a.uid, credits, segments);
           })
@@ -7787,7 +7880,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-root{position:fixed;right:22px;bottom:22px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;color:#1f1f1f;-webkit-font-smoothing:antialiased}',
     '.wbs-root.wbs-no-stash .wbs-stash-inline{display:none !important}',
     /* 机器人悬浮按钮（bitter-dragon-16 移植）：静态版 0.5 倍 · 无头顶尖角 · 眼睛双眨 */
-    '.wbs-fab{position:fixed;right:22px;bottom:22px;z-index:2147483647;transform:scale(0.5);transform-origin:bottom right;cursor:pointer}',
+    '.wbs-fab{position:fixed;right:22px;bottom:22px;z-index:2147483647;transform:scale(0.5);transform-origin:bottom right;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;will-change:right,bottom}',
     '.wbs-fab-sleep-dot{position:absolute;top:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:rgba(126,128,138,.55);border:2px solid #141416;box-shadow:0 1px 3px rgba(0,0,0,.5);transition:background .25s,box-shadow .25s;z-index:3}',
     '.wbs-fab-health-dot{position:absolute;top:-5px;left:-5px;width:14px;height:14px;border-radius:50%;background:#8b8f98;border:2px solid #141416;box-shadow:0 1px 3px rgba(0,0,0,.5);z-index:3}',
     '.wbs-fab-health-dot.running{background:#4da3ff}.wbs-fab-health-dot.blocked{background:#ffb03a}.wbs-fab-health-dot.error{background:#ef6262}.wbs-fab-health-dot.suspected{background:#f08a3c}.wbs-fab-health-dot.stopped{background:#9ca3af}',
@@ -7830,6 +7923,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '@keyframes wbs-cc-upb{0%,10%{top:0;left:0%}20%,40%{top:-50%;left:0%}50%,100%{top:0;left:0%}}',
     '.wbs-fab:hover{transform:scale(0.5)}',
     '.wbs-fab:active{transform:scale(0.5) translate(2px,2px)}',
+    '.wbs-fab.is-dragging{cursor:grabbing;transition:none !important}',
+    '.wbs-fab.is-dragging .button{cursor:grabbing}',
+    '.wbs-fab.is-snapping{transition:right .56s cubic-bezier(.22,1.35,.36,1),bottom .56s cubic-bezier(.22,1.35,.36,1)}',
     /* 面板：毛玻璃主题（半透明 + 模糊，背景图透出） */
     '.wbs-panel{position:absolute;right:0;bottom:0;width:520px;max-width:94vw;height:650px;max-height:650px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);border:1px solid var(--wb-border-subtle,#f0f0f0);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.28);display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(28px) saturate(1.25);-webkit-backdrop-filter:blur(28px) saturate(1.25)}',
     '.wbs-panel.show{display:flex}',
@@ -7855,11 +7951,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-secondary-row{flex-direction:row;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}',
     '.wbs-mi{display:flex;align-items:center;gap:6px;font-size:12px;line-height:1.4}',
     '.wbs-phone-cell,.wbs-token-cell{flex:1;min-width:0}',
-    '.wbs-phone-cell{gap:0}',
+    '.wbs-phone-cell{gap:4px}',
     // UIN 模式（国际版无手机号时用 UIN 替代）：标签与数字之间保留正常间距
-    '.wbs-phone-cell.wbs-uin-cell{gap:8px}',
+    '.wbs-phone-cell.wbs-uin-cell{gap:4px}',
     '.wbs-token-cell{justify-content:flex-end}',
-    '.wbs-phone-cell .wbs-lbl,.wbs-token-cell .wbs-lbl,.wbs-credit-label .wbs-lbl{width:auto}',
+    '.wbs-phone-cell .wbs-lbl,.wbs-credit-left .wbs-lbl{width:28px}',
+    '.wbs-token-cell .wbs-lbl{width:48px}',
     '.wbs-phone-cell .wbs-val,.wbs-token-cell .wbs-val{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.wbs-lbl{color:var(--wb-icon-tertiary,#999);flex-shrink:0;width:60px;white-space:nowrap}',
     '.wbs-val{color:var(--wb-color-text-primary,#1f1f1f);font-variant-numeric:tabular-nums;word-break:break-all}',
@@ -7868,8 +7965,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-credit-cell{display:block!important;width:100%;min-width:0}',
     '.wbs-credit-hidden{display:none!important}',
     '.wbs-credit-block{width:100%;min-width:0}',
-    '.wbs-credit-line{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}',
-    '.wbs-credit-label{display:inline-flex;align-items:center;gap:8px;min-width:0}',
+    '.wbs-credit-line{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px;min-width:0}',
+    '.wbs-credit-left{display:inline-flex;align-items:center;gap:4px;min-width:0}',
     '.wbs-credit-total{display:inline-flex;align-items:center;gap:4px;color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;font-variant-numeric:tabular-nums}',
     '.wbs-credit-total b{font-weight:700}',
     '.wbs-credit-bar{display:flex;align-items:stretch;gap:2px;width:100%;height:5px;min-height:5px;border-radius:0;overflow:visible;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent)}',
@@ -7895,6 +7992,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-credit-tooltip{display:none;position:fixed;z-index:2147483647;min-width:170px;max-width:260px;padding:8px 10px;border-radius:7px;background:#151518;color:#fff;font-size:11px;font-weight:500;line-height:1.55;white-space:pre-line;box-shadow:0 8px 22px rgba(0,0,0,.28);pointer-events:none}',
     '.wbs-credit-empty{height:5px;border-radius:0;background:color-mix(in srgb,var(--wb-bg-tertiary,#e8e8eb) 70%,transparent);color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:5px;text-align:center}',
     '.wbs-credit-hint{color:var(--wb-icon-tertiary,#999);font-size:10px;line-height:1.4;margin-top:2px}',
+    '.wbs-account-tags{display:inline-flex;align-items:center;gap:5px;min-width:0;margin-left:auto}',
+    '.wbs-usage-tag{display:inline-flex;align-items:center;gap:4px;min-width:0;white-space:nowrap;color:var(--wb-color-text-primary,#1f1f1f);font-size:12px;font-weight:400;font-variant-numeric:tabular-nums}',
+    '.wbs-usage-tag svg{width:14px;height:14px;flex:0 0 14px}',
+    '.wbs-usage-tag b{font-weight:700}',
+    'html.cb-dark .wbs-usage-tag,html[data-theme="dark"] .wbs-usage-tag{color:var(--wb-color-text-primary,#f3f5fa)}',
     '.wbs-credit-icon{width:14px;height:14px;vertical-align:middle;flex-shrink:0}',
     '.wbs-credit-loading{color:var(--wb-icon-tertiary,#999);font-size:12px}',
     '.wbs-credit-na{color:var(--wb-icon-tertiary,#999);font-size:12px}',

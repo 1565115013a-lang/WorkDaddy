@@ -38,6 +38,45 @@ const LOG_FILE = path.join(DATA_DIR, 'watchdog.log');
 const UPDATE_PENDING_FILE = path.join(DATA_DIR, 'update', 'pending.json'); // 自动更新进行中标记（update 目录由 apply 流程创建）
 const DAEMON_FILE = path.join(SCRIPTS_DIR, 'daemon.js');
 
+function updateProcessIsActive(pid) {
+  if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid <= 0) return false;
+  const command = `Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\" -ErrorAction SilentlyContinue | ` +
+    `Where-Object { $_.Name -match '^(powershell|pwsh)(\\.exe)?$' -and $_.CommandLine -match '(?i)apply-update\\.ps1' } | ` +
+    'Select-Object -First 1 ProcessId | ConvertTo-Json -Compress';
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    encoding: 'utf8', timeout: 10000, windowsHide: true,
+  });
+  return !result.error && result.status === 0 && /ProcessId/.test(String(result.stdout || ''));
+}
+
+function updatePendingIsActive() {
+  if (!fs.existsSync(UPDATE_PENDING_FILE)) return false;
+  let pending = null;
+  try { pending = JSON.parse(fs.readFileSync(UPDATE_PENDING_FILE, 'utf8')); } catch (_) {}
+  const attemptId = pending && typeof pending.attempt === 'string' ? pending.attempt : '';
+  let attempt = null;
+  try {
+    const attemptFile = path.join(path.dirname(UPDATE_PENDING_FILE), 'last-attempt.json');
+    attempt = JSON.parse(fs.readFileSync(attemptFile, 'utf8'));
+  } catch (_) {}
+  const scriptPid = Number(attempt && attempt.attemptId === attemptId ? attempt.scriptPid : 0);
+  if (updateProcessIsActive(scriptPid)) return true;
+
+  // A marker without a live apply-update process is allowed a short grace
+  // period for the spawn/exit race, then it is safe to remove as stale.
+  const markedAt = pending && Date.parse(pending.at);
+  const gracePeriodMs = 10 * 60 * 1000;
+  if (Number.isFinite(markedAt) && Date.now() - markedAt < gracePeriodMs) return true;
+  try {
+    fs.unlinkSync(UPDATE_PENDING_FILE);
+    log('已清理确认没有更新进程的过期 pending.json，继续启动 daemon');
+  } catch (error) {
+    log('清理过期 pending.json 失败: ' + error.message);
+    return true;
+  }
+  return false;
+}
+
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}\n`;
   try {
@@ -71,6 +110,7 @@ function runProcessQuery(whereClause) {
   });
   return parseCimProcessResult(result, {
     requireCommandLine: true, requireCurrentOwner: true, requireNativeArguments: true,
+    allowTransientNotFound: true,
   });
 }
 
@@ -93,7 +133,13 @@ function pidFileState() {
       process.execPath, __filename, queryWatchdogProcesses()
     ).filter((item) => item.ProcessId !== process.pid)
       .map((item) => assertSameProcessIdentity(item, item));
-    if (untracked.length) {
+    if (untracked.length === 1) {
+      // The PID file is only a lock hint. A single exact watchdog process is
+      // already bound to this profile by its Node path and entry script, so a
+      // file lost during installation/update can be safely reconstructed.
+      return { kind: 'recoverable', pid: untracked[0].ProcessId, watchdog: untracked[0], processes: queryWatchdogProcessFamily(untracked[0].ProcessId) };
+    }
+    if (untracked.length > 1) {
       return { kind: 'untracked', pid: null, processIds: untracked.map((item) => item.ProcessId) };
     }
     return { kind: 'absent', pid: null };
@@ -149,9 +195,15 @@ function terminateVerifiedProcess(original, expectedScript, label, expectedParen
 }
 
 function stopVerifiedWatchdog() {
-  const state = pidFileState();
+  let state = pidFileState();
   if (state.kind === 'absent') return;
   if (state.kind === 'self') throw new Error('stop 命令不能结束自身');
+  if (state.kind === 'recoverable') {
+    fs.writeFileSync(PID_FILE, String(state.pid), { flag: 'wx' });
+    state = pidFileState();
+    if (state.kind !== 'verified') throw new Error('恢复 watchdog.pid 后无法再次验证 watchdog 身份');
+    log(`通过精确身份恢复缺失的 watchdog.pid=${state.pid}`);
+  }
   if (state.kind === 'untracked') {
     throw new Error(`检测到没有 PID 文件的 watchdog 进程 PID=${state.processIds.join(',')}，无法确定当前 profile，拒绝结束`);
   }
@@ -186,6 +238,17 @@ if (existing.kind === 'stale') {
   removePidFileIf(existing.pid);
   log('已清理确认不存在的旧 watchdog.pid，继续启动');
 }
+if (existing.kind === 'recoverable') {
+  try {
+    fs.writeFileSync(PID_FILE, String(existing.pid), { flag: 'wx' });
+    log(`通过精确身份恢复缺失的 watchdog.pid=${existing.pid}，本实例退出`);
+  } catch (error) {
+    const current = readPidFile();
+    if (current !== existing.pid) throw error;
+    log(`watchdog.pid 已由并发启动恢复为 ${existing.pid}，本实例退出`);
+  }
+  process.exit(0);
+}
 if (existing.kind === 'untracked') {
   throw new Error(`检测到没有 PID 文件的 watchdog 进程 PID=${existing.processIds.join(',')}，拒绝启动重复实例`);
 }
@@ -212,7 +275,7 @@ function startDaemon() {
     // 自动更新标记存在：daemon 是在「更新替换」窗口内退出的（apply-update.ps1 正在换文件），
     // 绝不能立刻重启 daemon 抢占 47832 端口，否则会干扰替换甚至导致更新失败（历史偶发根因）。
     // 标记由 apply-update.ps1 成功/失败后删除；删除后靠新版 launcher/手动启动重新拉起。
-    if (fs.existsSync(UPDATE_PENDING_FILE)) {
+    if (updatePendingIsActive()) {
       log('检测到更新标记 pending.json，跳过自动重启 daemon（等待 apply-update.ps1 完成替换）');
       return;
     }

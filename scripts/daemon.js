@@ -32,6 +32,7 @@ const {
   detectWindowsPrivilege,
   buildNativeProcessQuery,
   filterVerifiedWindowsProcesses,
+  filterVerifiedNodeProcesses,
   parseCimProcessResult,
   resolveWindowsExecutable,
   sameWindowsPath,
@@ -98,6 +99,9 @@ const {
 } = require('./lib.js');
 const { extractCreditSegments, sortCreditSegments, mergeCreditSegments, parseEnterpriseUsage, ENTERPRISE_EDITIONS } = require('./credit-segments.js');
 const { buildCreditResourceBody } = require('./credit-resource-queries.js');
+const { fetchUsageSinceAnchor, startOfLocalDay } = require('./credit-request-usage.js');
+const { createCreditUsageStore } = require('./credit-usage-store.js');
+const { classifyCheckinResult } = require('./checkin-result.js');
 const {
   captureException,
   captureMessage,
@@ -108,6 +112,8 @@ const {
 const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
+const { replaceFileWithRetry } = require('./atomic-file-write.js');
+const { parseUiPortState, profileUiPortCandidates } = require('./ui-port.js');
 
 const PROFILE = getProfile();
 const DATA_DIR = defaultDataDir();
@@ -197,23 +203,34 @@ const DATA_DIR = defaultDataDir();
 // 1.0.49：主题 CDP 应用增加异常回读/重试，失败主题不再覆盖已保存主题。
 // 1.0.18：主题应用在页面刷新/切换期间自动重连 CDP，并补充失败诊断。
 // 1.1.0：Windows launcher 固定传递 profile UI 端口；显式端口冲突时不再递增到相邻 profile。
-const DAEMON_VERSION = '1.1.1';
-const DAEMON_BUILD_ID = 'release-1.1.1-20260827-windows-standard-launch-normalization';
+// 1.1.2：当前登录账号通过官方请求用量接口增量同步；SQLite 按账号持久化，并为所有账号回显今日用量缓存。
+// 1.1.3：账号面板稳定置顶当前登录账号。
+// 1.1.5：区分“当天已同步但用量为零”和“从未同步”，已同步零用量显示 0.00。
+// 1.1.6：今日用量标签复用积分 AI 图标，并统一展示文案。
+// 1.1.7：Windows 启动可靠性、profile 隔离 UI 端口、原子配置写入和 CIM 竞态修复。
+// 1.1.8：签到只接受明确成功响应并写入 SQLite；悬浮球释放时增加阻尼回弹。
+// 1.1.9：签到请求进行中仍立即展示已确认的今日签到标记。
+const DAEMON_VERSION = '1.1.9';
+const DAEMON_BUILD_ID = 'release-1.1.9-20260828-checkin-cache-first';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
 const WORKDADDY_INSTALL_NAME = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy AI' : 'WorkDaddy';
-const WORKDADDY_DIR_WIN = process.env.WBSWITCH_APP_DIR ||
-  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', WORKDADDY_INSTALL_NAME);
-const UI_PORT_BASE = parseInt(process.env.WBSWITCH_PORT || '47832', 10);
+const WORKDADDY_DIR_WIN = process.env.WBSWITCH_APP_DIR || path.resolve(__dirname, '..');
+const UI_PORT_BASE = parseInt(process.env.WBSWITCH_PORT || String(profileUiPortCandidates(PROFILE.id)[0]), 10);
 const ALLOW_UI_PORT_FALLBACK = !process.env.WBSWITCH_PORT;
-let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（被占用时 +1）
+let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（可能回退到当前 profile 的备用端口）
 const PROFILE_CDP_PORT = { 'workbuddy-cn': 9222, 'workbuddy-ai': 9223, 'codebuddy-cn': 9224, 'codebuddy-intl': 9225 };
 const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
   ? parseInt(process.env.WBSWITCH_CDP_PORT, 10)
   : (PROFILE_CDP_PORT[PROFILE.id] || null);
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
+const UI_PORT_FILE = path.join(DATA_DIR, 'ui-port.json');
 const API_TOKEN_FILE = path.join(DATA_DIR, '.api-token');
+const CREDIT_USAGE_DB_FILE = path.join(DATA_DIR, 'credit-usage.db');
+const CREDIT_USAGE_STORE = createCreditUsageStore({ dbPath: CREDIT_USAGE_DB_FILE, profileId: PROFILE.id });
+const CREDIT_USAGE_REFRESH_MS = 15000;
+const creditUsageSyncInFlight = new Map();
 const WATCH_INTERVAL = 3000; // 文件监听兜底
 const BACKUP_DEBOUNCE = 1500; // CDP 事件触发的备份防抖
 const CDP_RECONNECT_MS = 5000;
@@ -297,6 +314,25 @@ function writeCdpPortFile(port, logFn = log) {
   } catch (e) {
     try { fs.unlinkSync(`${CDP_PORT_FILE}.tmp.${process.pid}`); } catch (_) {}
     logFn(`[cdp] 保存端口配置失败: ${e.message}`);
+    return false;
+  }
+}
+
+function readUiPortFile() {
+  try { return parseUiPortState(fs.readFileSync(UI_PORT_FILE, 'utf8'), PROFILE.id); } catch (_) { return null; }
+}
+
+function writeUiPortFile(port, logFn = log) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    replaceFileWithRetry(UI_PORT_FILE, JSON.stringify({
+      profileId: PROFILE.id,
+      port,
+      updatedAt: new Date().toISOString(),
+    }) + '\n', 0o600);
+    return true;
+  } catch (error) {
+    logFn(`[http] 保存 UI 端口配置失败: ${error.message}`);
     return false;
   }
 }
@@ -1256,6 +1292,38 @@ function reportDaemonLockFallback(error) {
   }).catch(() => {});
 }
 
+function isCurrentWindowsDaemonProcess(pid) {
+  if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid <= 0) return false;
+  const command = buildNativeProcessQuery(
+    path.join(__dirname, 'windows-process-boundary.ps1'),
+    `Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\" -ErrorAction Stop | ` +
+      `Where-Object { $_.Name -ieq 'node.exe' }`
+  );
+  try {
+    const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+      encoding: 'utf8', timeout: 10000, windowsHide: true,
+    });
+    const processes = parseCimProcessResult(result, {
+      requireCommandLine: true,
+      requireCurrentOwner: true,
+      requireNativeArguments: true,
+      allowTransientNotFound: true,
+    });
+    return processes.some((item) => {
+      try {
+        return filterVerifiedNodeProcesses(item.ExecutablePath, __filename, [item])
+          .some((match) => match.ProcessId === pid);
+      } catch (_) {
+        return false;
+      }
+    });
+  } catch (_) {
+    // Failure to prove ownership must keep the lock: deleting it could permit
+    // two daemons to operate on the same profile at once.
+    return true;
+  }
+}
+
 // launchd 应只启动一个 daemon；启动器的 nohup 兜底和 launchd 异步拉起可能短暂重叠，
 // 用原子创建锁文件把这类竞态变成可观测的单实例退出，而不是两个进程同时清理/注入页面。
 // Windows 数据目录锁不可写时，使用同一台机器用户临时目录中的哈希锁继续保证单实例。
@@ -1285,7 +1353,10 @@ function acquireDaemonLock() {
           const ownerPid = Number(owner && owner.pid);
           let alive = false;
           if (ownerPid > 0 && ownerPid !== process.pid) {
-            try { process.kill(ownerPid, 0); alive = true; } catch (_) {}
+            if (IS_WIN) alive = isCurrentWindowsDaemonProcess(ownerPid);
+            else {
+              try { process.kill(ownerPid, 0); alive = true; } catch (_) {}
+            }
           }
           if (alive) {
             process.stdout.write(`[${new Date().toISOString()}] [lock] 已有 daemon 运行 (pid=${ownerPid})，当前进程退出\n`);
@@ -1661,6 +1732,7 @@ function queryWindowsWorkBuddyProcesses() {
   });
   return parseCimProcessResult(result, {
     requireCommandLine: true, requireCurrentOwner: true, requireNativeArguments: true,
+    allowTransientNotFound: true,
   });
 }
 
@@ -2143,7 +2215,7 @@ function saveCheckinCache(cache) {
 
 /**
  * 用指定账号 accessToken 调用签到接口（多域名兜底）。
- * 成功 / 已签（code=10001）均视为当日已完成。
+ * 只有明确 code=0，或 code=10001 且文案明确表示已签到/已领取，才视为成功。
  */
 async function dailyCheckin(accessToken) {
   const origin = PROFILE.apiHost || 'https://www.workbuddy.cn';
@@ -2169,14 +2241,13 @@ async function dailyCheckin(accessToken) {
       const text = await r.text();
       let o = {};
       try { o = JSON.parse(text); } catch (_) {}
-      const code = o.code;
-      const already = code === 10001;
-      const ok = already || (r.ok && (code === 0 || code === undefined || code === null));
       // 401 = token 过期/未授权：直接给友好文案，避免面板显示裸 "HTTP 401"
       const failMsg = r.status === 401 ? '登录身份过期' : 'HTTP ' + r.status;
-      const result = { ok, already, code, message: o.msg || o.message || (r.ok ? 'ok' : failMsg), url };
+      const message = o.msg || o.message || (r.ok ? 'ok' : failMsg);
+      const classified = classifyCheckinResult({ httpOk: r.ok, code: o.code, message });
+      const result = { ...classified, status: r.status, url };
       // 网络异常或服务端错误才切换兜底域名；认证/参数错误直接返回，避免无意义地重复请求。
-      if (ok || r.status === 401 || (r.status >= 400 && r.status < 500 && r.status !== 404)) return result;
+      if (classified.ok || r.status === 401 || (r.status >= 400 && r.status < 500 && r.status !== 404) || (r.ok && r.status !== 404)) return result;
       lastErr = result.message;
     } catch (e) {
       lastErr = e.name === 'AbortError' ? '请求超时（' + (CHECKIN_REQUEST_TIMEOUT_MS / 1000) + ' 秒）' : e.message;
@@ -2189,11 +2260,27 @@ async function dailyCheckin(accessToken) {
 
 /** 对单个账号签到（带每日缓存，幂等：今日已成功过则跳过） */
 async function claimDailyForUid(uid) {
-  const cache = loadCheckinCache();
   const today = todayStr();
+  let dbHit = null;
+  try { dbHit = await CREDIT_USAGE_STORE.getDailyCheckin(uid, today); } catch (e) {
+    log('[checkin] 读取 SQLite 标记失败: ' + e.message);
+  }
+  if (dbHit && dbHit.ok === true && dbHit.verified === true) {
+    return { uid, skipped: true, ...dbHit };
+  }
+  const cache = loadCheckinCache();
   const hit = cache[uid];
-  if (hit && hit.date === today && hit.ok) {
-    return { uid, skipped: true, ok: true, already: hit.already, code: hit.code, message: hit.message };
+  const cachedResult = hit && hit.date === today
+    ? classifyCheckinResult({ httpOk: true, code: hit.code, message: hit.message })
+    : null;
+  if (cachedResult && cachedResult.ok) {
+    const migrated = { uid, skipped: true, date: today, ...cachedResult, at: Number(hit.at) || Date.now(), verified: true };
+    try {
+      await CREDIT_USAGE_STORE.saveDailyCheckin({ uid, date: today, checkedAt: migrated.at, code: migrated.code, message: migrated.message });
+    } catch (e) {
+      log('[checkin] 迁移 SQLite 标记失败: ' + e.message);
+    }
+    return migrated;
   }
   const file = path.join(DATA_DIR, 'accounts', uid + '.info');
   if (!fs.existsSync(file)) return { uid, ok: false, reason: 'no-backup' };
@@ -2206,9 +2293,16 @@ async function claimDailyForUid(uid) {
   }
   if (!tk) return { uid, ok: false, reason: 'no-accessToken' };
   const r = await dailyCheckin(tk);
-  const rec = { date: today, ok: !!r.ok, already: !!r.already, code: r.code, message: r.message, at: Date.now() };
+  const rec = { date: today, ok: !!r.ok, already: !!r.already, inactive: !!r.inactive, code: r.code, message: r.message, at: Date.now(), verified: !!r.ok };
   cache[uid] = rec;
   saveCheckinCache(cache);
+  if (rec.ok) {
+    try {
+      await CREDIT_USAGE_STORE.saveDailyCheckin({ uid, date: today, checkedAt: rec.at, code: rec.code, message: rec.message });
+    } catch (e) {
+      log('[checkin] 写入 SQLite 标记失败: ' + e.message);
+    }
+  }
   return { uid, ...rec };
 }
 
@@ -3117,44 +3211,6 @@ function readWorkbuddySettings() {
   } catch (_) {
     return {};
   }
-}
-
-function sleepSync(ms) {
-  if (ms <= 0) return;
-  const sab = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(sab), 0, 0, ms);
-}
-
-/**
- * Replace a JSON file atomically. WorkBuddy can briefly hold the destination
- * open on Windows; retry only transient sharing/permission errors so config
- * writes do not fail during batch operations.
- */
-function replaceFileWithRetry(file, content, mode) {
-  const tmp = `${file}.wbs-tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  fs.writeFileSync(tmp, content, 'utf8');
-  if (mode !== undefined) fs.chmodSync(tmp, mode);
-  const maxAttempts = process.platform === 'win32' ? 80 : 1;
-  let lastError;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      fs.renameSync(tmp, file);
-      return;
-    } catch (error) {
-      lastError = error;
-      const retryable = process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(error && error.code);
-      if (!retryable || attempt === maxAttempts) break;
-      // A stale read-only attribute can surface as EPERM independently of a
-      // sharing violation. Clearing it is limited to this known config file;
-      // the atomic rename remains the only successful write path.
-      if (attempt === 1 && error && error.code === 'EPERM') {
-        try { fs.chmodSync(file, 0o666); } catch (_) {}
-      }
-      sleepSync(Math.min(250, 50 + attempt * 10));
-    }
-  }
-  try { fs.unlinkSync(tmp); } catch (_) {}
-  throw lastError;
 }
 
 function writeWorkbuddySettings(settings) {
@@ -4865,6 +4921,49 @@ async function fetchCredits(accessToken, account) {
   };
 }
 
+async function listDailyUsage(accounts, date = todayStr()) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  if (!list.length) return {};
+  return CREDIT_USAGE_STORE.listDailyUsage(list.map((account) => account.uid), date);
+}
+
+async function syncCurrentCreditUsage(uid, accessToken) {
+  const existing = creditUsageSyncInFlight.get(uid);
+  if (existing) return existing;
+  const task = (async () => {
+    const now = new Date();
+    const nowMs = now.getTime();
+    const state = await CREDIT_USAGE_STORE.getSyncState(uid);
+    if (state && Number.isFinite(state.lastSuccessAt) && nowMs - state.lastSuccessAt < CREDIT_USAGE_REFRESH_MS) {
+      return CREDIT_USAGE_STORE.dailyUsageForUid(uid, todayStr(now));
+    }
+    const lastSuccessAt = state && Number.isFinite(state.lastSuccessAt) && state.lastSuccessAt <= nowMs
+      ? new Date(state.lastSuccessAt)
+      : now;
+    const startTime = startOfLocalDay(lastSuccessAt);
+    const result = await fetchUsageSinceAnchor({
+      accessToken,
+      apiHost: PROFILE.apiHost || 'https://www.workbuddy.cn',
+      startTime,
+      endTime: now,
+      anchorRequestId: state && state.anchorRequestId,
+    });
+    await CREDIT_USAGE_STORE.saveSuccessfulSync({
+      uid,
+      records: result.records,
+      anchorRequestId: result.newestRequestId || (state && state.anchorRequestId) || '',
+      syncedAt: nowMs,
+    });
+    return CREDIT_USAGE_STORE.dailyUsageForUid(uid, todayStr(now));
+  })();
+  creditUsageSyncInFlight.set(uid, task);
+  try {
+    return await task;
+  } finally {
+    if (creditUsageSyncInFlight.get(uid) === task) creditUsageSyncInFlight.delete(uid);
+  }
+}
+
 /* ================= 账号导出 / 导入 =================
  * v2 导出：用户在面板输入非空密码；随机 salt + AES-256-GCM，密码不落盘、不写日志。
  * v1 导入：兼容历史固定密码 workdaddy 的导出文件，空密码即走旧格式默认值。
@@ -5279,13 +5378,33 @@ function handleApi(req, res) {
     const cache = loadCheckinCache();
     const today = todayStr();
     const checkinPending = !!claimInFlight;
-    const enriched = accounts.map((a) => {
-      const c = cache[a.uid];
-      return Object.assign({}, a, {
-        checkin: checkinDisplayValue(c, today, checkinPending),
+    return CREDIT_USAGE_STORE.listDailyCheckins(accounts.map((a) => a.uid), today)
+      .catch((error) => {
+        log('[checkin] 读取 SQLite 标记失败: ' + error.message);
+        return {};
+      })
+      .then((dbCheckins) => {
+        const enriched = accounts.map((a) => {
+          const c = dbCheckins[a.uid] || cache[a.uid];
+          const checked = c && c.ok && (c.verified === true || classifyCheckinResult({ httpOk: true, code: c.code, message: c.message }).ok)
+            ? c
+            : null;
+          return Object.assign({}, a, {
+            checkin: checkinDisplayValue(checked, today, checkinPending),
+          });
+        });
+        return listDailyUsage(enriched, today)
+          .then((summaries) => {
+            const withUsage = enriched.map((account) => summaries[account.uid]
+              ? Object.assign({}, account, { todayUsage: summaries[account.uid] })
+              : account);
+            return json(res, 200, { ok: true, current: currentAccount(), accounts: withUsage, checkin: checkinSnapshot() });
+          })
+          .catch((error) => {
+            log('[credits-usage] 读取本地今日用量失败: ' + error.message);
+            return json(res, 200, { ok: true, current: currentAccount(), accounts: enriched, checkin: checkinSnapshot() });
+          });
       });
-    });
-    return json(res, 200, { ok: true, current: currentAccount(), accounts: enriched, checkin: checkinSnapshot() });
   }
 
   // 查询指定账号的剩余积分（v2 全量资源 Account 汇总）
@@ -5299,8 +5418,18 @@ function handleApi(req, res) {
         const j = JSON.parse(fs.readFileSync(file, 'utf8'));
         const tk = j.auth && j.auth.accessToken;
         if (!tk) return json(res, 400, { ok: false, error: '备份中无 accessToken' });
-        const r = await fetchCredits(tk, j.account);
-        return json(res, 200, {
+        const current = currentAccount();
+        const shouldSyncUsage = !!(current && current.uid === uid);
+        const usagePromise = shouldSyncUsage
+          ? syncCurrentCreditUsage(uid, tk)
+            .then((value) => ({ synced: true, value }))
+            .catch((error) => {
+              log('[credits-usage] 当前账号增量同步失败: ' + error.message);
+              return { synced: false };
+            })
+          : Promise.resolve({ synced: false });
+        const [r, usage] = await Promise.all([fetchCredits(tk, j.account), usagePromise]);
+        const payload = {
           ok: true,
           uid,
           credits: r.credits,
@@ -5313,7 +5442,9 @@ function handleApi(req, res) {
           segments: r.segments,
           unlimited: !!r.unlimited,
           cycleResetTime: r.cycleResetTime || null,
-        });
+        };
+        if (usage.synced) payload.todayUsage = usage.value;
+        return json(res, 200, payload);
       } catch (e) {
         log(`[credits] 查询 ${uid} 积分失败: ${e.message}`);
         return json(res, 500, { ok: false, error: e.message });
@@ -6610,14 +6741,16 @@ function startServer() {
     log('[ws] DevTools 代理就绪 (/devtools-proxy/<targetId>)');
   }
 
-  // 直接运行且未指定端口时保留旧的 +1 兼容行为。launcher/install 已绑定 profile
-  // 端口时必须 fail closed，避免 AI 47833 串到其他 profile 的 47834/47835。
-  let port = UI_PORT_BASE;
+  // 每个 profile 的候选端口完全不重叠。显式端口由 launcher 预先选定，
+  // 直接运行 daemon 时才在本 profile 的持久化/固定候选中回退。
+  const ports = ALLOW_UI_PORT_FALLBACK
+    ? profileUiPortCandidates(PROFILE.id, { persistedPort: readUiPortFile(), preferredPort: UI_PORT_BASE })
+    : [UI_PORT_BASE];
   const tryListen = (attempt) => {
+    const port = ports[attempt];
     server.once('error', (e) => {
-      if (e.code === 'EADDRINUSE' && ALLOW_UI_PORT_FALLBACK && attempt < 7) {
-        port += 1;
-        log(`[http] 端口占用，改用 ${port}`);
+      if (e.code === 'EADDRINUSE' && attempt + 1 < ports.length) {
+        log(`[http] 端口 ${port} 不可绑定，改用当前 profile 备用端口 ${ports[attempt + 1]}`);
         tryListen(attempt + 1);
       } else {
         log(`[http] 启动失败: ${e.message}`);
@@ -6626,6 +6759,7 @@ function startServer() {
     });
     server.listen(port, HOST, () => {
       ACTUAL_PORT = port;
+      writeUiPortFile(port);
       log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
     });
   };
@@ -6646,6 +6780,7 @@ process.on('unhandledRejection', (reason) => {
 
 ensureDirs(DATA_DIR, log);
 if (!acquireDaemonLock()) process.exit(0);
+CREDIT_USAGE_STORE.initialize().catch((error) => log('[credits-usage] 初始化数据库失败: ' + error.message));
 // 首次启动初始化（新电脑 / 数据目录为空时）：内置壁纸 + WorkDaddy 主题 + 默认蒙版 10%
 initBuiltinAssets();
 // 启动时刷新决策弹窗规则到最新版本（已启用时替换旧规则段）

@@ -68,6 +68,10 @@ test('PowerShell source validates owner, exact launcher token, PID, and listener
   const helper = fs.readFileSync(helperPath, 'utf8');
   assert.doesNotMatch(helper, /Add-Type|csc\.exe/i);
   assert.match(helper, /Invoke-CimMethod[^\r\n]*GetOwner/i);
+  assert.match(helper, /function Test-CimProcessDisappearedError/);
+  assert.match(helper, /0x80041002/);
+  assert.match(helper, /function ConvertTo-WorkDaddyProcessRecordIfPresent/);
+  assert.match(helper, /\$record = ConvertTo-WorkDaddyProcessRecord[\s\S]*\$null -eq \$record/);
   assert.match(helper, /Test-ExactCmdLauncherCommandLine/);
   assert.match(helper, /Get-UniqueListeningProcessId/);
   assert.match(helper, /function Get-UniqueNodeProcessForScript/);

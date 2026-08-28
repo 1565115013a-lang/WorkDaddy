@@ -4,12 +4,12 @@
  *
  * 冷启动流程：
  *   1) 确保 daemon 运行 —— watchdog 常驻（崩溃自动拉起）；daemon 版本与内置不一致时强制重启
- *   2) 若 WorkBuddy 已在运行，弹窗要求用户完全退出，本次入口安静结束
- *   3) 否则以自动选择的 CDP 端口启动 → 等端口 → 注入
+ *   2) 若当前 profile 的 WorkBuddy 已在运行但没有 CDP，先按已验证 PID 重启
+ *   3) 以自动选择的 CDP 端口启动 → 等端口 → 注入
  *
  * 由 launcher.cmd 调用（cmd 负责兜底找 node），也可 node win-launcher.js 直接运行。
  * 默认按普通用户运行；用户明确以管理员身份启动时，先通过桌面 Shell
- * 重启为标准权限。真正关闭 UAC、没有过滤 token 时才继续当前权限。
+ * 重启为标准权限。若无法确认已降权，则 fail closed 并提示用户。
  */
 'use strict';
 
@@ -47,8 +47,12 @@ if (process.platform === 'win32') {
 const { captureMessage, captureException } = require('./sentry-report.js');
 const { getProfile, profileDataDir } = require('./profiles.js');
 const { isTargetForProfile } = require('./cdp-targets.js');
+const { replaceFileWithRetry } = require('./atomic-file-write.js');
+const { parseUiPortState, profileUiPortCandidates } = require('./ui-port.js');
 
 const SCRIPTS_DIR = __dirname;
+const WORKDADDY_APP_DIR = path.resolve(SCRIPTS_DIR, '..');
+process.env.WBSWITCH_APP_DIR = WORKDADDY_APP_DIR;
 const HOST = '127.0.0.1';
 const PROFILE_ID = process.env.WBSWITCH_PROFILE || 'workbuddy-cn';
 if (!process.env.WBSWITCH_PROFILE) process.env.WBSWITCH_PROFILE = PROFILE_ID;
@@ -60,10 +64,12 @@ const DATA_DIR =
 const API_TOKEN_FILE = path.join(DATA_DIR, '.api-token');
 const DESKTOP_RELAUNCH_ARG = '--desktop-shell-relaunch';
 const DEFAULT_UI_PORT = { 'workbuddy-cn': 47832, 'workbuddy-ai': 47833, 'codebuddy-cn': 47834, 'codebuddy-intl': 47835 }[PROFILE.id] || 47832;
-const UI_PORT = parseInt(process.env.WBSWITCH_PORT || String(DEFAULT_UI_PORT), 10);
-// watchdog/daemon inherit process.env. Persist the resolved profile port so an
-// AI launcher cannot fall back to daemon.js's legacy 47832 default.
+const REQUESTED_UI_PORT = parseInt(process.env.WBSWITCH_PORT || String(DEFAULT_UI_PORT), 10);
+let UI_PORT = REQUESTED_UI_PORT;
+// Make the profile's initial UI port available to every child process immediately.
+// configureUiPort() may replace it with a persisted fallback later.
 process.env.WBSWITCH_PORT = String(UI_PORT);
+const UI_PORT_FILE = path.join(DATA_DIR, 'ui-port.json');
 const PROFILE_CDP_PORTS = {
   'workbuddy-cn': [9222, 9226, 9227, 9228, 9229, 9230, 9231, 9232],
   'workbuddy-ai': [9223, 9233, 9234, 9235, 9236, 9237, 9238, 9239],
@@ -112,6 +118,51 @@ function readApiToken() {
 function localApiHeaders() {
   const token = readApiToken();
   return token ? { 'X-WorkDaddy-Token': token } : {};
+}
+
+function readUiPortFile() {
+  try { return parseUiPortState(fs.readFileSync(UI_PORT_FILE, 'utf8'), PROFILE.id); } catch (_) { return null; }
+}
+
+function writeUiPortFile(port) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  replaceFileWithRetry(UI_PORT_FILE, JSON.stringify({
+    profileId: PROFILE.id,
+    port,
+    updatedAt: new Date().toISOString(),
+  }) + '\n', 0o600);
+}
+
+function useUiPort(port) {
+  UI_PORT = port;
+  process.env.WBSWITCH_PORT = String(port);
+  writeUiPortFile(port);
+  return port;
+}
+
+async function configureUiPort() {
+  const candidates = profileUiPortCandidates(PROFILE.id, {
+    preferredPort: REQUESTED_UI_PORT,
+    persistedPort: readUiPortFile(),
+  });
+  for (const port of candidates) {
+    const response = await httpGet(port, '/api/status', localApiHeaders());
+    if (!response || response.status !== 200) continue;
+    let status;
+    try { status = JSON.parse(response.body); } catch (_) { continue; }
+    if (status && status.profile && status.profile.id === PROFILE.id &&
+        status.dataDir && sameWindowsPath(status.dataDir, DATA_DIR)) {
+      log('发现当前 profile daemon UI 端口: ' + port);
+      return useUiPort(port);
+    }
+  }
+  for (const port of candidates) {
+    if (await isLocalPortAvailable(port)) {
+      log((port === DEFAULT_UI_PORT ? '选择默认' : '选择备用') + ' daemon UI 端口: ' + port);
+      return useUiPort(port);
+    }
+  }
+  throw new Error('当前 profile 的 daemon UI 端口均不可绑定。请关闭占用端口的软件或 WSL2/Hyper-V 后重试');
 }
 
 function relaunchWithDesktopShell(nodeBin) {
@@ -342,6 +393,7 @@ function getWorkBuddyProcesses() {
     requireCommandLine: true,
     requireCurrentOwner: true,
     requireNativeArguments: true,
+    allowTransientNotFound: true,
   });
 }
 
@@ -350,8 +402,14 @@ function daemonRunning() {
   return portOpen(UI_PORT);
 }
 
+function isPrewarmProcess(process) {
+  return /(?:^|\s)--prewarm(?:\s|$)/i.test(String(process && process.CommandLine || ''));
+}
+
 function workBuddyProcesses(binary = null) {
-  const processes = getWorkBuddyProcesses();
+  // WorkBuddy AI keeps a headless prewarm helper alive between windows. It is
+  // not the user-facing app and must not block a cold launch or be terminated.
+  const processes = getWorkBuddyProcesses().filter((process) => !isPrewarmProcess(process));
   if (!binary) return processes;
   const verified = filterVerifiedWindowsProcesses(binary, processes);
   if (processes.length !== verified.length) {
@@ -414,8 +472,8 @@ function logProcessDiagnostics(binary, prefix = 'WorkBuddy 进程诊断') {
   return rows;
 }
 
-// 桌面快捷方式是“冷启动”入口：已有 WorkBuddy 时不结束用户进程，也不抢占其窗口。
-// 进程查询失败同样按无法确认处理，避免在边界状态误重启官方应用。
+// 仅保留给旧调用方的状态查询。真正的启动流程会在 findWorkBuddy() 后，
+// 通过 quitWorkBuddy() 对当前 profile 的已验证进程做精确重启。
 function requireWorkBuddyClosedBeforeLaunch() {
   if (process.platform !== 'win32') return false;
   let rows;
@@ -463,19 +521,26 @@ function findNode() {
       .filter((p) => fs.existsSync(p))
       .sort();
   } catch (_) {}
-  // Existing installs may have a watchdog/daemon still running under WorkBuddy's
-  // managed Node. Reuse that runtime first so identity checks can see the old
-  // process during an upgrade; fresh installs still prefer the bundled runtime.
-  const hasExistingWatchdogState = fs.existsSync(path.join(DATA_DIR, 'watchdog.pid'));
-  if (hasExistingWatchdogState && verDirs.length) {
-    return resolveWindowsExecutable(verDirs[verDirs.length - 1]);
+
+  // A stale watchdog.pid is not evidence that the daemon uses WorkBuddy's
+  // managed Node. Select a runtime only when its exact daemon/watchdog process
+  // is actually running; otherwise a stale PID file can make identity checks
+  // reject a valid daemon started by the bundled runtime.
+  const candidates = [];
+  for (const candidate of [bundled, ...verDirs]) {
+    try {
+      const resolved = resolveWindowsExecutable(candidate);
+      if (!candidates.some((item) => sameWindowsPath(item, resolved))) candidates.push(resolved);
+    } catch (_) {}
   }
-  try {
-    if (fs.existsSync(bundled)) return resolveWindowsExecutable(bundled);
-  } catch (_) {}
-  if (verDirs.length) {
-    try { return resolveWindowsExecutable(verDirs[verDirs.length - 1]); } catch (_) {}
+  for (const candidate of candidates) {
+    try {
+      if (uniqueNodeProcess(candidate, DAEMON_SCRIPT) || uniqueNodeProcess(candidate, WATCHDOG_SCRIPT)) {
+        return candidate;
+      }
+    } catch (_) {}
   }
+  if (candidates.length) return candidates[0];
   try {
     const r = spawnSync('where.exe', ['node.exe'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
     const candidate = String(r.stdout || '').split(/\r?\n/).map((line) => line.trim()).find(Boolean);
@@ -497,7 +562,10 @@ function findWorkBuddy() {
     } catch (_) {}
     return null;
   };
-  const runningBin = selectRunningProfileBinary([...PROFILE_BINARY_NAMES], getWorkBuddyProcesses());
+  const runningBin = selectRunningProfileBinary(
+    [...PROFILE_BINARY_NAMES],
+    getWorkBuddyProcesses().filter((process) => !isPrewarmProcess(process))
+  );
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
   if (process.env.WBSWITCH_WORKBUDDY_BIN && !envBin) {
     throw new Error('WBSWITCH_WORKBUDDY_BIN 不是可验证的当前 profile 主程序');
@@ -654,10 +722,41 @@ function readWatchdogPid() {
   }
 }
 
-function watchdogState(nodeBin) {
-  const pid = readWatchdogPid();
-  const exact = uniqueNodeProcess(nodeBin, WATCHDOG_SCRIPT);
-  if (!pid) return exact ? { kind: 'untracked', pid: null, process: exact } : { kind: 'absent', pid: null };
+async function watchdogState(nodeBin) {
+  let pid = readWatchdogPid();
+  let exact = uniqueNodeProcess(nodeBin, WATCHDOG_SCRIPT);
+  if (!pid) {
+    // A detached watchdog can be visible to CIM a moment before its atomic
+    // PID-file write becomes visible. Give that startup race a short window;
+    // after it expires, a single exact process can be recovered below while
+    // ambiguous or duplicate instances still fail closed.
+    for (let attempt = 0; attempt < 10 && !pid; attempt += 1) {
+      if (attempt > 0) await sleep(250);
+      pid = readWatchdogPid();
+      if (pid) break;
+      exact = uniqueNodeProcess(nodeBin, WATCHDOG_SCRIPT);
+    }
+  }
+  if (!pid && exact) {
+    // An installer/update can remove watchdog.pid after the exact watchdog
+    // process has started but before that process exits. The executable path,
+    // entry script, owner, and profile-specific scripts directory are already
+    // stronger identity evidence than the user-writable PID file. Recreate the
+    // file only for this single exact process, then re-read it and verify the
+    // process again before allowing reuse.
+    try {
+      fs.writeFileSync(WATCHDOG_PID_FILE, String(exact.ProcessId), { flag: 'wx' });
+      log(`通过精确身份恢复缺失的 watchdog.pid=${exact.ProcessId}`);
+      pid = readWatchdogPid();
+    } catch (error) {
+      const current = readWatchdogPid();
+      if (current !== Number(exact.ProcessId)) {
+        throw new Error('当前 profile 的 watchdog.pid 缺失，且无法安全恢复: ' + error.message);
+      }
+      pid = current;
+    }
+  }
+  if (!pid) return { kind: 'absent', pid: null };
   let processes;
   try {
     processes = queryNodeProcesses(nodeBin, [pid], path.basename(WATCHDOG_SCRIPT));
@@ -752,7 +851,13 @@ function killVerifiedNodeProcess(process, nodeBin, expectedScript) {
   const result = spawnSync('taskkill', ['/F', '/PID', String(pid)], {
     stdio: 'ignore', windowsHide: true, timeout: 10000,
   });
-  if (result.error || result.status !== 0) throw new Error(`无法结束已验证进程 PID=${pid}`);
+  if (result.error || result.status !== 0) {
+    // taskkill can race with a process that exits after the final identity
+    // check. Re-query the exact PID before failing; a missing PID means the
+    // requested termination already happened.
+    if (queryNodeProcesses(nodeBin, [pid]).length === 0) return true;
+    throw new Error(`无法结束已验证进程 PID=${pid}`);
+  }
   if (queryNodeProcesses(nodeBin, [pid]).length !== 0) throw new Error(`已验证进程 PID=${pid} 未退出`);
   return true;
 }
@@ -778,7 +883,7 @@ function removeWatchdogPidIf(pid) {
 }
 
 async function stopDaemonByPort(nodeBin, allowLowerPrivilege = false) {
-  const watchdog = watchdogState(nodeBin);
+  const watchdog = await watchdogState(nodeBin);
   if (watchdog.kind === 'untracked') {
     throw new Error('发现没有当前 profile PID 文件的 watchdog 进程，拒绝复用或结束');
   }
@@ -860,7 +965,7 @@ async function ensureDaemon(nodeBin) {
     }
   }
 
-  let watchdog = watchdogState(nodeBin);
+  let watchdog = await watchdogState(nodeBin);
   if (watchdog.kind === 'untracked') {
     throw new Error('发现没有当前 profile PID 文件的 watchdog 进程，拒绝复用或结束');
   }
@@ -928,11 +1033,18 @@ function exitSnapshot(binary = null) {
   };
 }
 
-async function killForExit(args, stage) {
+async function killForExit(args, stage, verifyGone) {
   const result = await runTaskkill(args);
   const error = result.error ? result.error.message : '';
   log(`[exit] ${stage} taskkill=${args.join(' ')} code=${result.code == null ? 'null' : result.code}${error ? ' error=' + error : ''}`);
   if (result.error || result.code !== 0) {
+    // Windows may report ERRORLEVEL 128 when the target exits between the
+    // caller's identity re-check and taskkill. Accept it only when this exact
+    // target PID has disappeared.
+    if (verifyGone && await verifyGone()) {
+      log(`[exit] ${stage} taskkill 非零但目标 PID 已消失，按竞态成功处理`);
+      return result;
+    }
     throw result.error || new Error(`${stage} taskkill 失败 (code=${result.code})`);
   }
   return result;
@@ -943,7 +1055,16 @@ async function killVerifiedWorkBuddyProcess(binary, process, force, stage) {
   const current = workBuddyProcesses(binary).find((item) => Number(item.ProcessId) === pid);
   if (!current) return false;
   assertSameProcessIdentity(process, current);
-  await killForExit([...(force ? ['/F'] : []), '/PID', String(pid)], stage);
+  await killForExit(
+    [...(force ? ['/F'] : []), '/PID', String(pid)],
+    stage,
+    async () => {
+      const after = workBuddyProcesses(binary).find((item) => Number(item.ProcessId) === pid);
+      if (!after) return true;
+      assertSameProcessIdentity(process, after);
+      return false;
+    }
+  );
   return true;
 }
 
@@ -1131,9 +1252,12 @@ if (require.main === module) (async () => {
       log('管理员入口已通过桌面 Shell 重新派发；当前 elevated launcher 退出');
       process.exit(0);
     }
-    log('桌面 Shell 仍返回 elevated token（可能已关闭 UAC），继续使用当前系统权限');
+    log('桌面 Shell 仍返回 elevated token（可能已关闭 UAC），拒绝继续启动管理员权限 WorkDaddy');
+    showWindowsMessageBox(WBS_BRAND, '无法自动降回普通用户权限，已拒绝启动管理员权限 WorkDaddy。请开启 UAC 后双击快捷方式重试。');
+    process.exit(5);
   }
   await configureCdpPort();
+  await configureUiPort();
 
   await ensureDaemon(nodeBin);
 
@@ -1144,8 +1268,6 @@ if (require.main === module) (async () => {
     console.log(WBS_BRAND + '：WorkBuddy 已在调试模式，组件已注入 ✓');
     process.exit(0);
   }
-
-  if (requireWorkBuddyClosedBeforeLaunch()) process.exit(0);
 
   // 未开 CDP → 需要重启 WorkBuddy 带调试端口
   const wb = findWorkBuddy();
@@ -1182,6 +1304,7 @@ if (require.main === module) (async () => {
 })().catch((e) => {
   log('launcher 异常: ' + (e && e.stack || e));
   console.error(WBS_BRAND + ' 启动异常: ' + (e && e.message || e));
+  showWindowsMessageBox(WBS_BRAND, '启动失败：' + (e && e.message || e) + '\n\n详细信息已写入 launcher.log。');
   captureException(e, { stage: 'windows-launcher-uncaught' }).catch(() => {}).finally(() => process.exit(4));
 });
 

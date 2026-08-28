@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)][string]$NodePath,
   [Parameter(Mandatory = $true)][string]$LauncherPath
 )
@@ -22,10 +22,29 @@ if (-not $launcher.StartsWith($scriptsRoot, [StringComparison]::OrdinalIgnoreCas
   throw 'Windows launcher is outside the installed scripts directory.'
 }
 
-# Shell.Application delegates ShellExecute to the interactive Explorer shell.
-# With normal UAC this yields the desktop user's standard token. If UAC is
-# genuinely disabled, Explorer has no filtered token and the marker prevents a
-# relaunch loop; the Node launcher then continues in the only available mode.
-$shell = New-Object -ComObject Shell.Application
+# Ask the out-of-process Explorer desktop for its Application object. Creating
+# Shell.Application in-process from an elevated launcher can preserve the
+# elevated token instead of performing a real de-elevation.
+$shellWindows = New-Object -ComObject Shell.Application
+$desktopView = $null
+try {
+  $desktopLocation = 0
+  $desktopRoot = 0
+  $desktopHwnd = 0
+  # SWC_DESKTOP (8) asks the ShellWindows collection for Explorer's desktop
+  # view, whose Application object is owned by the unelevated Explorer process.
+  $desktopView = $shellWindows.FindWindowSW([ref]$desktopLocation, [ref]$desktopRoot, 8, [ref]$desktopHwnd, 1)
+} catch {}
+if (-not $desktopView) {
+  # Explorer's MainWindowHandle is not guaranteed to match the HWND exposed
+  # by ShellWindows. Match the out-of-process Shell object by executable path.
+  $desktopView = $shellWindows.Windows() |
+    Where-Object {
+      try { [IO.Path]::GetFileName([string]$_.FullName) -ieq 'explorer.exe' } catch { $false }
+    } |
+    Select-Object -First 1
+}
+if (-not $desktopView) { throw '无法取得 Explorer 桌面视图，拒绝以管理员权限继续启动。' }
+$shell = $desktopView.Document.Application
 $arguments = '--experimental-sqlite ' + (Quote-WindowsArgument $launcher) + ' --desktop-shell-relaunch'
 $shell.ShellExecute($node, $arguments, (Split-Path -Parent $launcher), 'open', 0)

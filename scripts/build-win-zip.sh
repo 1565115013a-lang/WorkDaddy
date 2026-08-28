@@ -119,10 +119,6 @@ fi
 # 3.1) 顶层入口（zip 根）：Install-WorkDaddy.cmd / Start-WorkDaddy.cmd
 cp scripts/Install-WorkDaddy.cmd "$STAGE/Install-WorkDaddy.cmd"
 cp scripts/Start-WorkDaddy.cmd "$STAGE/Start-WorkDaddy.cmd"
-# 3.1a) Windows 故障排查提示词（供用户在安装失败时交给修复 agent）
-if [ -f "$DIR/安装失败自主解决提示词.txt" ]; then
-  cp "$DIR/安装失败自主解决提示词.txt" "$STAGE/安装失败自主解决提示词.txt"
-fi
 # 3.2) scripts\ 本体（含 node_modules/ws、builtin）
 cp -R scripts "$STAGE/scripts"
 # Windows cmd.exe expects CRLF in batch files.  Normalise every staged .cmd
@@ -321,20 +317,18 @@ patch('scripts/verify-win.cmd', [
 print('==>  品牌化替换完成（Install/Start/install-win/launcher/verify-win + base64 提示）')
 PY
 fi
-# 3.3.5) 非 ASCII 文件名守护：仅允许根目录的故障排查提示词，其余路径必须保持 ASCII。
+# 3.3.5) 非 ASCII 文件名守护：Windows 安装包路径必须保持 ASCII。
 #        macOS 自带 Info-ZIP 会使用 UTF-8 条目写入；安装/更新脚本本身仍全部使用 ASCII 路径。
 NON_ASCII_PATHS="$(find "$STAGE" -not -path '*/node_modules/*' 2>/dev/null | LC_ALL=C grep '[^ -~]' || true)"
-UNEXPECTED_NON_ASCII="$(printf '%s\n' "$NON_ASCII_PATHS" | LC_ALL=C grep -v '安装失败自主解决提示词\.txt$' || true)"
-if [ -n "$UNEXPECTED_NON_ASCII" ]; then
-  echo "==> ERROR: 发布包包含未批准的非 ASCII 文件路径，已终止打包！"
-  printf '%s\n' "$UNEXPECTED_NON_ASCII" | head -20
+if [ -n "$NON_ASCII_PATHS" ]; then
+  echo "==> ERROR: 发布包包含非 ASCII 文件路径，已终止打包！"
+  printf '%s\n' "$NON_ASCII_PATHS" | head -20
   rm -rf "$STAGE" 2>/dev/null || true
   exit 3
 fi
-echo "==> 非 ASCII 文件名守护通过（仅包含批准的故障排查提示词）"
-# 3.4) 打包：优先使用 Python zipfile，确保中文提示词写入 UTF-8 文件名标记。
-#      macOS 自带 zip 会把中文文件名按本地代码页写入，Windows/Python 解压后会出现乱码。
-#      没有 Python 且需要中文提示词时直接失败，避免生成名字损坏的发布包。
+echo "==> 非 ASCII 文件名守护通过"
+# 3.4) 打包：优先使用 Python zipfile，确保 Windows 条目编码稳定。
+#      macOS 自带 zip 会把非 ASCII 文件名按本地代码页写入，Windows/Python 解压后会出现乱码。
 if [ -n "$PYTHON_BIN" ]; then
   "$PYTHON_BIN" - "$(winpath "$STAGE")" "$(winpath "$DIR/$OUT")" <<'PY'
 import os
@@ -355,11 +349,7 @@ with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             arcname = os.path.relpath(source, stage).replace(os.sep, '/')
             archive.write(source, arcname)
 PY
-elif [ -f "$STAGE/安装失败自主解决提示词.txt" ]; then
-  echo "==> ERROR: 包含中文故障排查提示词，但当前环境没有可用 Python，无法生成 UTF-8 ZIP。"
-  rm -rf "$STAGE" 2>/dev/null || true
-  exit 4
-elif command -v zip >/dev/null 2>&1; then
+    elif command -v zip >/dev/null 2>&1; then
   (cd "$STAGE" && zip -r -q "$DIR/$OUT" .)
 else
   tar -a -cf "$DIR/$OUT" -C "$STAGE" .

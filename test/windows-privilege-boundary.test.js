@@ -320,7 +320,7 @@ test('watchdog stop terminates only reverified watchdog and direct daemon PIDs',
   }
 });
 
-test('watchdog startup refuses an exact untracked instance when the PID file is absent', () => {
+test('watchdog startup repairs a missing PID file for one exact instance', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-watchdog-untracked-'));
   const preload = path.join(tempDir, 'preload.js');
   const untrackedPid = 424203;
@@ -350,9 +350,9 @@ test('watchdog startup refuses an exact untracked instance when the PID file is 
       env: { ...process.env, WBSWITCH_DATA_DIR: tempDir },
       timeout: 10000,
     });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /没有 PID 文件|untracked|重复实例/i);
-    assert.equal(fs.existsSync(path.join(tempDir, 'watchdog.pid')), false);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /恢复缺失的 watchdog\.pid|本实例退出/i);
+    assert.equal(fs.readFileSync(path.join(tempDir, 'watchdog.pid'), 'utf8'), String(untrackedPid));
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -399,7 +399,7 @@ test('logout and restart paths refuse unverified profile processes', () => {
 test('Windows self-check includes the shared boundary and old admin comments are removed', () => {
   const verify = fs.readFileSync(path.join(scriptsDir, 'verify-win.cmd'), 'utf8');
   assert.match(verify, /win-launcher\.js windows-process-boundary\.js/);
-  assert.match(verify, /安装失败自主解决提示词\.txt/);
+  assert.doesNotMatch(verify, /安装失败自主解决提示词\.txt/);
   assert.doesNotMatch(verify, /win-inject-helper\.js/);
   assert.doesNotMatch(hiddenLauncherSource + cmdLauncherSource, /shortcut as administrator|管理员启动/i);
 });

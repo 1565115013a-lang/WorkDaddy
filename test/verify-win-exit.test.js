@@ -49,7 +49,7 @@ test('Windows verifier reports missing package files as a failing process', { sk
     assert.ifError(result.error);
     assert.equal(result.status, 1, result.stdout + result.stderr);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
   }
 });
 
@@ -79,7 +79,7 @@ test('Windows verifier returns success for a complete source package', { skip: p
     assert.ifError(result.error);
     assert.equal(result.status, 0, result.stdout + result.stderr);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
   }
 });
 
@@ -112,6 +112,6 @@ test('Windows verifier restores the caller code page', { skip: process.platform 
     assert.match(result.stdout, /VERIFY_STATUS=1/);
     assert.match(result.stdout, /AFTER_CP=\s*437/);
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
   }
 });

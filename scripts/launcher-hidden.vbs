@@ -1,7 +1,7 @@
 Option Explicit
 
 ' Desktop shortcut entry point. wscript.exe starts the Node launcher without a console window.
-Dim shell, fso, launcher, launcherJs, nodeBin, command, status
+Dim shell, fso, launcher, launcherJs, nodeBin, command, status, logPath
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
@@ -41,7 +41,11 @@ If Not fso.FileExists(nodeBin) Then nodeBin = "node.exe"
 shell.CurrentDirectory = fso.GetParentFolderName(launcher)
 command = """" & nodeBin & """ --experimental-sqlite """ & launcherJs & """"
 status = shell.Run(command, 0, True)
-' The Node launcher records failures in %APPDATA%\\WorkDaddy\\launcher.log.
-' Keep the desktop shortcut silent: a modal dialog makes a successful GUI launch
-' look broken and can remain hidden behind WorkBuddy.
+' The Node launcher records failures in %APPDATA%\\WorkDaddy\\launcher.log and
+' shows details for uncaught failures. A non-zero status without that dialog means
+' Node itself failed before the launcher could report the error.
+If status <> 0 And status <> 4 Then
+  logPath = shell.ExpandEnvironmentStrings("%APPDATA%") & "\WorkDaddy\launcher.log"
+  MsgBox "WorkDaddy launch failed, exit code " & status & "." & vbCrLf & "See " & logPath & ".", 48, "WorkDaddy"
+End If
 WScript.Quit status

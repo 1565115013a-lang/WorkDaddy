@@ -62,7 +62,6 @@ Source: "{#StageRoot}\scripts\prepare-win-install.ps1"; Flags: dontcopy
 Source: "{#StageRoot}\scripts\windows-process-boundary.ps1"; Flags: dontcopy
 Source: "{#StageRoot}\scripts\*"; DestDir: "{app}\scripts"; Excludes: "prepare-win-install.ps1,runtime\node\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageRoot}\scripts\runtime\node\*"; DestDir: "{app}\scripts\runtime\node"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: ShouldReplaceRuntime
-Source: "{#StageRoot}\安装失败自主解决提示词.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{sys}\wscript.exe"; Parameters: "//nologo ""{app}\scripts\launcher-hidden.vbs"""; WorkingDir: "{app}\scripts"; IconFilename: "{app}\scripts\WorkDaddy.ico"

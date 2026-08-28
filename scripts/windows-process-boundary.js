@@ -87,6 +87,7 @@ function parseCimProcessResult(result, options = {}) {
   }
   if (result.status !== 0) {
     const detail = String(result.stderr || '').trim();
+    if (options.allowTransientNotFound && /(0x80041002|ObjectNotFound|not found)/i.test(detail)) return [];
     throw new Error(`CIM process query exited with status ${result.status}${detail ? ': ' + detail : ''}`);
   }
   const output = String(result.stdout || '').trim();
@@ -132,7 +133,7 @@ function buildNativeProcessQuery(helperPath, processSource) {
     throw new Error('Native process query requires a trusted absolute helper and source');
   }
   const quotedHelper = helper.replace(/'/g, "''");
-  return `. '${quotedHelper}'; ${source} | ForEach-Object { ConvertTo-WorkDaddyProcessRecord -Process $_ } | ConvertTo-Json -Compress -Depth 4`;
+  return `. '${quotedHelper}'; ${source} | ForEach-Object { ConvertTo-WorkDaddyProcessRecordIfPresent -Process $_ } | Where-Object { $null -ne $_ } | ConvertTo-Json -Compress -Depth 4`;
 }
 
 function sameWindowsFilePath(a, b) {

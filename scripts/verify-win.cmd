@@ -34,12 +34,6 @@ if exist "%SCRIPT_DIR%..\Install-WorkDaddy.cmd" (
   echo   提示: 顶层 Install-WorkDaddy.cmd 未就位（打包时从 scripts\ 提升到 zip 根）
 )
 if exist "%SCRIPT_DIR%..\Start-WorkDaddy.cmd" echo   顶层入口 Start-WorkDaddy.cmd 存在
-if exist "%SCRIPT_DIR%..\安装失败自主解决提示词.txt" (
-  echo   安装失败自主解决提示词.txt 存在
-) else (
-  echo   缺失: 安装失败自主解决提示词.txt
-  set /a FAIL+=1
-)
 if not exist "%SCRIPT_DIR%node_modules\ws\index.js" (
   echo   警告: node_modules\ws 缺失（DevTools 代理降级，其他功能不受影响）
 )

@@ -109,8 +109,56 @@ The queue item's 暂存提示词 tag is rendered by `syncQueueTags` (in `scripts
 - Build scripts must always rewrite the staged daemon version from the release `VERSION`; never rely on the version embedded in the reusable `WorkDaddy.app` shell or on a conditional test-only override.
 - Windows releases are `Setup.exe` only. The `*-win64.zip` created by the installer pipeline is temporary staging and must be deleted before artifact upload or GitHub Release publication; ZIP remains supported only as an updater fallback for historical releases.
 - Before publishing or handing off a package, inspect the actual DMG/Setup.exe payload and record the daemon version, app metadata version, profile branding, and required update scripts. Do not infer package correctness from the filename alone.
-- Every Windows Setup.exe payload and macOS DMG staging directory must include `安装失败自主解决提示词.txt`; `scripts/verify-win.cmd` must treat the Windows copy as required. Inspect the packaged prompt filename/encoding along with the other release contents.
+- The repair prompt `安装失败自主解决提示词.txt` may remain in the source tree for the user-initiated repair-agent flow, but it must not be copied into Windows Setup.exe payloads or macOS release staging directories. Release verification must confirm that the prompt is absent from the deliverable.
 - The updater must reject an artifact whose internal daemon version does not match the GitHub release target, and must leave a local diagnostic trail showing the selected asset, expected version, internal version, and installation attempt ID.
+
+## Windows Packaging Runbook
+
+Use this exact flow for a Windows release. The two client packages are built from the same source tree, but each is staged with its own profile, installation directory, daemon port, desktop shortcut, and WorkBuddy executable name.
+
+1. Start from the requested source commit/branch and confirm the working tree. Do not silently change the release version in `scripts/daemon.js` when producing a fixed-version package; pass the requested version explicitly to the release script.
+
+2. From the repository root, run the Windows release builder with Git Bash, Inno Setup 6, and Python available:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-win-release.ps1 -Version 1.1.2
+   ```
+
+   `build-win-release.ps1` must build both `workbuddy-cn` and `workbuddy-ai`. `build-win-zip.sh` creates only an internal staging ZIP; `build-win-installer.ps1` rewrites the staged daemon version and build id to the requested release version before compiling Setup.exe. Do not hand-copy scripts into an old installer directory.
+
+3. Deliver only these files:
+
+   ```text
+   release/windows/WorkDaddy-Setup-1.1.2.exe
+   release/windows/WorkDaddy-AI-Setup-1.1.2.exe
+   ```
+
+   Remove the generated `WorkDaddy-1.1.2-win64.zip`, `WorkDaddy-AI-1.1.2-win64.zip`, and `release/.cache` before handoff or publication. The ZIPs are staging inputs, not Windows release artifacts. Confirm that `安装失败自主解决提示词.txt` is absent from both Setup.exe payloads.
+
+4. Inspect the actual Setup.exe payloads, not just their filenames. Run `innounp -t` on both files, list or extract them, and verify all of the following for each package:
+
+   - `scripts/runtime/node/node.exe` exists.
+   - `scripts/daemon.js` reports the requested version, here `1.1.2`.
+   - `scripts/win-launcher.js`, `scripts/watchdog.js`, and the required PowerShell scripts are present.
+   - CN uses `workbuddy-cn`, `47832`, `9222` as its defaults; AI uses `workbuddy-ai`, `47833`, `9223`.
+   - The package contains no `安装失败自主解决提示词.txt` and no temporary ZIP.
+
+5. Run release checks from the same repository:
+
+   ```powershell
+   node --check scripts/daemon.js
+   node --check scripts/inject.js
+   node --check scripts/win-launcher.js
+   node --check scripts/watchdog.js
+   node --test test/*.test.js
+   git diff --check
+   ```
+
+   A skipped `sqlite3` CLI fallback test is expected on machines without the CLI. Windows runtime operation uses the bundled Node `node:sqlite` implementation and must not depend on a separately installed `sqlite3.exe`.
+
+6. Smoke-test installation and startup in this order: install WorkDaddy AI first (including an elevated installer run), launch it; install WorkDaddy second with a normal installer run, launch it; then repeat normal and elevated shortcut launches for both profiles. Both clients must remain open simultaneously. If a previous install left a daemon/watchdog running, the installer may stop only the exact current-profile lifecycle after verifying script path, Node path, PID, owner, profile, port, and daemon status. It must never kill all `WorkBuddy.exe`/`Electron.exe` processes.
+
+7. When a PID file is missing during an install/update race, the launcher may reconstruct it only for one exact current-profile watchdog. Multiple matches, an unverified path, a foreign owner, an elevated target from a standard process, or an unbound daemon must fail closed with actionable logs. The old generic “请先完全退出 WorkBuddy” cold-start gate must not be used for a verified current-profile process; the launcher should restart that process precisely and wait for its expected CDP port.
 
 ## Change Workflow
 
