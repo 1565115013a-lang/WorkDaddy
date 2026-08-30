@@ -7210,6 +7210,12 @@ startServer();
 cdpLoop();
 // 每天多次兜底自动签到（面板打开也会触发），带每日缓存不会重复领
 setInterval(() => { claimDailyForAll().catch((e) => log('[checkin] 定时签到失败: ' + e.message)); }, 3 * 60 * 60 * 1000);
+// 签到兜底：daemon 单独常驻（不经面板启动，如 watchdog 场景）时，/api/accounts 与账号
+// 切换两个触发点不会命中，3 小时 setInterval 首轮也需等待，导致跨 0 点后的首次签到
+// 最多延迟 3 小时。启动时延迟一轮补齐跨日空窗；claimDailyForAll 幂等（每日缓存 +
+// claimInFlight 并发保护），重复触发无副作用。延迟 30s 等网络就绪，与下方自动更新
+// checkUpdate 的 setTimeout(8s) 同一模式。
+setTimeout(() => { claimDailyForAll().catch((e) => log('[checkin] 启动签到失败: ' + e.message)); }, 30000);
 // 自动更新：启动时检查一次（延迟 8s 等网络就绪），之后每 6 小时一次
 setTimeout(() => { checkUpdate(true).catch(() => {}); }, 8000);
 updateTimer = setInterval(() => { checkUpdate(false).catch(() => {}); }, UPDATE_CHECK_INTERVAL);
