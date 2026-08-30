@@ -15,6 +15,8 @@
  *   WBSWITCH_DATA_DIR    备份数据目录（默认 ~/Library/Application Support/WorkDaddy）
  *   WBSWITCH_PORT        Web 界面端口（显式指定时固定；未指定时从 47832 起尝试）
  *   WBSWITCH_CDP_PORT    WorkBuddy CDP 首选端口（被占用时自动切换到 9222-9232/9333）
+ *   WBSWITCH_WORKBUDDY_BIN / WBSWITCH_WORKBUDDY_VERSION
+ *                         VPC/便携版目标程序路径与可选版本校验
  *
  * 用法: node scripts/daemon.js
  */
@@ -40,7 +42,7 @@ const {
   selectPreferredDiscoveredBinary,
 } = require('./windows-process-boundary.js');
 const DAEMON_PRIVILEGE = process.platform === 'win32'
-  ? detectWindowsPrivilege()
+  ? (process.env.WBSWITCH_NATIVE_LAUNCHER === '1' ? 'standard' : detectWindowsPrivilege())
   : 'standard';
 // ws（WebSocketServer）用于 DevTools 代理：Electron 的 CDP server 拒绝带 Origin 的 WS 连接
 // （浏览器必带 Origin → DevTools 前端 "websocket disconnected"），daemon 代理中转去掉 Origin
@@ -110,8 +112,16 @@ const {
   telemetryEnvironmentOverride,
 } = require('./sentry-report.js');
 const { getProfile, profileDataDir, listInstalledModelSources } = require('./profiles.js');
+const { readWorkBuddyTarget } = require('./workbuddy-target.js');
 const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile } = require('./cdp-targets.js');
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
+const {
+  createEncryptedExport,
+  openEncryptedExport,
+  remapSessionArchivePath,
+  requiredPassword,
+  resolveArchiveTarget,
+} = require('./secure-transfer.js');
 const { replaceFileWithRetry } = require('./atomic-file-write.js');
 const { parseUiPortState, profileUiPortCandidates } = require('./ui-port.js');
 
@@ -210,8 +220,16 @@ const DATA_DIR = defaultDataDir();
 // 1.1.7：Windows 启动可靠性、profile 隔离 UI 端口、原子配置写入和 CIM 竞态修复。
 // 1.1.8：签到只接受明确成功响应并写入 SQLite；悬浮球释放时增加阻尼回弹。
 // 1.1.9：签到请求进行中仍立即展示已确认的今日签到标记。
-const DAEMON_VERSION = '1.1.9';
-const DAEMON_BUILD_ID = 'release-1.1.9-20260828-checkin-cache-first';
+// 1.1.10：账号支持选择性导出；会话和快捷短语支持强制密码加密导入导出。
+// 1.1.11：会话导入成功后通过 CDP 刷新 WorkBuddy 窗口，使新会话立即载入。
+// 1.1.12：VPC/便携版可通过用户数据目录配置 WorkBuddy 路径与版本。
+// 1.1.14：Windows 安装器依赖改为仅在 Windows 更新分支加载，避免 macOS daemon 启动失败。
+// 1.1.15：新版 WorkBuddy 按 DOM/队列能力适配，不再把新版布局等同于 AI profile。
+// 1.1.16：元素检查器改为 WorkDaddy 插件内弹窗，支持 DOM 树、悬停高亮和重叠元素浏览，不再提供独立页面。
+// 1.1.24：6 号官方壁纸替换为新默认图；消息导航与机器人瞳孔改为悬浮毛玻璃。
+// 1.1.25：内置官方壁纸更新时刷新数据目录旧副本；新 profile 默认启用 WorkDaddy 壁纸主题。
+const DAEMON_VERSION = '1.1.25';
+const DAEMON_BUILD_ID = 'release-1.1.25-20260830-unread-dot-theme';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -1084,8 +1102,8 @@ function extractAppFromDmg(dmgPath) {
   });
 }
 
-// 安装：macOS 调 apply-update.sh（launchctl 停服 → 备份 → 替换 → relaunch）；
-// Windows 调 apply-update.ps1（杀 watchdog/daemon → 释放文件锁 → 替换目录 → 重启）
+// 安装：macOS 继续使用 apply-update.sh；Windows 打开已校验的可见 Setup.exe，
+// 由 Inno Setup 确认 WorkBuddy 已退出、替换文件并启动新版。
 function applyUpdate() {
   if (!updateState.downloaded) {
     updateDebug('apply-error', { stage: 'preflight', error: '尚未下载完成', latest: updateState.latest });
@@ -1121,72 +1139,61 @@ function applyUpdate() {
   };
   const markSpawnFailure = (error) => markAttemptFailure(error, 'spawn-error');
   if (IS_WIN) {
-    // Windows 安装位置由 install.ps1 铺好（%LOCALAPPDATA%\Programs\WorkDaddy）
-    const scriptPath = path.join(__dirname, 'apply-update.ps1');
-    const appDir = WORKDADDY_DIR_WIN;
+    const { launchWindowsInstaller } = require('./windows-installer-launch.js');
+    // Windows 更新只负责打开已经过 SHA-256 校验的可见 Setup.exe。
+    // 文件替换、WorkBuddy 退出确认和新版启动全部由 Inno Setup 接管；
+    // daemon/watchdog 在安装器真正开始复制前保持运行，因此 UI 不会失联。
     const updatePrefix = PROFILE.id === 'workbuddy-ai' ? 'WorkDaddy-AI-' : 'WorkDaddy-';
     const packageExt = /\.exe$/i.test(updateState.assetName || '') ? '.exe' : '.zip';
     const srcPackage = path.join(UPDATE_DIR, updatePrefix + updateState.latest + packageExt);
-    if (!fs.existsSync(scriptPath)) {
-      const error = new Error('缺少 apply-update.ps1');
-      markAttemptFailure(error, 'preflight-error');
-      return Promise.reject(error);
-    }
     if (!fs.existsSync(srcPackage)) {
       const error = new Error('缺少已下载的新版本安装包');
       markAttemptFailure(error, 'preflight-error');
       return Promise.reject(error);
     }
-    attempt.sourcePackage = srcPackage;
-    attempt.targetApp = appDir;
-    writeUpdateAttempt(attempt);
-    log('[update] 执行 apply-update.ps1 attempt=' + attempt.id + ' log=' + applyLog);
-    updateDebug('apply-script-start', { script: 'apply-update.ps1', attemptId: attempt.id, sourcePackage: srcPackage, targetApp: appDir, applyLog });
-    // 【更新标记】写入 pending.json：watchdog 检测到它在 daemon 退出后【不自动重启 daemon】，
-    // 双重保险（配合本函数末尾「先精确停 watchdog 再自我退出」），彻底杜绝 watchdog 在替换窗口期
-    // 复活 daemon 抢占 47832 端口的竞态（历史上第一轮更新偶发失败、需点第二次才成功的根因）。
-    // apply-update.ps1 成功/失败都负责删除该标记。
-    const pendingFile = path.join(UPDATE_DIR, 'pending.json');
-    try { fs.writeFileSync(pendingFile, JSON.stringify({ attempt: attempt.id, at: new Date().toISOString() })); } catch (_) {}
-    // 【Windows 更新进程模型真相 · 挖坑实录 2.0】这条路踩遍三种写法，全部实例验证：
-    //  ① detached:true + stdio:'ignore'：PowerShell 5.1（console 程序）在 detached（无控制台）下宿主
-    //     初始化静默退出，-File 脚本根本不执行 → apply.log 永不生成、替换永不发生，面板一直「重启中」。
-    //  ② 不 detached + pipe 收集输出：脚本能跑，但 Node 在 Windows 上 spawn 的子进程位于 Job Object，
-    //     daemon 自我退出 → job 关闭 → powershell 被连带杀死（实测日志停在「停止 watchdog」一步）。
-    //  ③ detached + cmd.exe /c 中转：cmd 同为 console 程序，一样不执行。
-    // 唯一可靠的「父进程死后子进程照跑」通道：wscript.exe（GUI 子系统，不依赖控制台）做中介，
-    // VBS 内 WScript.Shell.Run 用 ShellExecute 创建完全独立于 Node Job Object 的 powershell 进程。
-    let applyVbs;
-    try {
-      applyVbs = resolveApplyUpdateVbs();
-    } catch (e) {
-      markAttemptFailure(e, 'preflight-error');
-      return Promise.reject(e);
+    if (packageExt !== '.exe') {
+      const error = new Error('此历史版本只提供 ZIP，无法使用新的可见安装流程；请从发布页下载 Setup.exe');
+      markAttemptFailure(error, 'unsupported-artifact');
+      return Promise.reject(error);
     }
-    const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
-    const child = spawn(
-      wscript,
-      ['//nologo', applyVbs, scriptPath, srcPackage, appDir, String(ACTUAL_PORT), applyLog, attempt.id, PROFILE.id],
-      { detached: true, stdio: 'ignore', windowsHide: true }
-    );
-    child.once('error', markSpawnFailure);
-    child.once('spawn', () => {
-      attempt.status = 'script-started';
-      attempt.scriptPid = child.pid;
-      writeUpdateAttempt(attempt);
-      log('[update] apply-update.ps1 已启动(经 wscript 中介) pid=' + child.pid);
-      updateDebug('apply-script-spawned', { script: 'apply-update.ps1', attemptId: attempt.id, pid: child.pid });
+    const expectedAsset = PROFILE.id === 'workbuddy-ai'
+      ? `WorkDaddy-AI-Setup-${updateState.latest}.exe`
+      : `WorkDaddy-Setup-${updateState.latest}.exe`;
+    if (String(updateState.assetName || '').toLowerCase() !== expectedAsset.toLowerCase()) {
+      const error = new Error('安装包名称与目标 profile 或版本不一致');
+      markAttemptFailure(error, 'artifact-identity');
+      return Promise.reject(error);
+    }
+    attempt.sourcePackage = srcPackage;
+    attempt.assetName = updateState.assetName;
+    writeUpdateAttempt(attempt);
+    updateDebug('installer-open', { attemptId: attempt.id, sourcePackage: srcPackage, assetName: updateState.assetName });
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const child = launchWindowsInstaller(srcPackage);
+      child.once('error', (error) => {
+        if (settled) return;
+        settled = true;
+        markSpawnFailure(error);
+        updateState.status = 'error';
+        updateState.message = '无法打开安装程序';
+        updateState.error = error.message;
+        reject(error);
+      });
+      child.once('spawn', () => {
+        if (settled) return;
+        settled = true;
+        child.unref();
+        attempt.status = 'installer-opened';
+        attempt.installerPid = child.pid;
+        attempt.finishedAt = new Date().toISOString();
+        writeUpdateAttempt(attempt);
+        updateState.status = 'installer-opened';
+        updateState.message = '安装程序已打开';
+        updateDebug('installer-opened', { attemptId: attempt.id, pid: child.pid, assetName: updateState.assetName });
+        resolve({ ok: true, opened: true, status: 'installer-opened', message: '安装程序已打开，请按提示完成安装' });
+      });
     });
-    child.unref();
-    // 【竞态加固 · 更新标记】daemon 自我退出后，watchdog 默认会在 3s 后重启新的 daemon 抢占 47832，
-    // 干扰替换。防复活职责完全交给「update/pending.json 更新标记」：watchdog 检测到标记后不自动
-    // 重启 daemon（见 watchdog.js），标记由 apply-update.ps1 finally 清理。
-    // ⚠️ 千万不要在这里用 spawnSync 去杀 watchdog / 做任何同步操作：spawnSync 会阻塞 Node 事件循环，
-    // daemon 将既无法响应 API（面板报「daemon 不可达」）也无法执行下面这行 process.exit(0)，
-    // 安装目录一直被占用 → Mov-Item 报「正在使用中」→ 更新必失败（实测 4 连败的根因）。
-    // 直接干净退出即可，退出过程零阻塞（毫秒级）。
-    setTimeout(() => { try { process.exit(0); } catch (_) {} }, 800);
-    return Promise.resolve({ ok: true, message: '已启动更新，正在替换文件并自动重启，请稍候…' });
   }
   const scriptPath = path.join(__dirname, 'apply-update.sh');
   const appPath = macWorkDaddyAppPath();
@@ -1711,7 +1718,10 @@ async function reloadWorkBuddyPage() {
   await cdpSend('Page.reload', { ignoreCache: false });
 }
 
-const WORKBUDDY_APP = IS_WIN ? '' : PROFILE.appPath;
+const WORKBUDDY_TARGET = IS_WIN ? null : readWorkBuddyTarget({ dataDir: DATA_DIR, profileId: PROFILE.id });
+const WORKBUDDY_APP = IS_WIN ? '' : (WORKBUDDY_TARGET.binary
+  ? path.resolve(WORKBUDDY_TARGET.binary, '../../..')
+  : PROFILE.appPath);
 const WORKBUDDY_BINARY = IS_WIN ? '' : `${WORKBUDDY_APP}/Contents/MacOS/Electron`;
 const WORKBUDDY_APP_NAME = path.basename(WORKBUDDY_APP).replace(/\.app$/i, '');
 
@@ -1753,6 +1763,11 @@ function resolveWorkBuddyBinary() {
   const { execFileSync } = require('child_process');
   const psCmd = (cmd) => execFileSync('powershell', ['-NoProfile', '-Command', cmd], { encoding: 'utf8', timeout: 8000, windowsHide: true });
   const runningBin = selectRunningProfileBinary(PROFILE_BINARY_NAMES, queryWindowsWorkBuddyProcesses());
+  const configuredTarget = readWorkBuddyTarget({ dataDir: DATA_DIR, profileId: PROFILE.id });
+  const configuredBin = tryFile(configuredTarget.binary);
+  if (configuredTarget.configured && !configuredBin) {
+    throw new Error('workbuddy-target.json 指定的路径不是可验证的当前 profile 主程序；登录信息未修改');
+  }
   // 1) 显式指定；若当前 profile 已运行，必须与运行路径完全一致。
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
   if (process.env.WBSWITCH_WORKBUDDY_BIN && !envBin) {
@@ -1763,6 +1778,12 @@ function resolveWorkBuddyBinary() {
       throw new Error('检测到当前 profile 正从另一安装目录运行，登录信息未修改');
     }
     return (wbBinaryCache = envBin);
+  }
+  if (configuredBin) {
+    if (runningBin && !sameWindowsPath(runningBin, configuredBin)) {
+      throw new Error('检测到当前 profile 正从另一安装目录运行，登录信息未修改');
+    }
+    return (wbBinaryCache = configuredBin);
   }
   // 2) 运行中当前 profile 的主程序优先（便携安装）。
   if (runningBin) return (wbBinaryCache = runningBin);
@@ -2371,14 +2392,27 @@ function injectWidget(reason) {
   lastInjectTs = now;
   let script;
   try {
-    script = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
+    const compatScript = fs.readFileSync(path.join(__dirname, 'workbuddy-compat.js'), 'utf8');
+    let injectScript = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
+    // 内部调试模块（元素检查/DevTools）：picker-internal.js 存在才注入（git 不跟踪，
+    // 他人环境无此文件 → 隐藏入口的拾取按钮点击会报错，符合预期，不影响面板其他功能）。
+    // 注入位置：放进 build() 函数体末尾（与面板共享闭包作用域：root/toast/esc 等），
+    // 这样拾取实现与原版稳定版 debug 模块完全同域，不被 IIFE 边界隔开。
+    const pickerPath = path.join(__dirname, 'picker-internal.js');
+    if (fs.existsSync(pickerPath)) {
+      const pickerCode = fs.readFileSync(pickerPath, 'utf8');
+      const anchor = 'return { destroy: lifecycle.destroy, alive: lifecycle.alive };';
+      if (!injectScript.includes(anchor)) {
+        return Promise.reject(new Error('picker-internal.js 注入锚点不存在'));
+      }
+      injectScript = injectScript.replace(anchor, pickerCode + '\n' + anchor);
+    }
+    script = compatScript + '\n' + injectScript;
   } catch (e) {
     return Promise.reject(new Error('读取注入脚本失败: ' + e.message));
   }
   // 组件内通过 fetch 调用本机 API，注入时写入实际端口
   script = script.replace(/__WBS_API__/g, `http://${HOST}:${ACTUAL_PORT}`);
-  // 同步注入当前 daemon 版本号（inject.js 顶部的 __WBS_VERSION__ 占位符会在面板「关于」页直接展示，
-  // 这样版本升级后不需要改 inject.js、面板永远显示 daemon 的真实版本）
   script = script.replace(/__WBS_VERSION__/g, DAEMON_VERSION);
   // 注入本地 API 能力凭证；旧版面板不会携带该 header，但新版 daemon 会在启动时重新注入新版面板。
   script = script.replace(/__WBS_API_TOKEN__/g, API_TOKEN);
@@ -2718,6 +2752,104 @@ function copySessionFiles(wbHome, oldId, newId) {
   return result;
 }
 
+const MAX_SESSION_EXPORT_BYTES = 256 * 1024 * 1024;
+const MAX_SESSION_EXPORT_FILES = 20000;
+
+function archiveRelativePath(wbHome, target) {
+  return path.relative(wbHome, target).split(path.sep).join('/');
+}
+
+function collectSessionArchiveFiles(wbHome, sessionId) {
+  if (!isValidSessionId(sessionId)) throw new Error('无效的会话 ID');
+  const files = [];
+  let totalBytes = 0;
+  const collect = (target) => {
+    let stat;
+    try { stat = fs.lstatSync(target); }
+    catch (error) { if (error && error.code === 'ENOENT') return; throw error; }
+    if (stat.isSymbolicLink()) return;
+    if (stat.isDirectory()) {
+      const entries = fs.readdirSync(target, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue;
+        collect(path.join(target, entry.name));
+      }
+      return;
+    }
+    if (!stat.isFile()) return;
+    if (files.length >= MAX_SESSION_EXPORT_FILES) throw new Error('会话附件文件过多，无法导出');
+    if (totalBytes + stat.size > MAX_SESSION_EXPORT_BYTES) throw new Error('会话附件超过 256 MB，无法导出');
+    const relative = archiveRelativePath(wbHome, target);
+    // Validate every exported path with the same mapper used during import.
+    remapSessionArchivePath(relative, sessionId, sessionId);
+    const content = fs.readFileSync(target);
+    totalBytes += content.length;
+    if (totalBytes > MAX_SESSION_EXPORT_BYTES) throw new Error('会话附件超过 256 MB，无法导出');
+    files.push({ path: relative, data: content.toString('base64') });
+  };
+
+  const projects = path.join(wbHome, 'projects');
+  try {
+    const projectEntries = fs.readdirSync(projects, { withFileTypes: true });
+    for (const project of projectEntries) {
+      if (!project.isDirectory() || project.isSymbolicLink()) continue;
+      const projectRoot = path.join(projects, project.name);
+      collect(path.join(projectRoot, sessionId + '.jsonl'));
+      collect(path.join(projectRoot, sessionId));
+    }
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') throw error;
+  }
+  collect(path.join(wbHome, 'workspace', 'sessions', sessionId));
+  collect(path.join(wbHome, 'tasks', sessionId));
+  collect(path.join(wbHome, 'file-history', sessionId));
+  collect(path.join(wbHome, 'artifact-index', sessionId + '.json'));
+  return files;
+}
+
+function ensureArchiveParentNoFollow(wbHome, target) {
+  const root = path.resolve(wbHome);
+  const rootStat = fs.lstatSync(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('WorkBuddy 数据目录不是受管目录');
+  const parent = path.dirname(resolveArchiveTarget(root, archiveRelativePath(root, target)));
+  const relative = path.relative(root, parent);
+  let current = root;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('会话归档目标包含符号链接或普通文件');
+    } catch (error) {
+      if (error && error.code === 'ENOENT') fs.mkdirSync(current, { mode: 0o700 });
+      else throw error;
+    }
+  }
+}
+
+function restoreSessionArchiveFiles(wbHome, sessionArchive, newId) {
+  const oldId = String(sessionArchive && sessionArchive.record && sessionArchive.record.id || '');
+  if (!isValidSessionId(oldId) || !isValidSessionId(newId)) throw new Error('会话归档包含无效 ID');
+  const sourceFiles = Array.isArray(sessionArchive.files) ? sessionArchive.files : [];
+  if (sourceFiles.length > MAX_SESSION_EXPORT_FILES) throw new Error('会话归档附件文件过多');
+  let totalBytes = 0;
+  const targets = new Set();
+  for (const entry of sourceFiles) {
+    if (!entry || typeof entry.path !== 'string' || typeof entry.data !== 'string' || entry.data.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(entry.data)) {
+      throw new Error('会话归档包含无效附件');
+    }
+    const relative = remapSessionArchivePath(entry.path, oldId, newId);
+    const target = resolveArchiveTarget(wbHome, relative);
+    if (targets.has(target)) throw new Error('会话归档包含重复附件路径');
+    targets.add(target);
+    const content = Buffer.from(entry.data, 'base64');
+    totalBytes += content.length;
+    if (totalBytes > MAX_SESSION_EXPORT_BYTES) throw new Error('会话归档附件超过 256 MB');
+    ensureArchiveParentNoFollow(wbHome, target);
+    fs.writeFileSync(target, content, { flag: 'wx', mode: 0o600 });
+  }
+  return sourceFiles.length;
+}
+
 const SESSION_COPY_COLUMNS = [
   'id', 'cwd', 'user_id', 'title', 'custom_title', 'status', 'created_at', 'updated_at',
   'last_activity_at', 'is_playground', 'source_mode', 'is_background_automation', 'mode', 'model',
@@ -2763,6 +2895,66 @@ async function insertCopiedSession(src, targetUid, newId) {
     'INSERT INTO sessions (' + SESSION_COPY_COLUMNS.join(',') + ') VALUES (' + sqlPlaceholders(vals) + ');',
     vals
   );
+}
+
+async function exportSessions(ids, password) {
+  const selectedIds = normalizeSessionIdBatch(ids);
+  if (!selectedIds.length) throw new Error('未选择会话');
+  requiredPassword(password);
+  const rows = await sqliteQuery(
+    'SELECT ' + SESSION_COPY_COLUMNS.join(',') + ' FROM sessions WHERE id IN (' + sqlPlaceholders(selectedIds) + ') AND deleted_at IS NULL;',
+    selectedIds
+  );
+  const byId = new Map(rows.map((row) => [String(row.id), row]));
+  const wbHome = PROFILE.dataRoot;
+  const sessions = selectedIds.filter((id) => byId.has(id)).map((id) => {
+    const record = byId.get(id);
+    return { record, files: collectSessionArchiveFiles(wbHome, id) };
+  });
+  if (!sessions.length) throw new Error('没有可导出的会话');
+  const payload = { exportType: 'WorkDaddy-sessions', version: 1, sessions };
+  const content = createEncryptedExport('sessions', payload, password);
+  return {
+    filename: 'WorkDaddy-会话导出-' + new Date().toISOString().slice(0, 10) + '.json',
+    content,
+    count: sessions.length,
+  };
+}
+
+function validImportedSessionUid(value) {
+  const uid = String(value || '').trim();
+  if (!uid || uid.length > 200 || /[\x00-\x1f\x7f]/.test(uid)) throw new Error('会话归档缺少有效的账号归属');
+  return uid;
+}
+
+async function importSessions(content, password, targetUid) {
+  const payload = openEncryptedExport(content, 'sessions', password);
+  const archives = Array.isArray(payload.sessions) ? payload.sessions : [];
+  if (!archives.length) throw new Error('导入文件中没有会话数据');
+  if (archives.length > 100) throw new Error('单次最多导入 100 个会话');
+  const overrideUid = typeof targetUid === 'string' && targetUid.trim() ? validImportedSessionUid(targetUid) : '';
+  const currentUid = String((currentAccount() || {}).uid || '').trim();
+  const imported = [];
+  const errors = [];
+  for (const archive of archives) {
+    const record = archive && archive.record;
+    const oldId = String(record && record.id || '');
+    if (!record || !isValidSessionId(oldId)) { errors.push('无效会话记录'); continue; }
+    let ownerUid;
+    try { ownerUid = overrideUid || validImportedSessionUid(record.user_id || currentUid); }
+    catch (error) { errors.push(error.message); continue; }
+    const newId = crypto.randomUUID();
+    try {
+      restoreSessionArchiveFiles(PROFILE.dataRoot, archive, newId);
+      await insertCopiedSession(record, ownerUid, newId);
+      imported.push({ sourceId: oldId, id: newId, uid: ownerUid });
+    } catch (error) {
+      try { deleteSessionFiles(PROFILE.dataRoot, newId); } catch (_) {}
+      errors.push(error.message);
+    }
+  }
+  if (!imported.length) throw new Error(errors[0] || '没有可导入的会话');
+  return { imported, failed: errors.length };
 }
 
 async function copySessionRecord(src, targetUid, options = {}) {
@@ -3614,6 +3806,58 @@ function deleteQuickPhrases(ids) {
   writeSessionState(st);
   return readSessionState();
 }
+function normalizeQuickPhraseIds(ids) {
+  if (!Array.isArray(ids)) throw new Error('快捷短语选择必须是数组');
+  if (ids.length > 1000) throw new Error('单次最多处理 1000 条快捷短语');
+  const result = [];
+  const seen = new Set();
+  for (const value of ids) {
+    const id = String(value || '').trim();
+    if (!id) throw new Error('快捷短语标识不能为空');
+    if (!seen.has(id)) { seen.add(id); result.push(id); }
+  }
+  return result;
+}
+function exportQuickPhrases(ids, password) {
+  const selectedIds = normalizeQuickPhraseIds(ids);
+  if (!selectedIds.length) throw new Error('未选择快捷短语');
+  requiredPassword(password);
+  const selected = new Set(selectedIds);
+  const phrases = readSessionState().phrases
+    .filter((item) => selected.has(String(item.id)))
+    .map((item) => ({ text: String(item.text || ''), createdAt: Number(item.createdAt || Date.now()) }));
+  if (!phrases.length) throw new Error('没有可导出的快捷短语');
+  const payload = { exportType: 'WorkDaddy-quick-phrases', version: 1, phrases };
+  return {
+    filename: 'WorkDaddy-快捷短语导出-' + new Date().toISOString().slice(0, 10) + '.json',
+    content: createEncryptedExport('quick-phrases', payload, password),
+    count: phrases.length,
+  };
+}
+function importQuickPhrases(content, password) {
+  const payload = openEncryptedExport(content, 'quick-phrases', password);
+  const incoming = Array.isArray(payload.phrases) ? payload.phrases : [];
+  if (!incoming.length) throw new Error('导入文件中没有快捷短语');
+  if (incoming.length > 1000) throw new Error('单次最多导入 1000 条快捷短语');
+  const state = readSessionState();
+  const existing = new Set(state.phrases.map((item) => String(item.text || '').trim()).filter(Boolean));
+  let imported = 0;
+  let skipped = 0;
+  for (const item of incoming) {
+    const text = String(item && item.text || '').trim();
+    if (!text || existing.has(text)) { skipped++; continue; }
+    existing.add(text);
+    state.phrases.push({
+      id: 'qp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+      text,
+      createdAt: Number(item && item.createdAt || Date.now()),
+    });
+    imported++;
+  }
+  if (!imported && !skipped) throw new Error('没有可导入的快捷短语');
+  writeSessionState(state);
+  return { state: readSessionState(), imported, skipped };
+}
 /** 通过 CDP 发送指定短语：聚焦 composer → 全选 → 真实输入短语 → 真实 Enter（replace 式发送，多行短语按段落插入） */
 async function acSendPhrase(text) {
   if (!cdp.connected) throw new Error('CDP 未连接');
@@ -3821,9 +4065,14 @@ function builtinAssetsDir() {
   return null;
 }
 
-/** 内置资产补齐（新电脑 / 数据目录为空 / 资产缺失时）：内置壁纸 + WorkDaddy 主题 + 默认蒙版 10%
- * 幂等：逐项补齐——壁纸缺失才复制、nebula 主题缺失才安装、mask.json 缺失才写，
- * 不覆盖用户已有的自定义/删减内容（已存在的文件不动）。
+function builtinWallpaperSource(baseDir, fileName) {
+  const override = path.join(__dirname, 'builtin-overrides', fileName);
+  return fs.existsSync(override) ? override : path.join(baseDir, 'wallpapers', fileName);
+}
+
+/** 内置资产同步：官方壁纸 + WorkDaddy 主题 + 默认蒙版 10%
+ * 幂等：官方 wallpaper-*.webp 由应用管理，内置内容变化时刷新；custom-* 与用户主题不覆盖。
+ * nebula 主题和背景仅在缺失时安装，避免覆盖用户后来选择的主题配色或背景。
  */
 function initBuiltinAssets() {
   if (!PROFILE.capabilities.theme) return;
@@ -3833,21 +4082,26 @@ function initBuiltinAssets() {
       log('[init] 未找到内置资产目录（builtin/），跳过初始化');
       return;
     }
-    // 1) 内置壁纸 → themes/wallpapers/（缺哪张补哪张，已有不动）
+    // 1) 内置官方壁纸 → themes/wallpapers/（缺失时补齐、应用升级内容变化时刷新）
     const wpSrc = path.join(src, 'wallpapers');
     if (fs.existsSync(wpSrc)) {
       const files = fs.readdirSync(wpSrc).filter((f) => /\.webp$/i.test(f)).sort();
       if (files.length) {
         fs.mkdirSync(WALLPAPERS_DIR, { recursive: true });
         let added = 0;
+        let updated = 0;
         for (const f of files) {
+          const source = builtinWallpaperSource(src, f);
           const dest = path.join(WALLPAPERS_DIR, f);
           if (!fs.existsSync(dest)) {
-            fs.copyFileSync(path.join(wpSrc, f), dest);
+            fs.copyFileSync(source, dest);
             added++;
+          } else if (Buffer.compare(fs.readFileSync(source), fs.readFileSync(dest)) !== 0) {
+            fs.copyFileSync(source, dest);
+            updated++;
           }
         }
-        if (added) log(`[init] 补齐内置壁纸 ${added} 张 -> ${WALLPAPERS_DIR}（已有 ${files.length - added} 张保留）`);
+        if (added || updated) log(`[init] 同步内置壁纸：新增 ${added} 张，更新 ${updated} 张 -> ${WALLPAPERS_DIR}`);
       }
     }
     // 2) WorkDaddy 主题（nebula）→ themes/nebula/（缺失才安装，已有不动）
@@ -3860,7 +4114,7 @@ function initBuiltinAssets() {
         fs.copyFileSync(path.join(thSrc, 'theme.json'), themeJson);
         log('[init] 已安装 WorkDaddy 主题（nebula）');
       }
-      const bgSrc = path.join(thSrc, 'background.webp');
+      const bgSrc = builtinWallpaperSource(src, 'wallpaper-06.webp');
       const bgDst = path.join(thDst, 'background.webp');
       if (fs.existsSync(bgSrc) && !fs.existsSync(bgDst)) {
         fs.copyFileSync(bgSrc, bgDst);
@@ -3873,11 +4127,11 @@ function initBuiltinAssets() {
       fs.writeFileSync(maskFile, JSON.stringify({ opacity: 0.1 }, null, 2));
       log('[init] 首次初始化：背景蒙版默认 10% -> mask.json');
     }
-    // 4) 默认主题 → WorkBuddy 默认主题（仅当未设置过；用户要求默认选中官方浅色，不再默认 nebula）
+    // 4) 默认主题 → WorkDaddy 壁纸主题（仅当 profile 从未设置过主题）
     const curFile = path.join(DATA_DIR, 'current-theme.json');
     if (!fs.existsSync(curFile)) {
-      fs.writeFileSync(curFile, JSON.stringify({ id: 'default', at: new Date().toISOString() }, null, 2));
-      log('[init] 首次初始化：默认主题 -> WorkBuddy 默认主题（default）');
+      fs.writeFileSync(curFile, JSON.stringify({ id: 'nebula', at: new Date().toISOString() }, null, 2));
+      log('[init] 首次初始化：默认主题 -> WorkDaddy 壁纸主题（nebula）');
     }
   } catch (e) {
     log('[init] 首次初始化失败: ' + e.message);
@@ -4158,6 +4412,50 @@ function themeExtrasCss() {
   return loadThemePatches().map((p) => (p && p.css ? p.css : '')).join('');
 }
 
+/** 主题变量别名层：从 theme-vars.js 热加载（官方漏定义/深色值不对的 token 重定向到主题变量）。
+ * body 级定义生成 `html[data-theme="dark"] body[data-vscode-theme-name]{...}`（darkOnly=true 时前缀深色条件），
+ * 组件作用域定义生成 `html[data-theme="dark"] body[data-vscode-theme-name] <sel>{...}`。
+ * 属「常量可搞定」的样式处理，不占 theme-patches.js（那里只保留必须针对元素写规则的魔改补丁）。
+ */
+let _varsCache = null;
+let _varsMtime = 0;
+function loadThemeVars() {
+  try {
+    const f = path.join(__dirname, 'theme-vars.js');
+    const st = fs.statSync(f);
+    if (!_varsCache || st.mtimeMs !== _varsMtime) {
+      delete require.cache[require.resolve(f)];
+      _varsCache = require(f);
+      _varsMtime = st.mtimeMs;
+    }
+    return _varsCache || { body: [], scoped: [] };
+  } catch (e) {
+    log('[theme] 变量别名层加载失败: ' + e.message);
+    return { body: [], scoped: [] };
+  }
+}
+/** 生成变量别名 CSS：isDark 时 darkOnly 条目加 html[data-theme="dark"] 前缀；浅色主题跳过 darkOnly 条目 */
+function themeVarsCss(isDark) {
+  const mod = loadThemeVars();
+  const pre = isDark ? 'html[data-theme="dark"] ' : '';
+  let out = '';
+  const declOf = (vars) => Object.keys(vars || {}).map((k) => k + ':' + vars[k] + ';').join('');
+  for (const b of mod.body || []) {
+    if (b.darkOnly && !isDark) continue;
+    const lead = b.darkOnly ? pre : '';
+    const d = declOf(b.vars);
+    if (d) out += lead + 'body[data-vscode-theme-name]{' + d + '}';
+  }
+  for (const s of mod.scoped || []) {
+    if (s.darkOnly && !isDark) continue;
+    const lead = (s.darkOnly ? pre : '') + 'body[data-vscode-theme-name] ';
+    const sels = String(s.sel).split(',').map((seg) => lead + seg.trim()).join(',');
+    const d = declOf(s.vars);
+    if (d) out += sels + '{' + d + '}';
+  }
+  return out;
+}
+
 async function applyThemeByCdp(id) {
   if (!PROFILE.capabilities.theme) throw new Error(`${PROFILE.name} 暂不支持主题功能`);
   if (!cdp.connected) throw new Error('CDP 未连接');
@@ -4209,11 +4507,15 @@ async function applyThemeByCdp(id) {
         const dataUrl = 'data:' + mime + ';base64,' + buf.toString('base64');
         // WBSS 背景图方案：背景图铺 #root，容器透明 + 半透明毛玻璃让底图透出
         // 遮罩/半透明度调低（40%/34%/30%）：背景图偏暗时让图更透出，毛玻璃更可见
-        // 全局黑色蒙版（默认 0.1，面板主题页可调）：rgba(0,0,0,α) 压在最上层，让背景图更沉、文字更可读
+        // 全局黑色蒙版（默认 0.3，面板主题页可调）：rgba(0,0,0,α) 压在最上层，让背景图更沉、文字更可读
+        // 注意：opacity=0 是合法的「关闭蒙版」，不能用 || 兜底（0 会被当成 falsy 变成 0.1）
         const maskFile = path.join(DATA_DIR, 'mask.json');
         let mask = 0.3;
         try {
-          if (fs.existsSync(maskFile)) mask = Math.min(1, Math.max(0, parseFloat(JSON.parse(fs.readFileSync(maskFile, 'utf8')).opacity) || 0.1));
+          if (fs.existsSync(maskFile)) {
+            const v = parseFloat(JSON.parse(fs.readFileSync(maskFile, 'utf8')).opacity);
+            if (!Number.isNaN(v)) mask = Math.min(1, Math.max(0, v));
+          }
         } catch (_) {}
         bgCssStr = [
           '#root{background:',
@@ -4224,8 +4526,8 @@ async function applyThemeByCdp(id) {
           'body[data-vscode-theme-name] .teams-container,body[data-vscode-theme-name] .teams-container.is-mac{background:transparent !important}',
           'body[data-vscode-theme-name] [data-view-id]{background:transparent !important}',
           'body[data-vscode-theme-name] .main-content{background:transparent !important}',
-          // 左侧菜单（会话列表）半透明毛玻璃：背景图透出 + 模糊
-          'body[data-vscode-theme-name] .conversation-list,body[data-vscode-theme-name] [data-view-id=sidebar]{background:color-mix(in srgb,var(--wb-bg-primary) 34%,transparent) !important;backdrop-filter:blur(26px) saturate(1.2);-webkit-backdrop-filter:blur(26px) saturate(1.2)}',
+          // 左侧菜单（会话列表）透明（用户 08-30 00:46 要求去掉毛玻璃，连同子组件全透明，背景图直接透出）
+          'body[data-vscode-theme-name] .conversation-list,body[data-vscode-theme-name] [data-view-id=sidebar]{background:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important}',
           // 输入框区域：毛玻璃背景（用户要求加回：半透明 + 模糊，背景图透出）
           // 注意：聊天页 [class*="input-area-container"] 父容器改为透明（patch-40 处理），
           // 主页 .wb-home-composer 也改为透明（patch-37），毛玻璃只保留在输入框主体 _mainArea（patch-40）。
@@ -4242,6 +4544,9 @@ async function applyThemeByCdp(id) {
     var h = document.documentElement, b = document.body;
     if (!h || !b) return { pending: true };
     var WBS_UID = ${JSON.stringify(uid || null)};
+    // WorkDaddy 自定义主题已应用标记：theme-patches 里部分规则用 html[data-wbs-theme] 限定
+    // 只在 WorkDaddy 内置自定义主题下生效（官方默认主题不激活）。
+    try { h.setAttribute('data-wbs-theme', ${id === 'default' ? "'0'" : "'1'"}); } catch (e) {}
     // 联动 WorkBuddy 原生主题（源码 theme.ts ThemeManager + legacy-appearance-mode-storage）：
     // 1) 写 localStorage 'agent-ui-theme'（ThemeManager.saveTheme 同款结构），reload/重启后 WorkBuddy 自己恢复该主题；
     // 2) 写 'workbuddy.appearance.lastApplied'（getInitialTheme 优先读它，避免残留旧外观覆盖我们的配置）；
@@ -4303,8 +4608,11 @@ async function applyThemeByCdp(id) {
         b.setAttribute('data-vscode-theme-name', 'IDE Light'); b.classList.remove('vscode-dark');
         wbsSyncNativeTheme('light');
       }
-      // 注入自定义色板（body 层覆盖，同优先级后插入胜出）
-      var css = 'body[data-vscode-theme-name]{' + ${JSON.stringify(allCssStr)} + '}' + ${JSON.stringify(localCssStr)} + ${JSON.stringify(extrasCss)} + ${JSON.stringify(bgCssStr)};
+      // 注入自定义色板（body 层覆盖，同优先级后插入胜出）+ 变量别名层（官方漏定义 token 重定向）
+      var css = 'body[data-vscode-theme-name]{' + ${JSON.stringify(allCssStr)} + '}' +
+        ${JSON.stringify(localCssStr)} +
+        ${JSON.stringify(themeVarsCss(isDark))} +
+        ${JSON.stringify(extrasCss)} + ${JSON.stringify(bgCssStr)};
       var st = document.createElement('style');
       st.id = 'wbs-theme-style';
       st.textContent = css;
@@ -4964,7 +5272,7 @@ async function syncCurrentCreditUsage(uid, accessToken) {
   }
 }
 
-/* ================= 账号导出 / 导入 =================
+/* ================= 加密导出 / 导入 =================
  * v2 导出：用户在面板输入非空密码；随机 salt + AES-256-GCM，密码不落盘、不写日志。
  * v1 导入：兼容历史固定密码 workdaddy 的导出文件，空密码即走旧格式默认值。
  */
@@ -4973,27 +5281,6 @@ const EXPORT_KDF_SALT = 'WorkDaddy-account-export-v1';
 
 function exportSecretKey(password, salt) {
   return crypto.scryptSync(String(password), salt, 32);
-}
-// 密文布局：iv(12) + authTag(16) + ciphertext
-function encryptExport(plain, password) {
-  const salt = crypto.randomBytes(16);
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', exportSecretKey(password, salt), iv);
-  const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return { data: Buffer.concat([iv, tag, enc]).toString('base64'), salt: salt.toString('base64') };
-}
-function decryptExport(b64, password, saltB64) {
-  const buf = Buffer.from(String(b64 || ''), 'base64');
-  if (buf.length <= 28) throw new Error('导出数据不完整或已损坏');
-  const salt = Buffer.from(String(saltB64 || ''), 'base64');
-  if (salt.length !== 16) throw new Error('导出文件缺少有效的加密 salt');
-  const iv = buf.subarray(0, 12);
-  const tag = buf.subarray(12, 28);
-  const data = buf.subarray(28);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', exportSecretKey(password, salt), iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
 }
 
 function decryptLegacyExport(b64, password) {
@@ -5167,6 +5454,30 @@ function handleApi(req, res) {
         return json(res, 200, { ok: true, ...deleteQuickPhrases(body.ids) });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+  // 快捷短语加密导出：POST /api/quick-phrases/export { ids, password }
+  if (req.method === 'POST' && p === '/api/quick-phrases/export') {
+    return readBody(req).then((body) => {
+      try {
+        const result = exportQuickPhrases(body && body.ids, body && body.password);
+        log(`[quick-phrases-export] 已导出 ${result.count} 条快捷短语`);
+        return json(res, 200, { ok: true, ...result });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error.message });
+      }
+    });
+  }
+  // 快捷短语加密导入：POST /api/quick-phrases/import { content, password }
+  if (req.method === 'POST' && p === '/api/quick-phrases/import') {
+    return readBody(req).then((body) => {
+      try {
+        const result = importQuickPhrases(body && body.content, body && body.password);
+        log(`[quick-phrases-import] 已导入 ${result.imported} 条，跳过 ${result.skipped} 条`);
+        return json(res, 200, { ok: true, ...result.state, imported: result.imported, skipped: result.skipped });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error.message });
       }
     });
   }
@@ -5457,10 +5768,15 @@ function handleApi(req, res) {
     return readBody(req).then((body) => {
       try {
         const enteredPassword = body && typeof body.password === 'string' ? body.password : '';
-        const password = enteredPassword.trim() ? enteredPassword : '';
-        if (password.length > 1024) return json(res, 400, { ok: false, error: '密码不能超过 1024 个字符' });
-        if (!password.trim()) return json(res, 400, { ok: false, error: '导出密码不能为空' });
-        const accounts = listAccounts(DATA_DIR);
+        const password = requiredPassword(enteredPassword);
+        let selectedUids = null;
+        if (body && body.uids !== undefined) {
+          if (!Array.isArray(body.uids)) return json(res, 400, { ok: false, error: '账号选择必须是数组' });
+          if (body.uids.length > 500) return json(res, 400, { ok: false, error: '选择的账号过多' });
+          selectedUids = new Set(body.uids.map((uid) => String(uid || '').trim()).filter(Boolean));
+          if (!selectedUids.size) return json(res, 400, { ok: false, error: '请至少选择一个账号' });
+        }
+        const accounts = listAccounts(DATA_DIR).filter((account) => !selectedUids || selectedUids.has(String(account.uid)));
         const items = [];
         for (const a of accounts) {
           const file = backupPath(DATA_DIR, a.uid);
@@ -5473,15 +5789,7 @@ function handleApi(req, res) {
         }
         if (!items.length) return json(res, 200, { ok: false, error: '没有可导出的账号备份' });
         const payload = { exportType: 'WorkDaddy-accounts', version: 2, accounts: items };
-        const encrypted = encryptExport(JSON.stringify(payload), password);
-        const envelope = JSON.stringify({
-          wbsExport: 'WorkDaddy',
-          version: 2,
-          createdAt: new Date().toISOString(),
-          kdf: 'aes-256-gcm+scrypt',
-          salt: encrypted.salt,
-          data: encrypted.data,
-        });
+        const envelope = createEncryptedExport('accounts', payload, password);
         const filename = 'WorkDaddy-账号导出-' + new Date().toISOString().slice(0, 10) + '.json';
         log(`[export] 导出 ${items.length} 个账号 -> ${filename}`);
         return json(res, 200, { ok: true, filename, content: envelope, count: items.length });
@@ -5507,15 +5815,12 @@ function handleApi(req, res) {
         const enteredPassword = body && typeof body.password === 'string' ? body.password : '';
         const password = enteredPassword.trim() ? enteredPassword : '';
         if (password.length > 1024) throw new Error('密码不能超过 1024 个字符');
-        let payloadText;
+        let payload;
         if (Number(envelope.version) >= 2) {
-          if (!envelope.salt) throw new Error('导出文件缺少有效的加密 salt');
-          if (!password.trim()) throw new Error('导入该文件需要密码');
-          payloadText = decryptExport(envelope.data, password, envelope.salt);
+          payload = openEncryptedExport(text, 'accounts', password);
         } else {
-          payloadText = decryptLegacyExport(envelope.data, password || EXPORT_PASSPHRASE);
+          payload = JSON.parse(decryptLegacyExport(envelope.data, password || EXPORT_PASSPHRASE));
         }
-        const payload = JSON.parse(payloadText);
         const list = Array.isArray(payload && payload.accounts) ? payload.accounts : [];
         if (!list.length) throw new Error('导入文件中没有账号数据');
         ensureDirs(DATA_DIR);
@@ -5573,11 +5878,14 @@ function handleApi(req, res) {
 
   // 官方背景图库列表（themes/wallpapers/*.webp），供面板「主题」页预览切换。
   // 附带 currentWallpaper：当前主题 background.webp 内容哈希匹配到的图库文件名（供面板高亮当前壁纸）
+  // 附带 customWallpapers：用户上传的自定义壁纸（custom-*.webp），供面板分开展示
   if (req.method === 'GET' && p === '/api/wallpapers') {
     try {
       const files = fs.existsSync(WALLPAPERS_DIR)
         ? fs.readdirSync(WALLPAPERS_DIR).filter((f) => /\.webp$/i.test(f)).sort()
         : [];
+      const official = files.filter((f) => !/^custom-/i.test(f));
+      const custom = files.filter((f) => /^custom-/i.test(f));
       // 当前背景 = 当前主题目录的 background.webp（哈希对比图库）
       let currentWallpaper = null;
       try {
@@ -5592,7 +5900,59 @@ function handleApi(req, res) {
           }
         }
       } catch (_) {}
-      return json(res, 200, { ok: true, wallpapers: files.map((f) => ({ name: f, title: '官方壁纸 ' + String(f.replace(/\.webp$/i, '')).replace(/^wallpaper-?0*/, '') })), currentWallpaper });
+      return json(res, 200, {
+        ok: true,
+        wallpapers: official.map((f) => ({ name: f, title: '官方壁纸 ' + String(f.replace(/\.webp$/i, '')).replace(/^wallpaper-?0*/, '') })),
+        customWallpapers: custom.map((f) => ({ name: f, title: '自定义壁纸 ' + String(f.replace(/\.webp$/i, '')).replace(/^custom-/, '') })),
+        currentWallpaper,
+      });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: e.message });
+    }
+  }
+
+  // 自定义壁纸管理（themes/wallpapers/custom-*.webp）：
+  // GET  /api/custom-wallpapers —— 列表（冗余，主要随 /api/wallpapers 返回）
+  // POST /api/custom-wallpapers —— 上传 body.dataUrl（base64），保存为 custom-<时间戳>.webp 并返回 name
+  // DELETE /api/custom-wallpapers?name=x —— 删除指定自定义壁纸文件（仅 custom- 前缀，防误删官方壁纸）
+  if (req.method === 'GET' && p === '/api/custom-wallpapers') {
+    try {
+      const files = fs.existsSync(WALLPAPERS_DIR)
+        ? fs.readdirSync(WALLPAPERS_DIR).filter((f) => /^custom-[A-Za-z0-9_.-]+\.webp$/i.test(f)).sort()
+        : [];
+      return json(res, 200, { ok: true, wallpapers: files.map((f) => ({ name: f, title: '自定义壁纸 ' + String(f.replace(/\.webp$/i, '')).replace(/^custom-/, '') })) });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: e.message });
+    }
+  }
+  if (req.method === 'POST' && p === '/api/custom-wallpapers') {
+    return readBody(req).then((body) => {
+      try {
+        const dataUrl = String(body.dataUrl || '');
+        const m = /^data:image\/(png|jpe?g|webp);base64,(.+)$/i.exec(dataUrl);
+        if (!m) return json(res, 400, { ok: false, error: '图片必须是 PNG/JPEG/WebP base64' });
+        const buf = Buffer.from(m[2], 'base64');
+        if (buf.length > 10 * 1024 * 1024) return json(res, 400, { ok: false, error: '图片不能超过 10MB' });
+        fs.mkdirSync(WALLPAPERS_DIR, { recursive: true });
+        const name = 'custom-' + Date.now().toString(36) + '.webp';
+        fs.writeFileSync(path.join(WALLPAPERS_DIR, name), buf);
+        log(`[theme] 上传自定义壁纸 -> ${name} (${buf.length}B)`);
+        return json(res, 200, { ok: true, name });
+      } catch (e) {
+        return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+  if (req.method === 'DELETE' && p === '/api/custom-wallpapers') {
+    try {
+      const raw = String(req.url.split('?')[1] || '');
+      const name = decodeURIComponent(/name=([^&]+)/.exec(raw) ? RegExp.$1 : '');
+      if (!/^custom-[A-Za-z0-9_.-]+\.webp$/i.test(name)) return json(res, 400, { ok: false, error: '仅支持删除自定义壁纸（custom-*.webp）' });
+      const file = path.join(WALLPAPERS_DIR, name);
+      if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '壁纸不存在: ' + name });
+      fs.unlinkSync(file);
+      log('[theme] 删除自定义壁纸 -> ' + name);
+      return json(res, 200, { ok: true, name });
     } catch (e) {
       return json(res, 500, { ok: false, error: e.message });
     }
@@ -5602,8 +5962,12 @@ function handleApi(req, res) {
   if (req.method === 'GET' && p === '/api/mask') {
     try {
       const f = path.join(DATA_DIR, 'mask.json');
-      const opacity = fs.existsSync(f) ? (parseFloat(JSON.parse(fs.readFileSync(f, 'utf8')).opacity) || 0.3) : 0.1;
-      return json(res, 200, { ok: true, opacity: Math.min(1, Math.max(0, opacity)) });
+      let opacity = 0.1;
+      if (fs.existsSync(f)) {
+        const v = parseFloat(JSON.parse(fs.readFileSync(f, 'utf8')).opacity);
+        if (!Number.isNaN(v)) opacity = Math.min(1, Math.max(0, v));
+      }
+      return json(res, 200, { ok: true, opacity });
     } catch (e) {
       return json(res, 200, { ok: true, opacity: 0.1 });
     }
@@ -5883,6 +6247,38 @@ function handleApi(req, res) {
     const job = autoCopyJobs.get(url.searchParams.get('id') || '');
     return job ? json(res, 200, { ok: true, job: publicAutoCopyJob(job) }) : json(res, 404, { ok: false, error: '自动复制任务不存在' });
   }
+  // 加密导出会话及其受管消息附件：POST /api/sessions/export { ids, password }
+  if (req.method === 'POST' && p === '/api/sessions/export') {
+    return readBody(req).then(async (body) => {
+      try {
+        const result = await exportSessions(body && body.ids, body && body.password);
+        log(`[sessions-export] 已导出 ${result.count} 个会话`);
+        return json(res, 200, { ok: true, ...result });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error.message });
+      }
+    });
+  }
+  // 加密导入会话；targetUid 缺省时保留归档中的账号归属。
+  if (req.method === 'POST' && p === '/api/sessions/import') {
+    return readBody(req).then(async (body) => {
+      try {
+        const result = await importSessions(body && body.content, body && body.password, body && body.targetUid);
+        log(`[sessions-import] 已导入 ${result.imported.length} 个会话，失败 ${result.failed} 个`);
+        let reloaded = false;
+        try {
+          await reloadWorkBuddyPage();
+          reloaded = true;
+          log('[sessions-import] 已通过 CDP 刷新 WorkBuddy 窗口');
+        } catch (reloadError) {
+          log(`[sessions-import] CDP 刷新失败: ${reloadError.message}`);
+        }
+        return json(res, 200, { ok: true, count: result.imported.length, imported: result.imported, failed: result.failed, reloaded });
+      } catch (error) {
+        return json(res, 400, { ok: false, error: error.message });
+      }
+    });
+  }
   // 复制会话：POST /api/sessions/copy { ids, targetUid }（保留原会话，复制记录+消息文件到目标账号）
   if (req.method === 'POST' && p === '/api/sessions/copy') {
     return readBody(req).then(async (body) => {
@@ -6103,7 +6499,10 @@ function handleApi(req, res) {
 
   // 替换主题背景图（保持主题配色不变）：存 background.webp + 更新 theme.json image 字段 +
   // 设 current 并立即应用。用于面板「图片」按钮——用户换背景图不生成新主题，reload 后恢复的就是新图。
-  // 支持两种来源：body.dataUrl（用户上传 base64）/ body.wallpaper（官方图库文件名，从 wallpapers 目录复制）
+  // 支持三种来源：body.dataUrl（用户上传 base64）/ body.wallpaper（官方图库文件名，从 wallpapers 目录复制）/
+  //             body.custom（自定义壁纸文件名，从 wallpapers/custom-* 复制）
+  // 注意：CDP 未连接时应用主题会失败，但文件与 current-theme.json 已保存——此时仍返回成功，
+  //       由 restoreSavedTheme 在连接恢复后自动应用，避免"背景图已保存但应用失败"的报错困扰用户。
   if (req.method === 'POST' && p === '/api/theme-bg') {
     return readBody(req).then((body) => {
       try {
@@ -6111,9 +6510,17 @@ function handleApi(req, res) {
         if (!id) return json(res, 400, { ok: false, error: '缺少 id' });
         let buf = null;
         const wpName = String(body.wallpaper || '');
+        const customName = String(body.custom || '');
         if (wpName) {
           // 官方图库：从 wallpapers 目录读取（防路径穿越：只允许纯文件名）
           const safeName = path.basename(wpName).replace(/[^A-Za-z0-9._-]/g, '_');
+          const src = path.join(WALLPAPERS_DIR, safeName);
+          if (!fs.existsSync(src)) return json(res, 400, { ok: false, error: '壁纸不存在: ' + safeName });
+          buf = fs.readFileSync(src);
+        } else if (customName) {
+          // 自定义壁纸：从 wallpapers/custom-* 读取（同样防路径穿越）
+          const safeName = path.basename(customName).replace(/[^A-Za-z0-9._-]/g, '_');
+          if (!/^custom-/i.test(safeName)) return json(res, 400, { ok: false, error: '壁纸不存在: ' + safeName });
           const src = path.join(WALLPAPERS_DIR, safeName);
           if (!fs.existsSync(src)) return json(res, 400, { ok: false, error: '壁纸不存在: ' + safeName });
           buf = fs.readFileSync(src);
@@ -6141,9 +6548,10 @@ function handleApi(req, res) {
           fs.writeFileSync(path.join(DATA_DIR, 'current-theme.json'), JSON.stringify({ id, at: new Date().toISOString() }, null, 2));
         } catch (_) {}
         log('[theme] 替换背景图 -> ' + id + '/background.webp (' + buf.length + 'B)');
+        // CDP 未连接/应用失败不再判为整体失败：文件已落盘，连接恢复后 restoreSavedTheme 会应用
         return applyThemeByCdp(id)
-          .then((info) => json(res, 200, { ok: true, image: 'background.webp', applied: info.ok, id }))
-          .catch((e) => json(res, 500, { ok: false, error: '背景图已保存但应用失败: ' + e.message }));
+          .then((info) => json(res, 200, { ok: true, image: 'background.webp', applied: !!(info && info.ok), id }))
+          .catch((e) => json(res, 200, { ok: true, image: 'background.webp', applied: false, pending: true, id, warn: '背景已保存，主题将在连接恢复后自动应用' }));
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }

@@ -1,9 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
@@ -12,6 +10,7 @@ const scriptsDir = path.join(root, 'scripts');
 const launcherSource = fs.readFileSync(path.join(scriptsDir, 'win-launcher.js'), 'utf8');
 const daemonSource = fs.readFileSync(path.join(scriptsDir, 'daemon.js'), 'utf8');
 const watchdogSource = fs.readFileSync(path.join(scriptsDir, 'watchdog.js'), 'utf8');
+const nativeSource = fs.readFileSync(path.join(scriptsDir, 'windows-native', 'main.go'), 'utf8');
 const installerSource = fs.readFileSync(path.join(scriptsDir, 'install-win.ps1'), 'utf8');
 const readmeSource = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
 const hiddenLauncherSource = fs.readFileSync(path.join(scriptsDir, 'launcher-hidden.vbs'), 'utf8');
@@ -165,43 +164,21 @@ test('daemon status identity binds metadata, listener PID, node path, and script
   assert.throws(() => boundary.assertDaemonServiceIdentity({ ...input, status: { ...status, pid: '301' } }), /PID/i);
 });
 
-test('Windows entry points detect and expose a matching daemon privilege mode', () => {
+test('Windows native entry point enforces standard privilege and exposes daemon identity', () => {
   assert.equal(fs.existsSync(path.join(scriptsDir, 'win-inject-helper.js')), false);
-  assert.match(launcherSource, /detectWindowsPrivilege/);
-  assert.match(watchdogSource, /detectWindowsPrivilege/);
+  assert.match(nativeSource, /TokenElevation/);
+  assert.match(nativeSource, /func isElevated\(\)/);
+  assert.match(nativeSource, /if elevated \{/);
+  assert.match(nativeSource, /WBSWITCH_NATIVE_LAUNCHER=1/);
   assert.match(daemonSource, /detectWindowsPrivilege/);
   assert.match(daemonSource, /privilege:\s*DAEMON_PRIVILEGE/);
   assert.match(daemonSource, /pid:\s*process\.pid/);
-  assert.match(launcherSource, /assertDaemonServiceIdentity/);
-  const privilegeProbe = launcherSource.indexOf('detectWindowsPrivilege();');
-  const telemetryImport = launcherSource.indexOf('const { captureMessage');
-  assert.ok(privilegeProbe >= 0 && telemetryImport > privilegeProbe);
-  const privilegeFailure = launcherSource.slice(privilegeProbe, telemetryImport);
-  assert.doesNotMatch(privilegeFailure, /reportAndExit|captureMessage|captureException|\blog\s*\(/);
-  const ensureDaemonSource = launcherSource.slice(
-    launcherSource.indexOf('async function ensureDaemon'),
-    launcherSource.indexOf('// ---------- 2\/3.', launcherSource.indexOf('async function ensureDaemon'))
-  );
-  assert.doesNotMatch(ensureDaemonSource, /daemonRunning\s*\(/);
-  assert.match(ensureDaemonSource, /exactDaemonStatus/);
-  assert.match(watchdogSource, /assertVerifiedNodeProcess/);
-  assert.match(watchdogSource, /filterVerifiedNodeProcesses/);
-  assert.match(watchdogSource, /assertSameProcessIdentity/);
-  assert.match(watchdogSource, /requireCurrentOwner:\s*true/);
-  assert.match(watchdogSource, /requireNativeArguments:\s*true/);
-  assert.match(watchdogSource, /ParentProcessId/);
-  assert.match(watchdogSource, /flag:\s*['"]wx['"]/);
-  assert.match(watchdogSource, /queryWatchdogProcesses\(\)/);
-  assert.match(watchdogSource, /state\.kind === 'untracked'/);
-  assert.doesNotMatch(watchdogSource, /taskkill[\s\S]{0,120}['"]\/T['"]/i);
-  assert.match(watchdogSource, /terminateVerifiedProcess\(state\.watchdog/);
-  assert.match(watchdogSource, /terminateVerifiedProcess\(daemon/);
-  assert.match(watchdogSource, /if \(state\.kind === 'stale'\) \{[\s\S]*removePidFileIf\(state\.pid\)/);
-  assert.match(launcherSource, /if \(watchdog\.kind === 'stale'\) \{[\s\S]*removeWatchdogPidIf\(watchdog\.pid\)/);
-  assert.match(launcherSource, /queryNodeProcesses\(nodeBin, \[pid\]\)/);
-  assert.match(launcherSource, /allowLowerPrivilege/);
-  assert.match(watchdogSource, /ExecutablePath -ieq/);
-  assert.doesNotMatch(launcherSource + daemonSource, /Start-Process[^\n]*-Verb\s+RunAs/i);
+  assert.match(watchdogSource, /net\.createServer\(\)/);
+  assert.match(watchdogSource, /exclusive:\s*true/);
+  assert.doesNotMatch(watchdogSource, /powershell|Get-CimInstance|Invoke-CimMethod|taskkill/i);
+  assert.match(nativeSource, /expectedNode := filepath\.Join\(appDir, "scripts", "runtime", "node", "node\.exe"\)/);
+  assert.match(nativeSource, /if !samePath\(actual, expectedPath\)/);
+  assert.doesNotMatch(nativeSource + daemonSource, /Start-Process[^\n]*-Verb\s+RunAs/i);
   assert.doesNotMatch(installerSource, /请以管理员身份运行/);
   assert.doesNotMatch(readmeSource, /右键以管理员身份运行 WorkDaddy/);
 });
@@ -233,129 +210,29 @@ test('PowerShell lifecycle scopes daemon discovery to a verified watchdog parent
   assert.match(boundary, /for \(\$attempt = 0; \$attempt -lt 20; \$attempt\+\+\)[\s\S]*Get-StrictProcessRecord -ProcessId \$targetPid[\s\S]*catch/);
 });
 
-test('watchdog stop terminates only reverified watchdog and direct daemon PIDs', () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-watchdog-stop-'));
-  const preload = path.join(tempDir, 'preload.js');
-  const callsFile = path.join(tempDir, 'calls.jsonl');
-  const watchdogPid = 424201;
-  const daemonPid = 424202;
-  fs.writeFileSync(path.join(tempDir, 'watchdog.pid'), String(watchdogPid));
-  fs.writeFileSync(preload, `
-    const cp = require('node:child_process');
-    const fs = require('node:fs');
-    const node = ${JSON.stringify(process.execPath)};
-    const watchdog = ${JSON.stringify(path.join(scriptsDir, 'watchdog.js'))};
-    const daemon = ${JSON.stringify(path.join(scriptsDir, 'daemon.js'))};
-    const callsFile = ${JSON.stringify(callsFile)};
-    const alive = new Set(process.env.TEST_NO_DAEMON === '1' ? [${watchdogPid}] : [${watchdogPid}, ${daemonPid}]);
-    const owner = 'DESKTOP\\alice';
-    const rows = {
-      ${watchdogPid}: { ProcessId: ${watchdogPid}, ParentProcessId: 100, Name: 'node.exe', ExecutablePath: node, CommandLine: '"' + node + '" --experimental-sqlite "' + watchdog + '"', ArgumentsSource: 'CommandLineToArgvW', Arguments: [node, '--experimental-sqlite', watchdog], Owner: owner, OwnerIsCurrent: process.env.TEST_FOREIGN_OWNER !== '1' },
-      ${daemonPid}: { ProcessId: ${daemonPid}, ParentProcessId: ${watchdogPid}, Name: 'node.exe', ExecutablePath: node, CommandLine: '"' + node + '" --experimental-sqlite "' + daemon + '"', ArgumentsSource: 'CommandLineToArgvW', Arguments: [node, '--experimental-sqlite', daemon], Owner: owner, OwnerIsCurrent: process.env.TEST_FOREIGN_OWNER !== '1' },
-    };
-    cp.spawn = () => { throw new Error('unexpected daemon spawn'); };
-    cp.spawnSync = (command, args) => {
-      if (command === 'powershell') {
-        const script = String(args[args.length - 1]);
-        if (script.includes('WindowsBuiltInRole')) return { status: 0, stdout: 'False\\r\\n', stderr: '' };
-        let selected = [];
-        if (script.includes('ParentProcessId -eq ${watchdogPid}')) {
-          selected = [rows[${watchdogPid}], rows[${daemonPid}]].filter((row) => alive.has(row.ProcessId));
-        } else {
-          const match = script.match(/ProcessId -eq (\\d+)/);
-          if (match && alive.has(Number(match[1]))) selected = [rows[Number(match[1])]];
-        }
-        return { status: 0, stdout: selected.length ? JSON.stringify(selected.length === 1 ? selected[0] : selected) : '', stderr: '' };
-      }
-      if (command === 'taskkill') {
-        fs.appendFileSync(callsFile, JSON.stringify(args) + '\\n');
-        const pid = Number(args[args.indexOf('/PID') + 1]);
-        alive.delete(pid);
-        return { status: 0, stdout: '', stderr: '' };
-      }
-      throw new Error('unexpected command: ' + command);
-    };
-  `);
-  try {
-    const result = spawnSync(process.execPath, ['--require', preload, path.join(scriptsDir, 'watchdog.js'), 'stop'], {
-      encoding: 'utf8',
-      env: { ...process.env, WBSWITCH_DATA_DIR: tempDir },
-      timeout: 10000,
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(fs.existsSync(path.join(tempDir, 'watchdog.pid')), false);
-    const calls = fs.readFileSync(callsFile, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-    assert.deepEqual(calls, [
-      ['/F', '/PID', String(watchdogPid)],
-      ['/F', '/PID', String(daemonPid)],
-    ]);
-
-    fs.writeFileSync(path.join(tempDir, 'watchdog.pid'), String(watchdogPid));
-    fs.writeFileSync(callsFile, '');
-    const crashWindow = spawnSync(process.execPath, ['--require', preload, path.join(scriptsDir, 'watchdog.js'), 'stop'], {
-      encoding: 'utf8',
-      env: { ...process.env, WBSWITCH_DATA_DIR: tempDir, TEST_NO_DAEMON: '1' },
-      timeout: 10000,
-    });
-    assert.equal(crashWindow.status, 0, crashWindow.stderr);
-    assert.equal(fs.existsSync(path.join(tempDir, 'watchdog.pid')), false);
-    assert.deepEqual(
-      fs.readFileSync(callsFile, 'utf8').trim().split(/\r?\n/).map(JSON.parse),
-      [['/F', '/PID', String(watchdogPid)]]
-    );
-
-    fs.writeFileSync(path.join(tempDir, 'watchdog.pid'), String(watchdogPid));
-    fs.writeFileSync(callsFile, '');
-    const foreignOwner = spawnSync(process.execPath, ['--require', preload, path.join(scriptsDir, 'watchdog.js'), 'stop'], {
-      encoding: 'utf8',
-      env: { ...process.env, WBSWITCH_DATA_DIR: tempDir, TEST_FOREIGN_OWNER: '1' },
-      timeout: 10000,
-    });
-    assert.notEqual(foreignOwner.status, 0);
-    assert.match(foreignOwner.stderr, /owner|current user|所有者|当前用户/i);
-    assert.equal(fs.readFileSync(path.join(tempDir, 'watchdog.pid'), 'utf8'), String(watchdogPid));
-    assert.equal(fs.readFileSync(callsFile, 'utf8'), '');
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+test('watchdog uses an OS-managed profile lock and no process scanner', () => {
+  assert.match(watchdogSource, /const LOCK_PORT = PROFILE\.id === 'workbuddy-ai' \? 47933 : 47932/);
+  assert.match(watchdogSource, /const lockServer = net\.createServer\(\)/);
+  assert.match(watchdogSource, /lockServer\.listen\(\{ host: '127\.0\.0\.1', port: LOCK_PORT, exclusive: true \}/);
+  assert.match(watchdogSource, /error\.code === 'EADDRINUSE'/);
+  assert.doesNotMatch(watchdogSource, /spawnSync|powershell|Get-CimInstance|taskkill/i);
 });
 
-test('watchdog startup repairs a missing PID file for one exact instance', () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-watchdog-untracked-'));
-  const preload = path.join(tempDir, 'preload.js');
-  const untrackedPid = 424203;
-  fs.writeFileSync(preload, `
-    const cp = require('node:child_process');
-    const node = ${JSON.stringify(process.execPath)};
-    const watchdog = ${JSON.stringify(path.join(scriptsDir, 'watchdog.js'))};
-    cp.spawn = () => { throw new Error('duplicate watchdog reached daemon spawn'); };
-    cp.spawnSync = (command, args) => {
-      if (command !== 'powershell') throw new Error('unexpected command: ' + command);
-      const script = String(args[args.length - 1]);
-      if (script.includes('WindowsBuiltInRole')) return { status: 0, stdout: 'False\\r\\n', stderr: '' };
-      if (script.includes("Name -eq 'node.exe'")) {
-        return { status: 0, stderr: '', stdout: JSON.stringify({
-          ProcessId: ${untrackedPid}, ParentProcessId: 100, Name: 'node.exe', ExecutablePath: node,
-          CommandLine: '"' + node + '" --experimental-sqlite "' + watchdog + '"',
-          ArgumentsSource: 'CommandLineToArgvW', Arguments: [node, '--experimental-sqlite', watchdog],
-          Owner: 'DESKTOP\\alice', OwnerIsCurrent: true,
-        }) };
-      }
-      return { status: 0, stdout: '', stderr: '' };
-    };
-  `);
-  try {
-    const result = spawnSync(process.execPath, ['--require', preload, path.join(scriptsDir, 'watchdog.js')], {
-      encoding: 'utf8',
-      env: { ...process.env, WBSWITCH_DATA_DIR: tempDir },
-      timeout: 10000,
-    });
-    assert.equal(result.status, 0);
-    assert.match(result.stdout, /恢复缺失的 watchdog\.pid|本实例退出/i);
-    assert.equal(fs.readFileSync(path.join(tempDir, 'watchdog.pid'), 'utf8'), String(untrackedPid));
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+test('native lifecycle stop validates the bundled node path before termination', () => {
+  const expectedNode = nativeSource.indexOf('expectedNode := filepath.Join(appDir, "scripts", "runtime", "node", "node.exe")');
+  const identityCheck = nativeSource.indexOf('if !samePath(actual, expectedPath)');
+  const terminate = nativeSource.indexOf('procTerminateProcess.Call', identityCheck);
+  const lifecycleCall = nativeSource.indexOf('terminateExactNode(candidate.pid, expectedNode)', expectedNode);
+  assert.ok(expectedNode >= 0, 'native helper must derive the bundled node path from the target app');
+  assert.ok(identityCheck >= 0, 'process path must be checked against the bundled node path');
+  assert.ok(terminate > identityCheck, 'termination must happen only after the exact path check');
+  assert.ok(lifecycleCall > expectedNode, 'lifecycle stop must pass the derived path into the terminating helper');
+  assert.match(nativeSource, /func terminateWorkBuddy\(profile string\)/);
+  assert.match(nativeSource, /if len\(paths\) != 1/);
+  assert.match(nativeSource, /--terminate-workbuddy/);
+  assert.match(nativeSource, /exitAccessDenied/);
+  assert.match(nativeSource, /exitIdentityMismatch/);
+  assert.match(nativeSource, /if elevated \{[\s\S]*return true, exitAccessDenied/);
 });
 
 test('packaged scripts contain no WorkBuddy image-name kill or stale elevation helper', () => {

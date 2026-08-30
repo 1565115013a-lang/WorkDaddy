@@ -116,31 +116,45 @@ The queue item's 暂存提示词 tag is rendered by `syncQueueTags` (in `scripts
 
 Use this exact flow for a Windows release. The two client packages are built from the same source tree, but each is staged with its own profile, installation directory, daemon port, desktop shortcut, and WorkBuddy executable name.
 
-1. Start from the requested source commit/branch and confirm the working tree. Do not silently change the release version in `scripts/daemon.js` when producing a fixed-version package; pass the requested version explicitly to the release script.
+1. Start from the requested source commit/branch and confirm the working tree. Do not silently change the release version in `scripts/daemon.js` when producing a fixed-version package; pass the requested version explicitly to the release script. Before building, remove only the existing `release/windows/*-Setup-*.exe` files if the request is to replace all installer artifacts; keep unrelated files outside that directory untouched.
 
-2. From the repository root, run the Windows release builder with Git Bash, Inno Setup 6, and Python available:
+2. From the repository root, run the Windows release builder with Git Bash, Inno Setup 6, and Python available. Prefer explicit tool paths on the build host so the result is reproducible and does not depend on `PATH`:
 
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-win-release.ps1 -Version 1.1.2
+   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-win-release.ps1 `
+     -Version <VERSION> `
+     -GoPath "$env:USERPROFILE\.workdaddy-toolchains\go1.27.0\bin\go.exe" `
+     -IsccPath "$env:USERPROFILE\.workdaddy-toolchains\Inno Setup 6\ISCC.exe"
+   ```
+
+   On a host where the compiler emits a large amount of output, run the same command through a child PowerShell with stdout/stderr redirected to temporary log files and wait for its exit code. Do not treat a truncated terminal response or an intermediate file as a completed build:
+
+   ```powershell
+   $argString = '-NoProfile -ExecutionPolicy Bypass -File "scripts/build-win-release.ps1" -Version <VERSION> -GoPath "<GO_EXE>" -IsccPath "<ISCC_EXE>"'
+   $p = Start-Process powershell.exe -ArgumentList $argString `
+     -RedirectStandardOutput release/build.stdout.log `
+     -RedirectStandardError release/build.stderr.log -Wait -PassThru
+   if ($p.ExitCode -ne 0) { throw "Windows build failed: $($p.ExitCode)" }
    ```
 
    `build-win-release.ps1` must build both `workbuddy-cn` and `workbuddy-ai`. `build-win-zip.sh` creates only an internal staging ZIP; `build-win-installer.ps1` rewrites the staged daemon version and build id to the requested release version before compiling Setup.exe. Do not hand-copy scripts into an old installer directory.
 
-3. Deliver only these files:
+3. Deliver only these files (replace `<VERSION>` with the requested release version):
 
    ```text
-   release/windows/WorkDaddy-Setup-1.1.2.exe
-   release/windows/WorkDaddy-AI-Setup-1.1.2.exe
+   release/windows/WorkDaddy-Setup-<VERSION>.exe
+   release/windows/WorkDaddy-AI-Setup-<VERSION>.exe
    ```
 
-   Remove the generated `WorkDaddy-1.1.2-win64.zip`, `WorkDaddy-AI-1.1.2-win64.zip`, and `release/.cache` before handoff or publication. The ZIPs are staging inputs, not Windows release artifacts. Confirm that `安装失败自主解决提示词.txt` is absent from both Setup.exe payloads.
+   Remove all generated `WorkDaddy-<VERSION>-win64.zip`, `WorkDaddy-AI-<VERSION>-win64.zip`, stale `release/windows/*-Setup-*.exe` files that are not part of this release, build logs, temporary verification directories, and `release/.cache` before handoff or publication. The ZIPs are staging inputs, not Windows release artifacts. Confirm that `安装失败自主解决提示词.txt` is absent from both Setup.exe payloads.
 
 4. Inspect the actual Setup.exe payloads, not just their filenames. Run `innounp -t` on both files, list or extract them, and verify all of the following for each package:
 
    - `scripts/runtime/node/node.exe` exists.
-   - `scripts/daemon.js` reports the requested version, here `1.1.2`.
+   - `scripts/daemon.js` reports the requested `<VERSION>`.
    - `scripts/win-launcher.js`, `scripts/watchdog.js`, and the required PowerShell scripts are present.
    - CN uses `workbuddy-cn`, `47832`, `9222` as its defaults; AI uses `workbuddy-ai`, `47833`, `9223`.
+   - The extracted `scripts/inject.js` keeps the platform placeholder unquoted (`var WBS_PLATFORM = __WBS_PLATFORM__;`) so daemon replacement with `JSON.stringify(process.platform)` produces the correct `"win32"` value. Confirm the Windows path contains the auto-open installer flow and does not enter the macOS reboot progress branch.
    - The package contains no `安装失败自主解决提示词.txt` and no temporary ZIP.
 
 5. Run release checks from the same repository:

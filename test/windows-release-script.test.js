@@ -44,13 +44,13 @@ test('Windows standard relaunch falls back to the Explorer Shell object by execu
   assert.doesNotMatch(relaunch, /Get-Process\s+-Name\s+explorer/);
 });
 
-test('Windows watchdog only pauses for a live or recent update marker', () => {
+test('Windows watchdog uses an OS-managed profile lock and keeps restart backoff', () => {
   const watchdog = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'watchdog.js'), 'utf8');
-  assert.match(watchdog, /updateProcessIsActive/);
-  assert.match(watchdog, /apply-update\\\\\.ps1/);
-  assert.match(watchdog, /gracePeriodMs\s*=\s*10 \* 60 \* 1000/);
-  assert.match(watchdog, /unlinkSync\(UPDATE_PENDING_FILE\)/);
-  assert.match(watchdog, /if \(updatePendingIsActive\(\)\)/);
+  assert.match(watchdog, /net\.createServer\(\)/);
+  assert.match(watchdog, /const LOCK_PORT = PROFILE\.id === 'workbuddy-ai' \? 47933 : 47932/);
+  assert.match(watchdog, /exclusive:\s*true/);
+  assert.match(watchdog, /restartDelay = Math\.min\(restartDelay \* 2, 60000\)/);
+  assert.doesNotMatch(watchdog, /pending\.json|updateProcessIsActive|powershell|Get-CimInstance|taskkill/i);
 });
 
 test('Windows installer excludes the repair prompt from all release stages', () => {

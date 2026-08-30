@@ -254,10 +254,12 @@ test('daemon session SQL uses bound parameters without delimiter serialization',
   assert.ok((daemon.match(/catch \(e\) \{ return json\(res, 400, \{ ok: false, error: e\.message \}\); \}/g) || []).length >= 4);
   assert.doesNotMatch(daemon, /body\.ids\.filter\(/);
   assert.match(daemon, /sqliteQuery\([^,]+,\s*\[[^\]]/s);
-  assert.match(verifyWin, /daemon\.js session-db\.js lib\.js/);
+  assert.match(verifyWin, /daemon\.js session-db\.js secure-transfer\.js lib\.js/);
   const copyList = (macBuild.match(/for f in ([^;]+); do/) || [])[1] || '';
   assert.match(copyList, /(?:^|\s)session-db\.js(?:\s|$)/);
+  assert.match(copyList, /(?:^|\s)secure-transfer\.js(?:\s|$)/);
   assert.match(copyList, /(?:^|\s)windows-process-boundary\.js(?:\s|$)/);
   assert.match(macBuild, /chmod 644[\s\S]*session-db\.js/);
+  assert.match(macBuild, /chmod 644[\s\S]*secure-transfer\.js/);
   assert.match(macBuild, /chmod 644[\s\S]*windows-process-boundary\.js/);
 });

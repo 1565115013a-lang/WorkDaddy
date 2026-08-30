@@ -7,12 +7,8 @@ const test = require('node:test');
 const {
   isStashQueueItem,
   stashContentMatches,
-  resolveWorkBuddyAiConversationId,
-  workBuddyAiDraftStorageKey,
-  isWorkBuddyAiComposerStore,
-  workBuddyAiThemeMigrationKey,
-  shouldMigrateWorkBuddyAiTheme,
 } = require('../scripts/inject.js');
+const compat = require('../scripts/workbuddy-compat.js');
 
 test('ordinary queue items are not classified as stash items by a text substring', () => {
   const stashIds = ['stash-1'];
@@ -55,9 +51,9 @@ test('async stash cleanup only clears the content captured at click time', () =>
   assert.equal(stashContentMatches(captured, { text: '先暂存这条', items: [{ type: 'image', uri: 'new-image' }] }), false);
 });
 
-test('WorkBuddy AI draft cleanup is scoped to the exact active conversation store', () => {
-  assert.equal(workBuddyAiDraftStorageKey(' conversation-a '), 'cb-draft:conversation-a');
-  assert.equal(workBuddyAiDraftStorageKey(''), null);
+test('modern draft cleanup is scoped to the exact active conversation store', () => {
+  assert.equal(compat.draftStorageKey(' conversation-a '), 'cb-draft:conversation-a');
+  assert.equal(compat.draftStorageKey(''), null);
 
   const matchingStore = {
     api: {
@@ -76,33 +72,26 @@ test('WorkBuddy AI draft cleanup is scoped to the exact active conversation stor
     getSnapshot() { return { activeSessionId: 'conversation-a' }; },
   };
 
-  assert.equal(isWorkBuddyAiComposerStore(matchingStore, 'conversation-a'), true);
-  assert.equal(isWorkBuddyAiComposerStore(otherConversationStore, 'conversation-a'), false);
-  assert.equal(isWorkBuddyAiComposerStore(unrelatedStore, 'conversation-a'), false);
+  assert.equal(compat.isComposerStore(matchingStore, 'conversation-a'), true);
+  assert.equal(compat.isComposerStore(otherConversationStore, 'conversation-a'), false);
+  assert.equal(compat.isComposerStore(unrelatedStore, 'conversation-a'), false);
 });
 
 test('stash cleanup clears the official composer store and persistent conversation draft before DOM fallback', () => {
   const inject = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
-  assert.match(inject, /function clearWorkBuddyAiComposerDraft\(ed, sessionId\)/);
-  assert.match(inject, /isWorkBuddyAiComposerStore\(store, sessionId\)/);
+  assert.match(inject, /function clearModernComposerDraft\(ed, sessionId\)/);
+  assert.match(inject, /WBS_COMPAT\.isComposerStore\(store, sessionId\)/);
   assert.match(inject, /store\.api\.clear\(\)/);
+  assert.match(inject, /WBS_COMPAT\.draftStorageKey\(sessionId\)/);
   assert.match(inject, /localStorage\.removeItem\(draftKey\)/);
-  assert.match(inject, /clearWorkBuddyAiComposerDraft\(ed, stashSessionAtClick\)/);
+  assert.match(inject, /clearModernComposerDraft\(ed, stashSessionAtClick\)/);
 });
 
-test('WorkBuddy AI theme migration is profile-gated and one-time', () => {
-  assert.equal(workBuddyAiThemeMigrationKey('workbuddy-ai'), 'workdaddy:theme-migration:workbuddy-ai:official-light:v1');
-  assert.equal(workBuddyAiThemeMigrationKey('workbuddy-cn'), null);
-  assert.equal(shouldMigrateWorkBuddyAiTheme('workbuddy-ai', null), true);
-  assert.equal(shouldMigrateWorkBuddyAiTheme('workbuddy-ai', '1'), false);
-  assert.equal(shouldMigrateWorkBuddyAiTheme('workbuddy-cn', null), false);
-
+test('theme tab is capability-gated and available to WorkBuddy AI', () => {
   const inject = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
-  assert.match(inject, /if \(!CAPS\.theme \|\| WBS_PROFILE_IS_AI\)/);
-  assert.match(inject, /function migrateWorkBuddyAiThemeOnce\(\)/);
-  assert.match(inject, /applyTheme\('default'\)/);
-  assert.match(inject, /localStorage\.setItem\(migrationKey, '1'\)/);
-  assert.match(inject, /migrateWorkBuddyAiThemeOnce\(\);/);
+  assert.match(inject, /if \(!CAPS\.theme\)/);
+  assert.doesNotMatch(inject, /if \(!CAPS\.theme \|\| WBS_PROFILE_IS_AI\)/);
+  assert.doesNotMatch(inject, /migrateWorkBuddyAiThemeOnce/);
 });
 
 test('daemon stash restore has an AI composer fallback when voice-mic-wrap is absent', () => {
@@ -111,8 +100,8 @@ test('daemon stash restore has an AI composer fallback when voice-mic-wrap is ab
   assert.match(daemon, /var allEd = document\.querySelectorAll\('\[contenteditable="true"\]'\)/);
 });
 
-test('WorkBuddy AI conversation id comes from the selected sidebar card, not message req ids', () => {
-  const id = resolveWorkBuddyAiConversationId([
+test('modern conversation id comes from the selected sidebar card, not message req ids', () => {
+  const id = compat.selectedConversationId([
     {
       conversationId: 'background-conversation',
       className: 'conversation-item',
@@ -129,45 +118,46 @@ test('WorkBuddy AI conversation id comes from the selected sidebar card, not mes
   assert.notEqual(id, 'req-1787762196288001-assistant');
 });
 
-test('WorkBuddy AI selected conversation resolver also supports aria-selected and rejects arbitrary rows', () => {
-  assert.equal(resolveWorkBuddyAiConversationId([
+test('modern selected conversation resolver also supports aria-selected and rejects arbitrary rows', () => {
+  assert.equal(compat.selectedConversationId([
     { conversationId: 'arbitrary', className: 'conversation-item' },
     { conversationId: 'aria-selected', ariaSelected: 'true', className: 'conversation-item' },
   ]), 'aria-selected');
-  assert.equal(resolveWorkBuddyAiConversationId([
+  assert.equal(compat.selectedConversationId([
     { conversationId: 'arbitrary', className: 'conversation-item' },
   ]), null);
 });
 
-test('WorkBuddy AI queue path uses the top-level notifying adapter and clears stale adapter cache', () => {
+test('modern queue path uses the top-level notifying adapter and clears stale adapter cache', () => {
   const inject = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
   assert.match(inject, /delete window\.__wbsAdapter/);
-  assert.match(inject, /var target = ai\.adapter/);
+  assert.match(inject, /var target = found\.adapter/);
   assert.doesNotMatch(inject, /var srX = p\.adapter\.sessionsResource/);
-  assert.match(inject, /var selectedId = getWorkBuddyAiSelectedConversationId\(\)/);
-  assert.match(inject, /function syncWorkBuddyAiQueueSnapshot\(sessionId, snapshot\)/);
+  assert.match(inject, /WBS_COMPAT\.getSelectedConversationId\(document\)/);
+  assert.match(inject, /function syncModernQueueSnapshot\(sessionId, snapshot\)/);
   assert.match(inject, /store\.setPromptQueue\(queueItems\)/);
   assert.match(inject, /__wbsQueueMirrorInstalled/);
   assert.match(inject, /manager\.__wbsQueueMirrorItems = queueItems\.slice\(\)/);
   assert.match(inject, /manager\.delete = function \(itemId\)/);
   assert.match(inject, /adapter\.removeConversationMessageQueueItem\(sessionId, itemId\)/);
   assert.match(inject, /adapter\.sendConversationMessageQueueItemNow\(sessionId, itemId\)/);
-  assert.match(inject, /function handleWorkBuddyAiQueueActionClick\(event\)/);
-  assert.match(inject, /listen\(document, 'click', handleWorkBuddyAiQueueActionClick, true\)/);
-  assert.match(inject, /function waitForWorkBuddyAiQueueAdapter\(maxMs\)/);
-  assert.match(inject, /var pauseWait = WBS_PROFILE_IS_AI\s*\?/);
+  assert.match(inject, /function handleModernQueueActionClick\(event\)/);
+  assert.match(inject, /listen\(document, 'click', handleModernQueueActionClick, true\)/);
+  assert.match(inject, /function waitForModernQueueAdapter\(maxMs\)/);
+  assert.match(inject, /var pauseWait = modernAdapter\s*\?/);
+  assert.match(inject, /WBS_COMPAT\.isModernQueueAdapter\(adapter\)/);
   assert.match(inject, /enqueue:not-ready-no-fallback/);
-  assert.match(inject, /function warmWorkBuddyAiQueueAdapter\(\)/);
+  assert.match(inject, /function warmModernQueueAdapter\(\)/);
   assert.match(inject, /var stashInFlight = null/);
   assert.match(inject, /if \(stashBusy \|\| stashInFlight\) return/);
   assert.match(inject, /stashInFlight = stashWork/);
   assert.match(inject, /stashInFlight = null/);
-  assert.match(inject, /function writeWorkBuddyAiQueueItemToComposer\(item\)/);
+  assert.match(inject, /function writeModernQueueItemToComposer\(item\)/);
   assert.match(inject, /controller\.promptQueue\.emitQueueUpdate\(\)/);
   assert.match(inject, /stashSessionAtClick = sessionId/);
 });
 
-test('WorkBuddy AI stash pauses before enqueue and refreshes incomplete snapshots', () => {
+test('modern stash pauses before enqueue and refreshes incomplete snapshots', () => {
   const inject = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
   const start = inject.indexOf('function enqueueToWorkBuddyQueue(content)');
   const end = inject.indexOf('\n    var stashBusy = false;', start);
@@ -175,10 +165,10 @@ test('WorkBuddy AI stash pauses before enqueue and refreshes incomplete snapshot
   const queuePath = inject.slice(start, end);
   assert.match(queuePath, /pauseWait[\s\S]*pauseConversationMessageQueue\(sessionId, 'manual'\)/);
   assert.ok(queuePath.indexOf('pauseConversationMessageQueue(sessionId, \'manual\')') < queuePath.indexOf('enqueueConversationMessageQueueItem(sessionId, blocks)'), 'pause must be requested before enqueue');
-  assert.match(queuePath, /getWorkBuddyAiQueueSnapshot\(adapter, sessionId, snapshot\)/);
-  assert.match(inject, /function getWorkBuddyAiQueueSnapshot\(adapter, sessionId, preferred\)/);
+  assert.match(queuePath, /getModernQueueSnapshot\(adapter, sessionId, snapshot\)/);
+  assert.match(inject, /function getModernQueueSnapshot\(adapter, sessionId, preferred\)/);
   assert.match(inject, /__wbsOptimistic/);
   assert.match(inject, /id: 'wbs-pending-'/);
-  assert.match(inject, /dropWorkBuddyAiOptimisticItem\(stashSessionAtClick\)/);
+  assert.match(inject, /dropModernOptimisticItem\(stashSessionAtClick\)/);
   assert.match(inject, /queueItems\.length === 0[\s\S]*currentItems\.length > 0[\s\S]*snapshot\.runtime == null/);
 });

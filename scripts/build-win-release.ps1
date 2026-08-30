@@ -4,7 +4,8 @@ param(
   [string]$OutputDirectory = '',
   [string]$GitBashPath = '',
   [string]$IsccPath = '',
-  [string]$PythonPath = ''
+  [string]$PythonPath = '',
+  [string]$GoPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,7 +62,8 @@ function Invoke-WindowsZipBuild {
     [Parameter(Mandatory)][string]$Bash,
     [Parameter(Mandatory)][string]$Profile,
     [Parameter(Mandatory)][string]$ReleaseVersion,
-    [string]$CachedPython
+    [string]$CachedPython,
+    [string]$GoExecutable
   )
 
   $bashRepo = ConvertTo-GitBashPath $repoRoot
@@ -70,7 +72,12 @@ function Invoke-WindowsZipBuild {
     $pythonBash = ConvertTo-GitBashPath $CachedPython
     $pythonAssignment = " WORKDADDY_PYTHON=`"$pythonBash`""
   }
-  $command = "cd `"$bashRepo`" && WORKDADDY_BUILD_PROFILE=`"$Profile`" WORKDADDY_BUILD_VERSION=`"$ReleaseVersion`"$pythonAssignment bash scripts/build-win-zip.sh"
+  $goAssignment = ''
+  if ($GoExecutable) {
+    $goBash = ConvertTo-GitBashPath $GoExecutable
+    $goAssignment = " WORKDADDY_GO=`"$goBash`""
+  }
+  $command = "cd `"$bashRepo`" && WORKDADDY_BUILD_PROFILE=`"$Profile`" WORKDADDY_BUILD_VERSION=`"$ReleaseVersion`"$pythonAssignment$goAssignment bash scripts/build-win-zip.sh"
   Write-Host "`n==> 生成 $Profile staging ZIP"
   & $Bash -lc $command
   if ($LASTEXITCODE -ne 0) {
@@ -136,10 +143,22 @@ try {
     throw "找不到指定的 Python: $PythonPath"
   }
 
+  if (-not $GoPath) {
+    $goCommand = Get-Command go.exe -ErrorAction SilentlyContinue
+    if ($goCommand) { $GoPath = $goCommand.Source }
+    if (-not $GoPath) {
+      $cachedGo = Join-Path $env:USERPROFILE '.workdaddy-toolchains\go1.27.0\bin\go.exe'
+      if (Test-Path -LiteralPath $cachedGo -PathType Leaf) { $GoPath = $cachedGo }
+    }
+  }
+  if (-not $GoPath -or -not (Test-Path -LiteralPath $GoPath -PathType Leaf)) {
+    throw '找不到 Go 1.24+；请安装 Go 或使用 -GoPath 指定 go.exe。'
+  }
+
   New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
   $packages = @()
   foreach ($profile in @('workbuddy-cn', 'workbuddy-ai')) {
-    Invoke-WindowsZipBuild -Bash $bash -Profile $profile -ReleaseVersion $Version -CachedPython $PythonPath
+    Invoke-WindowsZipBuild -Bash $bash -Profile $profile -ReleaseVersion $Version -CachedPython $PythonPath -GoExecutable $GoPath
     $packages += Invoke-WindowsInstallerBuild -Profile $profile -ReleaseVersion $Version -Compiler $iscc
   }
 

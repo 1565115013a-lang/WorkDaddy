@@ -8,16 +8,6 @@
 // ============================================================
 module.exports = [
   {
-    id: 'patch-00',
-    desc: '(no comment)',
-    css: 'body[data-vscode-theme-name] .cb-markdown{--cb-markdown-table-cell-bg:var(--wb-bg-primary);--cb-markdown-table-header-bg:var(--wb-bg-secondary);--cb-markdown-table-border-color:var(--wb-border-strong);--cb-markdown-border-color:var(--wb-border-strong);}',
-  },
-  {
-    id: 'patch-02',
-    desc: '与 markdown 表格同款坑，统一在 .cb-markdown 上直接定义为主题变量',
-    css: 'body[data-vscode-theme-name] .cb-markdown{--cb-markdown-code-block-header-bg:var(--wb-bg-secondary);--cb-markdown-code-block-title-fg:var(--wb-color-text-primary);--cb-markdown-code-block-action-fg:var(--wb-color-text-secondary);--cb-markdown-code-block-action-hover-bg:var(--wb-bg-hover);--cb-markdown-code-block-border:var(--wb-border-subtle);--cb-markdown-code-block-bg:var(--wb-bg-tertiary);}body[data-vscode-theme-name] [class*="input-area-container"]::before{--cb-colleagues-dashboard-bg:var(--wb-bg-primary);}',
-  },
-  {
     id: 'patch-03',
     desc: '改为半透明毛玻璃（背景图透出 + 模糊），而非纯色',
     css: 'body[data-vscode-theme-name] :not(.project-detail-view__task-conversation) [class*="userMessageBubble"]{background:color-mix(in srgb,var(--wb-bg-secondary) 62%,transparent) !important;backdrop-filter:blur(18px) saturate(1.15);-webkit-backdrop-filter:blur(18px) saturate(1.15);}',
@@ -79,8 +69,8 @@ module.exports = [
   },
   {
     id: 'patch-15',
-    desc: '弹窗/tooltip 通用深色适配：dropdown/popover/popper/picker-panel/menu-panel 背景默认白，深色下覆盖',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"]:not([class*="toolbar"]),html[data-theme="dark"] body[data-vscode-theme-name] [class*="popover"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="popper"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="picker-panel"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="menu-panel"]{background:var(--wb-bg-popover) !important;color:var(--wb-color-text-primary);border-color:var(--wb-border-subtle) !important;box-shadow:0 6px 24px rgba(0,0,0,0.5) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="tooltip"]:not([class*="chat"]):not([class*="message"]){background:var(--wb-bg-popover) !important;color:var(--wb-color-text-primary);}html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"] [class*="item"]:hover,html[data-theme="dark"] body[data-vscode-theme-name] [class*="popover"] [class*="item"]:hover{background:var(--wb-bg-hover) !important;}',
+    desc: '弹窗/tooltip 通用深色适配：dropdown/popover/popper/picker-panel/menu-panel 背景默认白，深色下覆盖。排除官方新组件体系(cr-theme/cr-popover/cr-menu——官方自带深色适配)与官方 hash 触发器容器(_dropdownRoot_——仅定位容器，不应着色，否则更多按钮出现黑底)',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"]:not([class*="toolbar"]):not([class*="cr-theme"]):not([class*="_dropdownRoot_"]),html[data-theme="dark"] body[data-vscode-theme-name] [class*="popover"]:not([class*="cr-theme"]),html[data-theme="dark"] body[data-vscode-theme-name] [class*="popper"]:not([class*="cr-theme"]),html[data-theme="dark"] body[data-vscode-theme-name] [class*="picker-panel"]:not([class*="cr-theme"]),html[data-theme="dark"] body[data-vscode-theme-name] [class*="menu-panel"]:not([class*="cr-theme"]){background:var(--wb-bg-popover) !important;color:var(--wb-color-text-primary);border-color:var(--wb-border-subtle) !important;box-shadow:0 6px 24px rgba(0,0,0,0.5) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="tooltip"]:not([class*="chat"]):not([class*="message"]){background:var(--wb-bg-popover) !important;color:var(--wb-color-text-primary);}html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"]:not([class*="cr-theme"]):not([class*="_dropdownRoot_"]) [class*="item"]:hover,html[data-theme="dark"] body[data-vscode-theme-name] [class*="popover"]:not([class*="cr-theme"]) [class*="item"]:hover{background:var(--wb-bg-hover) !important;}',
   },
   {
     id: 'patch-16',
@@ -159,18 +149,18 @@ module.exports = [
   },
   {
     id: 'patch-31',
-    desc: '注意：body 层定义会被中间祖先链的局部浅色值覆盖，必须在组件元素上直接定义（直接定义 > 继承）',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_questionAnswerDisplay_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_qaQuestion_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_qaAnswerText_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_qaAnswer_"]{--qad-card-bg:var(--wb-bg-secondary) !important;--qad-question-color:var(--wb-color-text-secondary) !important;--qad-answer-color:var(--wb-color-text-primary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question [class*="_questionAnswerDisplay_"]{background-color:var(--qad-card-bg) !important;}',
+    desc: '问答展示区背景绑定 qad-card-bg 变量（变量定义已移入 theme-vars.js scoped 层，此处仅保留元素背景应用）',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question [class*="_questionAnswerDisplay_"]{background-color:var(--qad-card-bg) !important;}',
   },
   {
     id: 'patch-32',
     desc: '问答状态文本（skipped/failed/cancelled 用 --cb-text-tertiary，深色下未定义回退浅色）',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question--skipped .skipped-content,html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question--failed .failed-content,html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question--cancelled .cancelled-content{color:var(--wb-color-text-tertiary) !important;}html[data-theme="dark"] body[data-vscode-theme-name]{--qad-card-bg:var(--wb-bg-secondary);--qad-question-color:var(--wb-color-text-secondary);--qad-answer-color:var(--wb-color-text-primary);}',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question--skipped .skipped-content,html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question--failed .failed-content,html[data-theme="dark"] body[data-vscode-theme-name] .ask-user-question--cancelled .cancelled-content{color:var(--wb-color-text-tertiary) !important;}',
   },
   {
     id: 'patch-33',
-    desc: '更多按钮弹层(dropdownRoot)：背景透明 + 去边框 + 去阴影（patch-15 通用弹窗规则会给它加边框/阴影，需在此一并清掉）',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_moreMenu_"] [class*="_dropdownRoot_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_moreButton_"]{background:transparent !important;border-color:transparent !important;box-shadow:none !important;}',
+    desc: '更多按钮弹层(dropdownRoot/_moreMenu/_moreButton)：背景透明 + 去边框 + 去阴影（patch-15 通用弹窗规则会给 _dropdownRoot_ 命中 dropdown 子串染上 --wb-bg-popover 背景色/阴影，需在此一并清掉；_moreButton_ 内层同样）',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_moreMenu_"] [class*="_dropdownRoot_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_dropdownRoot_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_moreButton_"]{background:transparent !important;border-color:transparent !important;box-shadow:none !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
   },
   {
     id: 'patch-34',
@@ -194,13 +184,8 @@ module.exports = [
   },
   {
     id: 'patch-38',
-    desc: '= rgb(31,31,31) 纯色硬块，改为与输入框一致的毛玻璃；并全局兜底 palette-gray-3 变量',
-    css: 'body[data-vscode-theme-name] .cb-message-queue.cb-expand{background:color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) !important;backdrop-filter:blur(20px) saturate(1.15);-webkit-backdrop-filter:blur(20px) saturate(1.15);}html[data-theme="dark"] body[data-vscode-theme-name]{--wb-palette-gray-3:var(--wb-bg-primary);}',
-  },
-  {
-    id: 'patch-39',
-    desc: '--cb-bg-secondary/--cb-border 深色下仍是浅色值（浅灰 #f5f5f5 / #d1d5db），全局深色化',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name]{--cb-bg-secondary:var(--wb-bg-tertiary);--cb-border:var(--wb-border-subtle);}',
+    desc: '消息队列展开态(cb-expand)毛玻璃（全局 palette-gray-3 兜底变量已移入 theme-vars.js body 层）',
+    css: 'body[data-vscode-theme-name] .cb-message-queue.cb-expand{background:color-mix(in srgb,var(--wb-bg-primary) 40%,transparent) !important;backdrop-filter:blur(20px) saturate(1.15);-webkit-backdrop-filter:blur(20px) saturate(1.15);}',
   },
   {
     id: 'patch-40',
@@ -224,8 +209,8 @@ module.exports = [
   },
   {
     id: 'patch-44',
-    desc: 'tooltip/悬浮提示组件文字硬编码深色（与深色弹窗同色看不见）：强制浅色 + hover 高亮态文字浅色',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="tooltip"]:not([class*="chat"]):not([class*="message"]) *,html[data-theme="dark"] body[data-vscode-theme-name] [class*="popover"] *,html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"] *{color:var(--wb-color-text-primary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"] [class*="item"]:hover,html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"] [class*="item"]:hover *{color:var(--wb-color-text-primary) !important;background:var(--wb-bg-hover) !important;}',
+    desc: 'tooltip/悬浮提示组件文字硬编码深色（与深色弹窗同色看不见）：强制浅色 + hover 高亮态文字浅色（排除官方新组件体系 cr-theme——其自带深色文字适配）',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="tooltip"]:not([class*="chat"]):not([class*="message"]) *,html[data-theme="dark"] body[data-vscode-theme-name] [class*="popover"]:not([class*="cr-theme"]) *,html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"]:not([class*="cr-theme"]) *{color:var(--wb-color-text-primary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"]:not([class*="cr-theme"]) [class*="item"]:hover,html[data-theme="dark"] body[data-vscode-theme-name] [class*="dropdown"]:not([class*="cr-theme"]) [class*="item"]:hover *{color:var(--wb-color-text-primary) !important;background:var(--wb-bg-hover) !important;}',
   },
   {
     id: 'patch-45',
@@ -279,8 +264,8 @@ module.exports = [
   },
   {
     id: 'patch-55',
-    desc: '深度思考标题与正文语义标签颜色适配；不修改折叠、流式显隐、动画、尺寸或代码高亮 token',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name]{--cb-text-primary:var(--wb-color-text-primary);--cb-text-tertiary:var(--wb-color-text-secondary);}html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoning_"] [class*="_assistantReasoningHeader_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoning_"] [class*="_assistantReasoningHeader_"]:hover{color:var(--wb-color-text-primary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoning_"] [class*="_assistantReasoningIcon_"]{color:var(--wb-color-text-secondary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] p,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] li,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h1,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h2,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h3,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h4,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h5,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h6,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] blockquote,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] a{color:var(--wb-color-text-primary) !important;}',
+    desc: '深度思考标题与正文语义标签颜色适配；不修改折叠、流式显隐、动画、尺寸或代码高亮 token（--cb-text-* 全局变量已移入 theme-vars.js body 层）',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoning_"] [class*="_assistantReasoningHeader_"],html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoning_"] [class*="_assistantReasoningHeader_"]:hover{color:var(--wb-color-text-primary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoning_"] [class*="_assistantReasoningIcon_"]{color:var(--wb-color-text-secondary) !important;}html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] p,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] li,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h1,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h2,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h3,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h4,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h5,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] h6,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] blockquote,html[data-theme="dark"] body[data-vscode-theme-name] [class*="_assistantReasoningContent_"] a{color:var(--wb-color-text-primary) !important;}',
   },
   {
     id: 'patch-56',
@@ -359,8 +344,8 @@ module.exports = [
   },
   {
     id: 'patch-71',
-    desc: 'markdown 表格边框线条透明：官方 .cb-markdown table border + th/td border-right/bottom 用 --cb-markdown-table-border-color(主题映射=#262626 深色)太抢眼；改为 transparent（表格外框与单元格分隔线都透明，仅靠毛玻璃底区分），并覆盖变量让同类边框同步透明',
-    css: 'html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown{--cb-markdown-table-border-color:transparent !important;--cb-markdown-border-color:transparent !important;}html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown table,html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown-table-wrapper > table,html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown th,html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown td{border-color:transparent !important;}',
+    desc: 'markdown 表格边框线条透明：官方 .cb-markdown table border + th/td border-right/bottom 用 --cb-markdown-table-border-color(主题映射=#262626 深色)太抢眼；改为 transparent（表格外框与单元格分隔线都透明，仅靠毛玻璃底区分；变量覆盖已移入 theme-vars.js scoped 层）',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown table,html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown-table-wrapper > table,html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown th,html[data-theme="dark"] body[data-vscode-theme-name] .cb-markdown td{border-color:transparent !important;}',
   },
   {
     id: 'patch-72',
@@ -406,6 +391,86 @@ module.exports = [
     id: 'patch-81',
     desc: '消息队列项左侧「拖拽图标」（prompt-ico/prompt-icon）在有暂存提示词时透明但仍占位，导致文字左侧空白：整体隐藏不占位（用户要求）',
     css: '.cb-message-queue-item-left .prompt-ico,.cb-message-queue-item-left .prompt-icon{display:none !important;width:0 !important;margin:0 !important;}',
+  },
+  {
+    id: 'patch-83',
+    desc: '会话主区域(conversation-shell__main)去背景色全透明（用户 08-29 18:02 终版要求透明）；侧栏代理卡片(cb-agent-card)仅选中态毛玻璃（用户 08-30 10:03 调整：只有带 selected class 的卡片才 32% 毛玻璃，其余透明）——选中判定覆盖 conversation-item 的 active / aria-selected / _selected_ 及卡片自身挂 _selected_（5.4.4 选中 class 直接挂在 card 上，如 _selected_914ll_20）',
+    css: 'body[data-vscode-theme-name] .conversation-shell__main{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}body[data-vscode-theme-name] .conversation-section-content .cb-agent-card{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}body[data-vscode-theme-name] .conversation-section-content .conversation-item.active .cb-agent-card,body[data-vscode-theme-name] .conversation-section-content .conversation-item[aria-selected="true"] .cb-agent-card,body[data-vscode-theme-name] .conversation-section-content .conversation-item[class*="_selected_"] .cb-agent-card,body[data-vscode-theme-name] .conversation-section-content .cb-agent-card[class*="_selected_"]{background:color-mix(in srgb,var(--wb-bg-primary) 32%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 32%,transparent) !important;backdrop-filter:blur(14px) saturate(1.15) !important;-webkit-backdrop-filter:blur(14px) saturate(1.15) !important;border-color:var(--wb-border-subtle) !important;}',
+  },
+  {
+    id: 'patch-84',
+    desc: '主页路由主体(.wb-home-route__body)去背景色全透明（用户 08-29 18:02 要求透明，撤销此前 45% 毛玻璃）；主页整链 teams-main-content / wb-home-route / wb-home-route__body 全透明，层次由输入框毛玻璃局部呈现',
+    css: 'body[data-vscode-theme-name] .teams-main-content main.wb-home-route > .wb-home-route__body{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+  },
+  {
+    id: 'patch-85',
+    desc: '会话输入框容器(cr-input-container，新版 5.4.4 conversation-input 内)毛玻璃：42% 半透明 bg-primary + blur(18px)，与整体系列毛玻璃风格统一；会话主区域已透明，输入框需保留层次（用户要求）',
+    css: 'body[data-vscode-theme-name] .conversation-input .cr-input-box__main .cr-input-container{background:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;backdrop-filter:blur(18px) saturate(1.15) !important;-webkit-backdrop-filter:blur(18px) saturate(1.15) !important;border-color:var(--wb-border-subtle) !important;}',
+  },
+  {
+    id: 'patch-86',
+    desc: '消息列表滚动到底部渐变色去除·v3（用户 08-29 18:16 反馈仍存在）：清理面从 content--revealed 扩大到整条虚拟滚动链 cr-message-list-viewport / cr-message-list / content--revealed / cr-document / virtual-spacer，清 background-image 与 mask 全家族（含简写），隐藏所有承载渐变的 ::before/::after',
+    css: 'body[data-vscode-theme-name] .cr-message-list-viewport,body[data-vscode-theme-name] .cr-message-list,body[data-vscode-theme-name] .cr-message-list__content.cr-message-list__content--revealed,body[data-vscode-theme-name] .cr-document,body[data-vscode-theme-name] .cr-document__virtual-spacer{background-image:none !important;mask:none !important;-webkit-mask:none !important;mask-image:none !important;-webkit-mask-image:none !important;}body[data-vscode-theme-name] .cr-message-list-viewport::before,body[data-vscode-theme-name] .cr-message-list-viewport::after,body[data-vscode-theme-name] .cr-message-list::before,body[data-vscode-theme-name] .cr-message-list::after,body[data-vscode-theme-name] .cr-message-list__content.cr-message-list__content--revealed::before,body[data-vscode-theme-name] .cr-message-list__content.cr-message-list__content--revealed::after,body[data-vscode-theme-name] .cr-document::before,body[data-vscode-theme-name] .cr-document::after,body[data-vscode-theme-name] .cr-document__virtual-spacer::before,body[data-vscode-theme-name] .cr-document__virtual-spacer::after{display:none !important;background-image:none !important;background:transparent !important;mask:none !important;-webkit-mask:none !important;mask-image:none !important;-webkit-mask-image:none !important;}',
+  },
+  {
+    id: 'patch-87',
+    desc: '输入框底部工具栏右侧(cr-input-toolbar__right)全局背景透明（会话页 + 主页 wb-home-composer 均命中）：官方不透明底 → 完全透明，露出输入框容器(cr-input-container)的毛玻璃层（用户 08-29 要求，主页版同步覆盖）',
+    css: 'body[data-vscode-theme-name] .cr-input-toolbar__right{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+  },
+  {
+    id: 'patch-88',
+    desc: '会话页最外层内容容器(teams-main-content)去背景色全透明（用户 08-29 18:02 要求透明，撤销此前 42% 毛玻璃）；配合 conversation-shell/shell__main 全透明，整体露出背景，层次由 topbar/气泡/输入框等局部毛玻璃呈现',
+    css: 'body[data-vscode-theme-name] .teams-main-content{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+  },
+  {
+    id: 'patch-89',
+    desc: '会话容器分层整理（用户 08-30 00:20 修正）：conversation-shell 深色主题下半透明黑 45%（无 blur，仅底色，不影响背景图清晰度；浅色主题如护眼绿不受影响）；teams 布局最外层 grid 网格项(_gridViewItem_)透明；主页路由 main.wb-home-route 透明；侧栏会话列表 tab 按钮(conversation-list-tab-button-box)透明',
+    css: 'html[data-theme="dark"] body[data-vscode-theme-name] .conversation-shell{background:rgba(0,0,0,0.45) !important;background-color:rgba(0,0,0,0.45) !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}body[data-vscode-theme-name] .teams-container.is-mac [class*="_gridViewItem_"]{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}body[data-vscode-theme-name] .teams-main-content main.wb-home-route{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}body[data-vscode-theme-name] .conversation-list-tab-button.conversation-list-tab-button-box{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+  },
+  {
+    id: 'patch-90',
+    desc: '局部毛玻璃组（用户 08-29 18:02/18:16 批量需求，统一 42% bg-primary + blur(18px)）：workbuddy-topbar--mac 顶栏、会话自己的消息气泡(cr-self-bubble)、滚动到底按钮(cr-scroll-to-bottom__inner)、主页输入框本体(cr-input-box__main)；markdown 分隔线 cr-markdown hr 改毛玻璃质感（硬边框 → 半透明主题色渐变线）',
+    css: 'body[data-vscode-theme-name] .workbuddy-topbar--mac,body[data-vscode-theme-name] .cr-self-message .cr-self-bubble,body[data-vscode-theme-name] .cr-scroll-to-bottom,body[data-vscode-theme-name] .cr-scroll-to-bottom__inner,body[data-vscode-theme-name] .wb-home-composer .cr-input-box__main{background:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;backdrop-filter:blur(18px) saturate(1.15) !important;-webkit-backdrop-filter:blur(18px) saturate(1.15) !important;border-color:var(--wb-border-subtle) !important;}body[data-vscode-theme-name] .cr-markdown hr{background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--wb-color-text-secondary) 30%,transparent) 50%,transparent) !important;border:none !important;height:1px !important;border-radius:1px !important;box-shadow:none !important;}',
+  },
+  {
+    id: 'patch-91',
+    desc: '主页输入框容器(.wb-home-composer 内 cr-input-container)改透明背景（用户 08-29 18:02 要求）：主页输入区层次为本体 cr-input-box__main 毛玻璃(patch-90) + 容器与工具栏全透明',
+    css: 'body[data-vscode-theme-name] .wb-home-composer .cr-input-container{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+  },
+  {
+    id: 'patch-92',
+    desc: '侧栏会话卡片未读圆点(_unreadDot_，挂 cb-agent-card 的 header 内)适配主题：圆点由 ::before 实现（官方硬编码 rgb(0,194,154) 青绿、局部 --wb-accent-unread 也被官方污染为青绿；无 --wb-accent 定义导致 fallback 蓝色突兀），改为主题文字色 var(--wb-color-text-primary)（WorkDaddy 建主题必定义：深色=白/浅色=深绿，与主题绝对协调），fallback #8a8f98 中性灰；容器自身保持透明背景（用户 08-30 10:40 修正 10:36 的蓝色）',
+    css: 'html[data-wbs-theme="1"] body[data-vscode-theme-name] .cb-agent-card [class*="_unreadDot_"]{background:transparent !important;background-color:transparent !important;}html[data-wbs-theme="1"] body[data-vscode-theme-name] .cb-agent-card [class*="_unreadDot_"]::before{background:var(--wb-color-text-primary,#8a8f98) !important;background-color:var(--wb-color-text-primary,#8a8f98) !important;}',
+  },
+  {
+    id: 'patch-93',
+    desc: '细节适配组（用户 08-29 18:21 / 08-30 09:57 调整）：1) 深度思考推理区 cr-collapse__content(-inner) 左侧边框线条去掉；2) markdown 表格：外层容器 cr-table-block 透明背景，表格本体 cr-table-block table 毛玻璃(42%+blur18) + 表头 thead/th 半透明背景；3) 会话列表 tab 行 conversation-list-tab-row 鼠标悬浮时毛玻璃背景（仅背景/模糊，不改变布局）',
+    css: 'body[data-vscode-theme-name] .cr-reasoning .cr-collapse__content,body[data-vscode-theme-name] .cr-reasoning .cr-collapse__content-inner{border-left:none !important;}body[data-vscode-theme-name] .cr-markdown .cr-table-block{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}body[data-vscode-theme-name] .cr-markdown .cr-table-block .cr-table-block__inner table,body[data-vscode-theme-name] .cr-markdown .cr-table-block table{background:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;backdrop-filter:blur(18px) saturate(1.15) !important;-webkit-backdrop-filter:blur(18px) saturate(1.15) !important;border-color:var(--wb-border-subtle) !important;}body[data-vscode-theme-name] .cr-markdown .cr-table-block thead,body[data-vscode-theme-name] .cr-markdown .cr-table-block thead th{background:color-mix(in srgb,var(--wb-bg-secondary) 52%,transparent) !important;}body[data-vscode-theme-name] .conversation-list-tab-row:hover{background:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;backdrop-filter:blur(18px) saturate(1.15) !important;-webkit-backdrop-filter:blur(18px) saturate(1.15) !important;}',
+  },
+  {
+    id: 'patch-94',
+    desc: '会话消息列表底部渐变色(cr-message-list__bottom-mask, 72px 高)改透明：官方 background-image 硬编码 linear-gradient(rgba(0,0,0,0),rgb(20,20,20))，滚动场景下 expose 渐变，用户要求顶部/中部/底部均无渐变遮罩（非默认主题注入）',
+    css: 'body[data-vscode-theme-name] .cr-message-list__bottom-mask{background-image:none !important;background:transparent !important;background-color:transparent !important;mask:none !important;-webkit-mask:none !important;mask-image:none !important;-webkit-mask-image:none !important;}body[data-vscode-theme-name] .cr-message-list__bottom-mask::before,body[data-vscode-theme-name] .cr-message-list__bottom-mask::after{background-image:none !important;background:transparent !important;mask:none !important;-webkit-mask:none !important;}',
+  },
+  {
+    id: 'patch-95',
+    desc: '工具调用展开内容(cr-tool-exp__content)背景半透明（用户 08-30 00:46）：官方硬编码 rgb(42,44,49) 不透明纯色块 → 45% 主题次级底 + 轻微 blur，与整体毛玻璃语言统一',
+    css: 'body[data-vscode-theme-name] .cr-tool-exp__content-shell .cr-tool-exp__content,body[data-vscode-theme-name] .cr-tool-exp__content{background:color-mix(in srgb,var(--wb-bg-tertiary) 45%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-tertiary) 45%,transparent) !important;backdrop-filter:blur(16px) saturate(1.15) !important;-webkit-backdrop-filter:blur(16px) saturate(1.15) !important;border-color:var(--wb-border-subtle) !important;}',
+  },
+  {
+    id: 'patch-96',
+    desc: '左侧栏整理（用户 08-30 00:52 调整）：conversation-sidebar 外层改与顶栏(workbuddy-topbar--mac)相同的毛玻璃 42% + blur(18px)；内部容器（list/topbar/content/section 等）保持透明避免叠层；选中会话卡片 32% 毛玻璃选中态保留（patch-83）',
+    css: 'body[data-vscode-theme-name] .conversation-sidebar{background:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 42%,transparent) !important;backdrop-filter:blur(18px) saturate(1.15) !important;-webkit-backdrop-filter:blur(18px) saturate(1.15) !important;}body[data-vscode-theme-name] .conversation-list,body[data-vscode-theme-name] [data-view-id="sidebar"],body[data-vscode-theme-name] .conversation-list-topbar,body[data-vscode-theme-name] .conversation-list-content,body[data-vscode-theme-name] .conversation-section,body[data-vscode-theme-name] .conversation-section-content,body[data-vscode-theme-name] .conversation-section-groups{background:transparent !important;background-color:transparent !important;backdrop-filter:none !important;-webkit-backdrop-filter:none !important;}',
+  },
+  {
+    id: 'patch-97',
+    desc: '代码块容器(cr-code-like-box)背景毛玻璃（用户 08-30 01:16）：官方硬编码 rgb(26,27,30) 不透明 → 45% 主题深色底 + blur(16px)，与消息区毛玻璃语言统一',
+    css: 'body[data-vscode-theme-name] .cr-code-like-box{background:color-mix(in srgb,var(--wb-bg-primary) 45%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 45%,transparent) !important;backdrop-filter:blur(16px) saturate(1.15) !important;-webkit-backdrop-filter:blur(16px) saturate(1.15) !important;border-color:var(--wb-border-subtle) !important;}',
+  },
+  {
+    id: 'patch-98',
+    desc: '代码块头部(cr-code-like-box__header)背景半透明（用户 08-30 01:16）：官方硬编码 rgb(20,21,24) 不透明 → 32% 主题深色底（比容器略深形成层次，无独立 blur 透出容器毛玻璃）',
+    css: 'body[data-vscode-theme-name] .cr-code-like-box__header{background:color-mix(in srgb,var(--wb-bg-primary) 32%,transparent) !important;background-color:color-mix(in srgb,var(--wb-bg-primary) 32%,transparent) !important;border-color:var(--wb-border-subtle) !important;}',
   },
   /* 原 patch-82（AI 端快捷短语弹层 z-index 抬升）已移入 inject.js 常驻样式：
      theme-patches 仅在非默认主题时注入，默认浅色主题下会失效；层级修复不依赖主题，随注入脚本常驻更可靠。 */

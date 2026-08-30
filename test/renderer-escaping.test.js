@@ -6,12 +6,16 @@ const path = require('node:path');
 const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
+// 内部调试模块（git 不跟踪）：存在才测试，缺失（他人环境）则跳过
+const pickerPath = path.join(__dirname, '..', 'scripts', 'picker-internal.js');
+const picker = fs.existsSync(pickerPath) ? fs.readFileSync(pickerPath, 'utf8') : null;
 
-function sourceBetween(start, end) {
-  const startIndex = source.indexOf(start);
-  const endIndex = source.indexOf(end, startIndex + start.length);
+function sourceBetween(start, end, src) {
+  src = src || source;
+  const startIndex = src.indexOf(start);
+  const endIndex = src.indexOf(end, startIndex + start.length);
   assert.ok(startIndex >= 0 && endIndex > startIndex, `missing source block ${start}`);
-  return source.slice(startIndex, endIndex);
+  return src.slice(startIndex, endIndex);
 }
 
 test('HTML and attribute escaping cover markup and quoted attributes', () => {
@@ -67,12 +71,14 @@ test('model, wallpaper, and account cards escape each dynamic HTML sink', () => 
   assert.doesNotMatch(models, /data-model-(?:backup|test|delete-official)="' \+ model\.index/);
   assert.doesNotMatch(models, /data-model-(?:copy|edit|enable)="' \+ model\.backupId/);
 
-  const wallpapers = sourceBetween('function loadWallpapers()', 'function setOpen(open)');
+  const wallpapers = sourceBetween('function loadWallpapers(force)', 'function setOpen(open)');
   assert.match(wallpapers, /data-wp="' \+ escAttr\(w\.name\)/);
   assert.match(wallpapers, /title="' \+ escAttr\(w\.title\)/);
   assert.match(wallpapers, /data-src="' \+ escAttr\(wallpaperUrl\)/);
   assert.match(wallpapers, /alt="' \+ escAttr\(w\.title\)/);
   assert.match(wallpapers, /wbs-wp-badge">' \+ esc\(/);
+  assert.match(wallpapers, /data-del="' \+ escAttr\(w\.name\)/);
+  assert.match(wallpapers, /btn\.getAttribute\('data-del'\)/);
   assert.doesNotMatch(wallpapers, /(?:data-wp|title|data-src|alt)="' \+ (?:w\.|wallpaperUrl)/);
 
   const accounts = sourceBetween('function render(data)', 'function updateAccountSummary()');
@@ -94,16 +100,16 @@ test('dynamic error and check-in messages are escaped before HTML insertion', ()
   assert.doesNotMatch(source, /innerHTML\s*=\s*'[^\n]*'\s*\+\s*\(e\.message \|\| e\)/);
 });
 
-test('inspector escapes page-controlled selectors and computed style values', () => {
-  const inspector = sourceBetween('function showInspector(el)', 'function stopInspect()');
-  assert.match(inspector, /esc\(buildSelector\(el\)\)/);
+test('inspector escapes page-controlled labels, attributes, paths and computed style values', (t) => {
+  if (!picker) return t.skip('picker-internal.js 未就绪（内部模块不入库）');
+  const inspector = sourceBetween('function showInspector(stack, fallbackEl)', 'function stopInspect()', picker);
+  assert.match(inspector, /esc\(nodeLabel\(node\)\)/);
   assert.match(inspector, /esc\(queryPath\)/);
-  assert.match(inspector, /esc\(items\[i\]\[1\] \|\| '—'\)/);
-  assert.match(inspector, /esc\(v \|\| '未定义（继承上层）'\)/);
-  assert.match(inspector, /rules\.map\(function \(x\) \{ return '[^\n]+' \+ esc\(x\)/);
-  assert.doesNotMatch(inspector, /\+ buildSelector\(el\) \+/);
+  assert.match(inspector, /esc\(attr\.name\)/);
+  assert.match(inspector, /esc\(attr\.value\)/);
+  assert.match(inspector, /esc\(value \|\| '未定义'\)/);
+  assert.match(inspector, /textContent = selected\.outerHTML/);
+  assert.doesNotMatch(inspector, /\+ nodeLabel\(node\) \+/);
   assert.doesNotMatch(inspector, /\+ queryPath \+/);
-  assert.doesNotMatch(inspector, /<code>' \+ \(items\[i\]\[1\]/);
-  assert.doesNotMatch(inspector, /<code>' \+ \(v \|\|/);
-  assert.doesNotMatch(inspector, /wbs-ins-rule">' \+ x \+/);
+  assert.doesNotMatch(inspector, /innerHTML = selected\.outerHTML/);
 });

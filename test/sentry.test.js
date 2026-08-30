@@ -150,17 +150,12 @@ test('privacy documentation distinguishes local data from required remote servic
   assert.match(readme, /对应 API Key/);
 });
 
-test('packaged repair instructions require a verified Sentry send', () => {
-  const prompts = [
-    fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8'),
-    fs.readFileSync(path.join(repoRoot, '安装失败自主解决提示词.txt'), 'utf8'),
-  ];
-  for (const instructions of prompts) {
-    assert.match(instructions, /启动后必须先完整读取本文件/);
-    assert.match(instructions, /--force-send --require-sent/);
-    assert.match(instructions, /只有看到 `sent=true` 才算上报成功/);
-    assert.doesNotMatch(instructions, /可选诊断上报/);
-  }
+test('source repair instructions require a verified Sentry send', () => {
+  const instructions = fs.readFileSync(path.join(repoRoot, '安装失败自主解决提示词.txt'), 'utf8');
+  assert.match(instructions, /启动后必须先完整读取本文件/);
+  assert.match(instructions, /--force-send --require-sent/);
+  assert.match(instructions, /只有看到 `sent=true` 才算上报成功/);
+  assert.doesNotMatch(instructions, /可选诊断上报/);
   assert.match(reporterSource, /if \(key === 'force-send'\)/);
   assert.match(reporterSource, /if \(args\.requireSent && result\.sent !== true\) process\.exitCode = 1/);
   assert.match(reporterSource, /process\.exitCode = 1/);

@@ -126,11 +126,14 @@ test('launcher enumerates exact lifecycle entries and never kills process trees'
   assert.match(launcherSource, /taskkill 非零但目标 PID 已消失，按竞态成功处理/);
   assert.match(launcherSource, /verifyGone && await verifyGone\(\)/);
   assert.match(launcherSource, /queryNodeProcesses\(nodeBin, \[pid\]\)\.length === 0/);
-  for (const source of [launcherSource, daemonSource, watchdogSource]) {
+  for (const source of [launcherSource, daemonSource]) {
     assert.match(source, /buildNativeProcessQuery/);
     assert.match(source, /windows-process-boundary\.ps1/);
     assert.match(source, /-ExecutionPolicy['"],\s*['"]Bypass/);
   }
+  assert.match(watchdogSource, /net\.createServer\(\)/);
+  assert.match(watchdogSource, /exclusive:\s*true/);
+  assert.doesNotMatch(watchdogSource, /Get-CimInstance|PowerShell|taskkill/i);
 });
 
 test('installer boundary releases the exact profile launcher and waits for its runtime lock', () => {
@@ -174,7 +177,7 @@ test('CIM process disappearance is treated as an empty snapshot, not a launcher 
   assert.match(boundarySource, /allowTransientNotFound/);
   assert.match(boundarySource, /0x80041002/);
   assert.match(launcherSource, /allowTransientNotFound:\s*true/);
-  assert.match(watchdogSource, /allowTransientNotFound:\s*true/);
+  assert.doesNotMatch(watchdogSource, /CIM|Get-CimInstance/);
 });
 
 test('authenticated daemon capability binds token-only status to profile, data directory, and listener PID', () => {
@@ -293,11 +296,12 @@ test('PowerShell reconciles only a proven stale watchdog PID file', () => {
   assert.match(powershellSource, /Remove-Item -LiteralPath \$pidFile -Force -ErrorAction Stop/);
 });
 
-test('Windows launcher and watchdog recover a PID file whose process is gone', () => {
+test('legacy launcher recovers stale PID files while the new watchdog uses an OS lock', () => {
   assert.match(launcherSource, /watchdog\.kind === 'stale'[\s\S]*removeWatchdogPidIf\(watchdog\.pid\)/);
   assert.match(launcherSource, /已清理确认不存在的旧 watchdog\.pid/);
-  assert.match(watchdogSource, /state\.kind === 'stale'[\s\S]*removePidFileIf\(state\.pid\)/);
-  assert.match(watchdogSource, /existing\.kind === 'stale'[\s\S]*removePidFileIf\(existing\.pid\)/);
+  assert.match(watchdogSource, /LOCK_PORT/);
+  assert.match(watchdogSource, /EADDRINUSE/);
+  assert.match(watchdogSource, /writePidFile\(\)/);
 });
 
 test('Windows launcher reconciles a reused PID file to an exact watchdog', () => {
@@ -325,7 +329,10 @@ test('Windows launcher ignores WorkBuddy AI headless prewarm helpers during cold
 
 test('Windows process queries are scoped to the selected Node runtime', () => {
   assert.match(launcherSource, /ExecutablePath -ieq/);
-  assert.match(watchdogSource, /ExecutablePath -ieq/);
+  const nativeSource = fs.readFileSync(path.join(root, 'scripts', 'windows-native', 'main.go'), 'utf8');
+  assert.match(nativeSource, /expectedNode/);
+  assert.match(nativeSource, /QueryFullProcessImageNameW/);
+  assert.match(nativeSource, /samePath\(actual, expectedPath\)/);
 });
 
 test('optional WorkBuddy path discovery does not make launcher startup fatal', () => {

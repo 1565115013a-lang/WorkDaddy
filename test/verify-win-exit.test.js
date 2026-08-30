@@ -57,7 +57,7 @@ test('Windows verifier returns success for a complete source package', { skip: p
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-verify-win-complete-'));
   const scriptsDir = path.join(dir, 'scripts');
   const required = [
-    'daemon.js', 'session-db.js', 'lib.js', 'watchdog.js', 'win-launcher.js',
+    'daemon.js', 'session-db.js', 'secure-transfer.js', 'lib.js', 'watchdog.js', 'win-launcher.js',
     'windows-process-boundary.js', 'windows-process-boundary.ps1', 'windows-relaunch-standard.ps1', 'inject.js',
     'theme-patches.js', 'launcher.cmd', 'launcher-hidden.vbs', 'install-win.cmd',
     'install-win.ps1', 'prepare-win-install.ps1', 'uninstall-win.ps1', 'apply-update.ps1',

@@ -44,13 +44,16 @@ test('theme apply retries CDP evaluation and persists the selection only after s
   assert.ok(route.indexOf("fs.writeFileSync(path.join(DATA_DIR, 'current-theme.json')") > route.indexOf('.then((info)'), 'failed theme must not be persisted');
 });
 
-test('Windows updater keeps an apply-update VBS bridge in the package and has a runtime fallback', () => {
+test('Windows updater opens the verified Setup directly without a script bridge', () => {
   const daemon = read('daemon.js');
   const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-win-zip.sh'), 'utf8');
-  assert.match(build, /apply-update\.vbs/);
-  assert.match(build, /关键文件|required|必须/);
-  assert.match(daemon, /apply-update\.vbs/);
-  assert.match(daemon, /runtime.*vbs|生成.*VBS|写入.*VBS/i);
+  const branchStart = daemon.indexOf('if (IS_WIN) {', daemon.indexOf('function applyUpdate()'));
+  const branchEnd = daemon.indexOf("const scriptPath = path.join(__dirname, 'apply-update.sh')", branchStart);
+  const branch = daemon.slice(branchStart, branchEnd);
+  assert.match(build, /WorkDaddyLauncher\.exe/);
+  assert.match(branch, /launchWindowsInstaller\(srcPackage\)/);
+  assert.match(branch, /installer-opened/);
+  assert.doesNotMatch(branch, /apply-update\.vbs|wscript|pending\.json/);
 });
 
 test('update status exposes the running daemon version so reboot polling can finish', () => {
@@ -546,7 +549,10 @@ test('Windows release packages bundle a pinned Node runtime and build a user-lev
   assert.match(workflow, /-Version \$\{\{ steps\.ver\.outputs\.version \}\}/);
   assert.match(iss, /PrivilegesRequired=lowest/);
   assert.match(iss, /runtime|scripts\\\*/i);
-  assert.match(iss, /install-win\.ps1/);
+  assert.match(iss, /WorkDaddyLauncher\.exe/);
+  assert.doesNotMatch(iss, /install-win\.ps1|launcher-hidden\.vbs|wscript\.exe/i);
+  assert.match(build, /GOOS=windows GOARCH=amd64/);
+  assert.match(workflow, /actions\/setup-go@v5/);
   assert.match(workflow, /(?:Install Inno Setup|安装 Inno Setup)/);
   assert.match(workflow, /build-win-installer\.ps1/);
   assert.match(workflow, /release\/windows\/WorkDaddy-Setup-\*\.exe/);
@@ -566,34 +572,34 @@ test('Windows release publishes Setup.exe only and removes temporary ZIP staging
   assert.match(guide, /temporary staging/);
 });
 
-test('Windows Setup stops a verified lifecycle or preserves an authenticated elevated runtime', () => {
+test('Windows Setup waits for WorkBuddy and stops only a native-verified profile lifecycle', () => {
   const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'win', 'workdaddy.iss'), 'utf8');
-  const prepare = fs.readFileSync(path.join(repoRoot, 'scripts', 'prepare-win-install.ps1'), 'utf8');
-  const verify = fs.readFileSync(path.join(repoRoot, 'scripts', 'verify-win.cmd'), 'utf8');
   assert.match(installer, /function PrepareToInstall\(var NeedsRestart: Boolean\): String/);
-  assert.match(installer, /ExtractTemporaryFile\('prepare-win-install\.ps1'\)/);
-  assert.match(installer, /ExtractTemporaryFile\('windows-process-boundary\.ps1'\)/);
+  assert.match(installer, /ExtractTemporaryFile\('WorkDaddyLauncher\.exe'\)/);
+  assert.match(installer, /function EnsureWorkBuddyClosed/);
+  assert.match(installer, /--check-workbuddy/);
+  assert.match(installer, /重新检测/);
+  assert.match(installer, /结束进程/);
+  assert.match(installer, /--terminate-workbuddy/);
+  assert.match(installer, /--stop-lifecycle/);
   assert.match(installer, /ewWaitUntilTerminated/);
-  assert.match(prepare, /Stop-VerifiedWorkDaddyLifecycle/);
-  assert.match(prepare, /Get-AuthenticatedWorkDaddyStatus/);
-  assert.match(prepare, /-AllowVersionMismatch/);
-  assert.match(prepare, /exit 10/);
-  assert.match(prepare, /\$privilege = if \(\$principal\.IsInRole/);
-  assert.doesNotMatch(prepare, /Refusing to prepare WorkDaddy installation with elevated privileges/);
-  assert.match(installer, /ResultCode = 5/);
-  assert.match(installer, /ResultCode = 10/);
-  assert.match(installer, /ShouldReplaceRuntime/);
+  assert.match(installer, /ResultCode <> 10/);
+  assert.match(installer, /ResultCode = 11/);
   assert.match(installer, /runtime\\node\\\*/);
-  assert.match(installer, /管理员权限运行的旧版 WorkDaddy/);
-  assert.match(prepare, /WorkDaddy-prepare-install\.log/);
-  assert.match(prepare, /-ExpectedWatchdogScript \(Join-Path \$AppDir 'scripts\\watchdog\.js'\)/);
-  assert.match(verify, /prepare-win-install\.ps1/);
+  assert.match(installer, /无法安全停止 WorkDaddy 后台进程/);
+  assert.match(installer, /IsAdminInstallMode/);
+  assert.match(installer, /当前安装程序是以管理员权限运行的/);
+  assert.match(installer, /不要选择“以管理员身份运行”/);
+  assert.match(installer, /普通安装器不会跨权限强行结束/);
+  assert.doesNotMatch(installer, /安装器本身可以使用管理员权限运行/);
+  assert.doesNotMatch(installer, /旧版 WorkDaddy 正以管理员权限运行/);
+  assert.doesNotMatch(installer, /prepare-win-install|windows-process-boundary|PowerShell/i);
 });
 
-test('macOS release staging includes the troubleshooting prompt', () => {
+test('macOS release staging excludes the troubleshooting prompt', () => {
   const build = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
-  assert.match(build, /STAGE\/安装失败自主解决提示词\.txt/);
-  assert.match(build, /cat > "\$STAGE\/安装失败自主解决提示词\.txt"/);
+  assert.doesNotMatch(build, /STAGE\/安装失败自主解决提示词\.txt/);
+  assert.doesNotMatch(build, /cat > "\$STAGE\/安装失败自主解决提示词\.txt"/);
 });
 
 test('macOS package launcher keeps WorkBuddy CN and AI CDP ports profile-specific', () => {
@@ -614,12 +620,9 @@ test('macOS package launcher returns focus to the target WorkBuddy and separates
 
 test('troubleshooting prompts keep Sentry reports short and omit raw logs', () => {
   const prompt = fs.readFileSync(path.join(repoRoot, '安装失败自主解决提示词.txt'), 'utf8');
-  const macBuild = fs.readFileSync(path.join(repoRoot, 'scripts', 'build-mac-dmg.sh'), 'utf8');
-  assert.ok(prompt.length < 3500, 'Windows prompt should stay compact');
+  assert.ok(prompt.length < 3500, 'source prompt should stay compact');
   assert.match(prompt, /报告硬上限 3500 字符/);
   assert.match(prompt, /不要粘贴完整日志/);
-  assert.match(macBuild, /报告硬上限 3500 字符/);
-  assert.match(macBuild, /不附完整日志/);
 });
 
 test('daemon lock falls back when the data-directory lock is not writable on Windows', () => {
@@ -668,9 +671,9 @@ test('account cards keep the compact three-row layout', () => {
   assert.match(script, /var isUinMode = !a\.phone;/);
   assert.match(script, /var idLbl = a\.phone \? '手机' : \(a\.uin \? 'UIN' : '账号'\)/);
   assert.match(script, /\.wbs-phone-cell\.wbs-uin-cell\{gap:4px\}/);
-  // 国际版：签到标签不展示；暂存按钮内联进操作栏按钮组第一位（AI 端无 voice-mic-wrap）
+  // 国际版：签到标签不展示；新版布局按能力把暂存按钮内联进操作栏按钮组第一位。
   assert.match(script, /if \(PROFILE_ID === 'workbuddy-ai'\) return '';/);
-  assert.match(script, /function findAiToolbar\(\)/);
+  assert.match(script, /WBS_COMPAT\.findComposerToolbar\(document\)/);
   assert.match(script, /wbs-stash-inline-inline/);
   assert.match(script, /row0\.insertBefore\(stashBtn, row0\.firstChild\)/);
   assert.match(script, /wbs-credit-hidden/);
@@ -746,15 +749,12 @@ test('auto-continue keeps the three-second terminal settle window', () => {
 test('robot button decorations remain visible alongside the eye states', () => {
   const script = read('inject.js');
   assert.match(script, /wbs-fab-antenna/);
-  assert.match(script, /wbs-fab-ear wbs-fab-ear-left/);
-  assert.match(script, /wbs-fab-ear wbs-fab-ear-right/);
-  assert.match(script, /\.wbs-fab-ear\{[^}]*width:20px;height:30px[^}]*background:#141416/);
-  assert.match(script, /\.wbs-fab-ear::before\{[^}]*width:12px;height:22px[^}]*background:#141416/);
-  assert.doesNotMatch(script, /\.wbs-fab-ear::before\{[^}]*background:#fff/);
-  assert.match(script, /\.wbs-fab-ear::after\{[^}]*width:4px;height:10px[^}]*background:#141416/);
-  assert.match(script, /wbs-fab-ear-left\{left:-11px;transform:[^}]*rotate\(-8deg\)/);
-  assert.match(script, /wbs-fab-ear-right\{right:-11px;transform:[^}]*rotate\(8deg\)/);
-  assert.match(script, /\.wbs-fab \.click > span:not\(\.wbs-fab-antenna\):not\(\.wbs-fab-ear\)\{display:none\}/);
+  assert.doesNotMatch(script, /wbs-fab-ear/); // 用户 08-30 00:37 要求去掉双耳
+  assert.match(script, /\.wbs-fab-antenna\{[^}]*background:rgba\(20,20,22,\.55\)[^}]*mask-image:url\("data:image\/svg\+xml/);
+  assert.match(script, /\.wbs-fab-antenna-dot\{[^}]*background:transparent/);
+  assert.match(script, /viewBox=\\'0 0 14 24\\'>/);
+  assert.match(script, /#wbs-fab-sleep-light\.sleep-on\{background:rgba\(46,229,157,\.85\)/);
+  assert.match(script, /\.wbs-fab \.click > span:not\(\.wbs-fab-antenna\)\{display:none\}/);
   assert.doesNotMatch(script, /\.wbs-fab \.click span\{display:none\}/);
   assert.match(script, /\.wbs-fab \.click \.button \.speak~\.speak\{display:none\}/);
 });
@@ -803,6 +803,19 @@ test('update card keeps the action button stable beside short progress text', ()
   assert.doesNotMatch(script, /也可双击桌面 .* 图标手动启动/);
 });
 
+test('Windows updater stops at the installer prompt after download', () => {
+  const script = read('inject.js');
+  assert.match(script, /var WBS_PLATFORM = __WBS_PLATFORM__/);
+  assert.doesNotMatch(script, /var WBS_PLATFORM = '__WBS_PLATFORM__'/);
+  const injectedWindows = script.replace(/__WBS_PLATFORM__/g, JSON.stringify('win32'));
+  assert.match(injectedWindows, /var WBS_PLATFORM = "win32";/);
+  assert.match(script, /function showWindowsInstallerReady\(prog, btn, card, timer\)/);
+  assert.match(script, /function openWindowsInstallerAfterDownload\(prog, btn, card, timer, resolve, reject\)/);
+  assert.match(script, /appendUpdateLog\(prog, '即将打开安装包…'\)/);
+  assert.match(script, /if \(WBS_PLATFORM === 'win32'\) \{[\s\S]*openWindowsInstallerAfterDownload\(prog, btn, card, timer, resolve, reject\);/);
+  assert.doesNotMatch(script, /下载和校验完成，可以打开安装程序。/);
+});
+
 test('update notes keep the full release text inside the panel scroll area', () => {
   const script = read('inject.js');
   assert.doesNotMatch(script, /\.slice\(0,\s*3\)\.map/);
@@ -819,7 +832,6 @@ test('auto-continue and session controls are available on Windows and macOS', ()
   assert.match(inject, /var acRow = enhancePane && enhancePane\.querySelector\('\#wbs-ac-row'\)/);
   assert.match(inject, /var AC_SUPPORTED = true/);
   assert.doesNotMatch(inject, /WBS_PLATFORM !== 'win32'/);
-  assert.doesNotMatch(inject, /WBS_PLATFORM === 'win32'\) \{/);
   assert.match(daemon, /platformSupported: true/);
   assert.doesNotMatch(daemon, /const enabled = !IS_WIN/);
   assert.doesNotMatch(daemon, /if \(IS_WIN\) return readAutoContinueState/);
@@ -938,12 +950,13 @@ test('update downloads use a unique partial file before atomically promoting the
 test('account export asks for a non-empty password and import supports an optional password', () => {
   const daemon = read('daemon.js');
   const inject = read('inject.js');
-  assert.match(daemon, /password.*不能为空|导出密码不能为空/);
-  assert.match(daemon, /randomBytes\(16\)/);
+  const secureTransfer = read('secure-transfer.js');
+  assert.match(secureTransfer, /密码不能为空/);
+  assert.match(secureTransfer, /randomBytes\(16\)/);
   assert.match(daemon, /version:\s*2/);
   assert.match(daemon, /EXPORT_PASSPHRASE/);
-  assert.match(inject, /导出账号.*密码/);
-  assert.match(inject, /导入密码可留空/);
+  assert.match(inject, /title:\s*'导出账号'[\s\S]*requirePassword:\s*true/);
+  assert.match(inject, /旧版导出文件可留空/);
   assert.match(inject, /type="password"/);
 });
 

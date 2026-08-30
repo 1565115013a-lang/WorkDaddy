@@ -50,11 +50,6 @@ case "$PROFILE" in
   *) PROFILE="workbuddy-cn"; PACKAGE_NAME="WorkDaddy"; OUT="release/windows/WorkDaddy-${VERSION}-win64.zip" ;;
 esac
 
-if [ ! -f scripts/apply-update.vbs ]; then
-  echo "错误：关键文件 scripts/apply-update.vbs 缺失，无法生成 Windows 更新包" >&2
-  exit 2
-fi
-
 echo "==> profile: ${PROFILE}"
 echo "==> 版本: ${VERSION}"
 echo "==> 产物: ${OUT}"
@@ -64,10 +59,23 @@ echo "==> 产物: ${OUT}"
 # WORKDADDY_NODE_ARCHIVE 指向预下载压缩包以支持离线/受限网络构建。
 NODE_VERSION="${WORKDADDY_NODE_VERSION:-22.23.1}"
 NODE_ARCHIVE="node-v${NODE_VERSION}-win-x64.zip"
-NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
+NODE_URL="${WORKDADDY_NODE_URL:-https://npmmirror.com/mirrors/node/v${NODE_VERSION}/${NODE_ARCHIVE}}"
 NODE_SHA256="7df0bc9375723f4a86b3aa1b7cc73342423d9677a8df4538aca31a049e309c29"
 NODE_CACHE="${WORKDADDY_NODE_CACHE:-$DIR/release/.cache}"
 mkdir -p "$NODE_CACHE"
+
+# 正式 Windows 入口是自包含原生 EXE。它负责标准权限、单实例、原生对话框和
+# 精确进程检测；普通启动不再经过 cmd/vbs/PowerShell/CIM。
+GO_BIN="${WORKDADDY_GO:-go}"
+if ! command -v "$GO_BIN" >/dev/null 2>&1 && [ ! -x "$GO_BIN" ]; then
+  echo "错误：缺少 Go 1.24+（可设置 WORKDADDY_GO 指向 go.exe）" >&2
+  exit 2
+fi
+NATIVE_LAUNCHER="$NODE_CACHE/WorkDaddyLauncher.exe"
+echo "==> 编译原生 Windows 启动器"
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 "$GO_BIN" build -trimpath \
+  -ldflags '-s -w -H=windowsgui' -o "$NATIVE_LAUNCHER" ./scripts/windows-native/main.go
+test -s "$NATIVE_LAUNCHER"
 NODE_ARCHIVE_PATH="${WORKDADDY_NODE_ARCHIVE:-$NODE_CACHE/$NODE_ARCHIVE}"
 if [ ! -f "$NODE_ARCHIVE_PATH" ]; then
   echo "==> 下载 Node.js v${NODE_VERSION} Windows x64 运行时"
@@ -108,6 +116,11 @@ if [ -d "$BUILTIN_SRC" ]; then
 else
   echo "==> 警告: 未找到内置资产 $BUILTIN_SRC（无 WorkDaddy.app？），打包将不含官方壁纸/主题"
 fi
+WALLPAPER_OVERRIDE="$DIR/scripts/builtin-overrides/wallpaper-06.webp"
+if [ -f "$WALLPAPER_OVERRIDE" ] && [ -d scripts/builtin ]; then
+  cp "$WALLPAPER_OVERRIDE" scripts/builtin/wallpapers/wallpaper-06.webp
+  cp "$WALLPAPER_OVERRIDE" scripts/builtin/nebula/background.webp
+fi
 
 # 3) 打包：staging 目录，把两个顶层入口文件 + scripts/ 一起打进 zip 根（解压即见一键安装/启动）
 #    注意 apply-update.ps1 复用本结构（需 zip 内存在 scripts\daemon.js 做 srcRoot 判定）
@@ -121,6 +134,9 @@ cp scripts/Install-WorkDaddy.cmd "$STAGE/Install-WorkDaddy.cmd"
 cp scripts/Start-WorkDaddy.cmd "$STAGE/Start-WorkDaddy.cmd"
 # 3.2) scripts\ 本体（含 node_modules/ws、builtin）
 cp -R scripts "$STAGE/scripts"
+cp "$NATIVE_LAUNCHER" "$STAGE/WorkDaddyLauncher.exe"
+printf '%s\n' "$PROFILE" > "$STAGE/scripts/profile-id.txt"
+echo "==> 原生入口: WorkDaddyLauncher.exe (${PROFILE})"
 # Windows cmd.exe expects CRLF in batch files.  Normalise every staged .cmd
 # after copying so a source edit made on macOS cannot leave a mixed-ending
 # launcher that silently stops before invoking Node.

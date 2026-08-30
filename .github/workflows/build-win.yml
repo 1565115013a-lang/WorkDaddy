@@ -26,6 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: 安装固定 Go 工具链
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+
       - name: 校验 CRLF（cmd 必须 CRLF，否则 cmd.exe 解析括号块会失败）
         shell: bash
         run: |
