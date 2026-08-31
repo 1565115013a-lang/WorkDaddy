@@ -345,6 +345,34 @@ func terminateExactNode(pid int, expectedNode string) (bool, int, error) {
 	return terminateExactProcess(pid, expectedNode, "node")
 }
 
+func stopInstalledLauncher(appDir string) int {
+	expectedLauncher := filepath.Join(appDir, "WorkDaddyLauncher.exe")
+	records, err := enumerateProcesses()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitFailure
+	}
+	matches := make([]processRecord, 0, 1)
+	for _, record := range records {
+		if strings.EqualFold(record.Name, "WorkDaddyLauncher.exe") && samePath(record.Path, expectedLauncher) {
+			matches = append(matches, record)
+		}
+	}
+	if len(matches) > 1 {
+		fmt.Fprintln(os.Stderr, "发现多个当前安装目录的 WorkDaddyLauncher 进程，已拒绝批量结束")
+		return exitIdentityMismatch
+	}
+	if len(matches) == 0 {
+		return 0
+	}
+	_, code, stopErr := terminateExactProcess(int(matches[0].PID), expectedLauncher, "launcher")
+	if stopErr != nil {
+		fmt.Fprintln(os.Stderr, stopErr)
+		return code
+	}
+	return 0
+}
+
 func uniqueRunningWorkBuddyPath(profile string, matches []processRecord) (string, error) {
 	paths := make([]string, 0, len(matches))
 	for _, match := range matches {
@@ -433,6 +461,9 @@ func stopLifecycle(profile, appDir string) int {
 		if candidate.path != "" {
 			_ = os.Remove(candidate.path)
 		}
+	}
+	if code := stopInstalledLauncher(appDir); code != 0 {
+		return code
 	}
 	return 0
 }

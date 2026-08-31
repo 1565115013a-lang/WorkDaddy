@@ -12,18 +12,21 @@ const pickerSource = fs.existsSync(pickerPath) ? fs.readFileSync(pickerPath, 'ut
 const daemonSource = fs.readFileSync(path.join(__dirname, '../scripts/daemon.js'), 'utf8');
 const macBuildSource = fs.readFileSync(path.join(__dirname, '../scripts/build-mac-dmg.sh'), 'utf8');
 
-const test = require('node:test');
-const assert = require('node:assert/strict');
-
 if (!pickerSource) {
   test('picker-internal.js 未就绪（内部模块不入库）', (t) => t.skip());
 } else {
+  function functionSource(name, nextName) {
+    const start = pickerSource.indexOf('function ' + name + '(');
+    const end = pickerSource.indexOf('function ' + nextName + '(', start + 1);
+    assert.ok(start >= 0 && end > start, `missing picker function ${name}`);
+    return pickerSource.slice(start, end);
+  }
+
   test('拾取点击直接打开插件内 DOM 检查器', () => {
-    const handler = functionSource('showInspector', 'stopInspect');
-  const handler = functionSource('onInspectClick', 'onInspectKey');
-  assert.match(handler, /showInspector\(stack, el\)/);
-  assert.doesNotMatch(handler, /window\.open|api\(|element-inspector-url|open-url/);
-});
+    const handler = functionSource('onInspectClick', 'onInspectKey');
+    assert.match(handler, /showInspector\(stack, el\)/);
+    assert.doesNotMatch(handler, /window\.open|api\(|element-inspector-url|open-url/);
+  });
 
 test('插件内检查器包含 DOM 树、重叠元素栈、节点详情和 HTML', () => {
   const handler = functionSource('showInspector', 'stopInspect');
@@ -102,3 +105,4 @@ test('daemon 不再暴露 localhost 元素检查器页面与 bridge', () => {
 test('macOS 打包不再携带外部元素检查器文件', () => {
   assert.doesNotMatch(macBuildSource, /element-inspector\.js|element-inspector\.html/);
 });
+}

@@ -203,7 +203,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   (function () {
     var n;
     if ((n = document.querySelector('.wbs-root'))) n.remove();
-    var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn, .wbs-explore-inline');
+    var st = document.querySelectorAll('.wbs-stash-inline, .wbs-stash-btn, .wbs-explore-inline, .wbs-selection-quote-btn');
     for (var i = 0; i < st.length; i++) st[i].remove();
     var nav = document.querySelectorAll('.wbs-message-nav-root');
     for (var ni = 0; ni < nav.length; ni++) nav[ni].remove();
@@ -1086,19 +1086,27 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     exploreBtn.addEventListener('mouseleave', function () { exploreBtn.classList.remove('wbs-menu-closed'); });
     if (isWelcomePage()) exploreBtn.style.display = 'none'; // 欢迎页无操作栏，定位没意义；其余情况由 syncStash 常驻显示
 
-    /* ———— 会话模块（session）：暂存提示词、会话消息索引 & 快捷短语 ————
+    /* ———— 会话模块（session）：暂存提示词、会话消息索引、选中文字引用 & 快捷短语 ————
      * 暂存提示词/快捷短语由 daemon 持久化；消息索引开关保存在渲染器 localStorage。
      * stash 按钮显隐受「暂存提示词」开关影响；explore 按钮与面板选项受「快捷短语」开关/列表影响。 */
     var MESSAGE_NAV_ENABLED_KEY = 'workdaddy.session.messageNavigationEnabled';
+    var SELECTION_QUOTE_ENABLED_KEY = 'workdaddy.session.selectionQuoteEnabled';
     function readMessageNavigationEnabled() {
       try { return localStorage.getItem(MESSAGE_NAV_ENABLED_KEY) !== '0'; } catch (_) { return true; }
     }
     function writeMessageNavigationEnabled(enabled) {
       try { localStorage.setItem(MESSAGE_NAV_ENABLED_KEY, enabled ? '1' : '0'); } catch (_) {}
     }
+    function readSelectionQuoteEnabled() {
+      try { return localStorage.getItem(SELECTION_QUOTE_ENABLED_KEY) !== '0'; } catch (_) { return true; }
+    }
+    function writeSelectionQuoteEnabled(enabled) {
+      try { localStorage.setItem(SELECTION_QUOTE_ENABLED_KEY, enabled ? '1' : '0'); } catch (_) {}
+    }
     var sessState = {
       stash: true,
       messageNav: readMessageNavigationEnabled(),
+      selectionQuote: readSelectionQuoteEnabled(),
       phrase: true,
       phrases: [],
       qpBatch: false,
@@ -1111,14 +1119,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       sessState.stash = !!d.stashEnabled;
       sessState.phrase = !!d.phraseEnabled;
       sessState.phrases = Array.isArray(d.phrases) ? d.phrases : [];
-      // 同步 UI：三个开关 + 快捷短语列表区显隐
+      // 同步 UI：会话开关 + 快捷短语列表区显隐
       var pane0 = enhancePane;
       var swS = pane0 && pane0.querySelector('#wbs-sess-stash');
       var swN = pane0 && pane0.querySelector('#wbs-sess-message-nav');
+      var swQ = pane0 && pane0.querySelector('#wbs-sess-selection-quote');
       var swP = pane0 && pane0.querySelector('#wbs-sess-phrase');
       var area = pane0 && pane0.querySelector('#wbs-qp-area');
       if (swS) swS.checked = !!sessState.stash;
       if (swN) swN.checked = !!sessState.messageNav;
+      if (swQ) swQ.checked = !!sessState.selectionQuote;
       if (swP) swP.checked = !!sessState.phrase;
       if (area) area.style.display = sessState.phrase ? '' : 'none';
       renderQpList();
@@ -1143,6 +1153,139 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }).catch(function (e) {
         toast('设置失败: ' + (e.message || e), true, root);
         syncSessionModule();
+      });
+    }
+
+    // 轻量选区引用：只保存当前选中的文字，通过 WorkBuddy 官方 content-block 请求插入输入框。
+    // 不复制 Codex 的 locator/回复标注协议，避免依赖脆弱的内部状态。
+    var selectionQuoteButton = null;
+    var selectionQuotePending = null;
+    var selectionQuoteFrame = null;
+    var SELECTION_QUOTE_MAX_LENGTH = 12000;
+    /* WorkBuddy 的 selection-quote renderer 会通过 InputContextTag 自己渲染消息图标。 */
+
+    function selectionQuoteElement(range) {
+      if (!range || !range.commonAncestorContainer) return null;
+      var node = range.commonAncestorContainer;
+      var element = node.nodeType === 1 ? node : node.parentElement;
+      if (!element || !element.closest) return null;
+      if (element.closest('.wbs-root,.wbs-selection-quote-btn,textarea,input')) return null;
+      var editable = element.closest('[contenteditable="true"]');
+      var composer = findComposer();
+      if (editable && composer && editable === composer) return null;
+      return element.closest(
+        '[data-message-id],[data-message-request-id],.cb-message,.cr-message,.cr-message-content,' +
+        '[class*="message-content"],[class*="messageContent"],[class*="message-bubble"],[class*="messageBubble"]'
+      ) || element.closest('.cr-document[data-root-id]');
+    }
+
+    function selectionQuoteBlock(text) {
+      return {
+        type: 'resource_link',
+        name: '引用文本',
+        uri: 'selection://document-selection',
+        _meta: {
+          displayAsPhrase: true,
+          displayAsContext: false,
+          displayText: '引用文本',
+          selectionQuote: true,
+          mentionType: 'selection',
+          selectedText: text,
+          title: '引用文本',
+        },
+      };
+    }
+
+    function hideSelectionQuoteButton() {
+      if (selectionQuoteButton) selectionQuoteButton.style.display = 'none';
+      selectionQuotePending = null;
+    }
+
+    function updateSelectionQuoteButton() {
+      selectionQuoteFrame = null;
+      if (!alive || !sessState.selectionQuote || !selectionQuoteButton) return;
+      var sel = window.getSelection && window.getSelection();
+      if (!sel || sel.rangeCount < 1 || sel.isCollapsed) return hideSelectionQuoteButton();
+      var range = sel.getRangeAt(0);
+      var message = selectionQuoteElement(range);
+      var text = String(sel.toString() || '').trim();
+      if (!message || !text || text.length > SELECTION_QUOTE_MAX_LENGTH) return hideSelectionQuoteButton();
+      var rect = range.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0 || rect.bottom < 0 || rect.top > window.innerHeight) {
+        return hideSelectionQuoteButton();
+      }
+      selectionQuotePending = { text: text, rect: rect };
+      selectionQuoteButton.style.display = 'inline-flex';
+      var buttonRect = selectionQuoteButton.getBoundingClientRect();
+      var left = Math.max(8, Math.min(window.innerWidth - buttonRect.width - 8, rect.right - buttonRect.width));
+      var top = rect.top - buttonRect.height - 8;
+      if (top < 8) top = Math.min(window.innerHeight - buttonRect.height - 8, rect.bottom + 8);
+      selectionQuoteButton.style.left = Math.round(left) + 'px';
+      selectionQuoteButton.style.top = Math.round(Math.max(8, top)) + 'px';
+    }
+
+    function scheduleSelectionQuoteButton() {
+      if (selectionQuoteFrame !== null) return;
+      var request = window.requestAnimationFrame || function (callback) { return setTimeout(callback, 40); };
+      selectionQuoteFrame = request(updateSelectionQuoteButton);
+    }
+
+    function insertSelectionQuote() {
+      var pending = selectionQuotePending;
+      if (!pending || !pending.text) return;
+      hideSelectionQuoteButton();
+      var adapter = null;
+      try { adapter = window.__wbsAdapter || findWbsAdapter(); } catch (_) {}
+      if (!adapter || typeof adapter.requestInsertContentBlocks !== 'function') {
+        toast('当前输入框暂不支持引用插入', true, root);
+        return;
+      }
+      var request = { contentBlocks: [selectionQuoteBlock(pending.text)] };
+      try {
+        Promise.resolve(adapter.requestInsertContentBlocks(request)).then(function () {
+          toast('已引用选中文字', false, root);
+        }).catch(function () {
+          toast('引用插入失败，请重试', true, root);
+        });
+      } catch (_) {
+        toast('引用插入失败，请重试', true, root);
+      }
+    }
+
+    function setupSelectionQuote() {
+      if (!document.body) return;
+      if (!sessState.selectionQuote) hideSelectionQuoteButton();
+      if (!selectionQuoteButton) {
+        selectionQuoteButton = el('button', 'wbs-selection-quote-btn');
+        selectionQuoteButton.type = 'button';
+        selectionQuoteButton.setAttribute('aria-label', '引用文本');
+        selectionQuoteButton.textContent = '引用文本';
+        document.body.appendChild(selectionQuoteButton);
+        listen(selectionQuoteButton, 'pointerdown', function (event) {
+          if (event.preventDefault) event.preventDefault();
+          if (event.stopPropagation) event.stopPropagation();
+        });
+        listen(selectionQuoteButton, 'click', function (event) {
+          if (event.preventDefault) event.preventDefault();
+          if (event.stopPropagation) event.stopPropagation();
+          insertSelectionQuote();
+        });
+      }
+      listen(document, 'selectionchange', scheduleSelectionQuoteButton);
+      listen(document, 'mouseup', scheduleSelectionQuoteButton);
+      listen(window, 'scroll', scheduleSelectionQuoteButton, true);
+      listen(window, 'resize', scheduleSelectionQuoteButton);
+      listen(document, 'keydown', function (event) {
+        if (event.key === 'Escape') hideSelectionQuoteButton();
+      });
+      registerDisposer(function () {
+        if (selectionQuoteFrame !== null) {
+          var cancel = window.cancelAnimationFrame || clearTimeout;
+          try { cancel(selectionQuoteFrame); } catch (_) {}
+          selectionQuoteFrame = null;
+        }
+        if (selectionQuoteButton) { selectionQuoteButton.remove(); selectionQuoteButton = null; }
+        selectionQuotePending = null;
       });
     }
     /** 增强页快捷短语列表渲染（含批量模式） */
@@ -2393,6 +2536,15 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
               syncModernQueueSnapshot(sessionId, snapshot);
               return snapshot;
             });
+          };
+        }
+      });
+      // Composer content-block requests are handled by WorkBuddy's Slate owner.
+      // Keep the original receiver so prototype methods retain their context.
+      ['requestInsertContentBlocks', 'requestSendPrompt', 'onInsertContentBlocksRequest'].forEach(function (m) {
+        if (typeof target[m] === 'function') {
+          shim[m] = function () {
+            return target[m].apply(target, arguments);
           };
         }
       });
@@ -4482,6 +4634,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<span class="wbs-nd-title">会话消息索引</span>' +
         '<span class="wbs-nd-hint">悬停预览，点击或拖动快速定位消息。</span>' +
         '<label class="wbs-switch" title="在会话左侧显示消息索引"><input type="checkbox" id="wbs-sess-message-nav"><span class="wbs-switch-slider"></span></label>' +
+        '</div>' +
+        '<div class="wbs-nd-row">' +
+        '<span class="wbs-nd-title">引用消息文本</span>' +
+        '<span class="wbs-nd-hint">选中会话消息文字后，一键插入输入框。</span>' +
+        '<label class="wbs-switch" title="选中会话消息中的文字后显示引用按钮"><input type="checkbox" id="wbs-sess-selection-quote"><span class="wbs-switch-slider"></span></label>' +
         '</div>' +
         '<div class="wbs-nd-row">' +
         '<span class="wbs-nd-title">快捷短语</span>' +
@@ -7164,6 +7321,13 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         writeMessageNavigationEnabled(sessState.messageNav);
         if (messageNavigation) messageNavigation.setEnabled(sessState.messageNav);
       });
+      var swQ = pane2.querySelector('#wbs-sess-selection-quote');
+      if (swQ) swQ.addEventListener('change', function () {
+        sessState.selectionQuote = !!this.checked;
+        writeSelectionQuoteEnabled(sessState.selectionQuote);
+        if (!sessState.selectionQuote) hideSelectionQuoteButton();
+        else scheduleSelectionQuoteButton();
+      });
       var swP = pane2.querySelector('#wbs-sess-phrase');
       if (swP) swP.addEventListener('change', function () { setSessionSwitchWire('phraseEnabled', this); });
       var batchBtn = pane2.querySelector('#wbs-qp-batch');
@@ -8188,6 +8352,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     try { ensureAutoContinueMonitor(); } catch (e) {}
     // 注入完成即同步会话模块状态（暂存/快捷短语开关 + 短语列表）并应用到输入框按钮显隐
     try { syncSessionModule(); } catch (e) {}
+    // 选区引用按钮默认开启；开关关闭时仅保留监听器，重新开启无需重注入。
+    try { setupSelectionQuote(); } catch (e) {}
     // 打开面板时校验指令块是否丢失，丢失则自动关闭开关（不弹 toast）
     try { acCheckPromptOnOpen(); } catch (e) {}
     // 按钮主题色（浅色黑底白图 / 深色白底黑图）+ 监听主题切换
@@ -8260,6 +8426,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-message-nav-response{-webkit-line-clamp:6;margin-top:7px;padding-top:7px;border-top:1px solid var(--wb-border-subtle,rgba(20,24,32,.12));font-size:11px;font-weight:400;line-height:1.55;color:var(--wb-color-text-secondary,#5f626a)}',
     '.wbs-message-nav-highlight{animation:wbs-message-nav-highlight .7s ease-out}',
     '@keyframes wbs-message-nav-highlight{0%{box-shadow:0 0 0 3px color-mix(in srgb,var(--wb-accent-blue,#4f86ff) 48%,transparent)}100%{box-shadow:0 0 0 8px transparent}}',
+    /* WorkBuddy 内置引用 tooltip 复用快捷短语的气泡风格，长文本在气泡内滚动 */
+    '.sq-tooltip-wrapper{width:max-content!important;max-width:calc(100vw - 24px)!important;padding:0!important;border:1px solid color-mix(in srgb,var(--wb-border-subtle,#ececec) 65%,transparent)!important;border-radius:8px!important;background:var(--wb-bg-popover,#fff)!important;box-shadow:0 6px 20px rgba(0,0,0,.16)!important;color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.sq-tooltip-wrapper .sq-popover,.sq-tooltip-wrapper .sq-image-preview{width:max-content;max-width:min(240px,calc(100vw - 24px));max-height:min(48vh,240px);box-sizing:border-box;padding:5px 11px;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain}',
+    '.sq-tooltip-wrapper .sq-popover__row--title,.sq-tooltip-wrapper .sq-image-preview__title-row{display:none!important}',
+    '.sq-tooltip-wrapper .sq-popover__locate-btn,.sq-tooltip-wrapper .sq-image-preview__locate-fab{display:none!important}',
+    '.sq-tooltip-wrapper .sq-popover__row--selection{align-items:flex-start}',
+    '.sq-tooltip-wrapper .sq-popover__preview{display:block;max-height:min(44vh,220px);overflow-x:hidden;overflow-y:auto;overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap;text-overflow:clip;scrollbar-width:thin}',
+    'html.cb-dark .sq-tooltip-wrapper{background:var(--wb-bg-popover,#202126)!important;border-color:color-mix(in srgb,var(--wb-border-subtle,#ececec) 65%,transparent)!important;color:var(--wb-color-text-primary,#f2f3f5)}',
+    /* 复用 WorkBuddy 官方 InputContextTag 的消息图标与关闭图标，仅修正 sceneTag 的 hover 覆盖规则。 */
+    '.slate-selection-quote-sceneTag._hasCloseIcon:hover [class*="iconContainer"],.slate-selection-quote-sceneTag__readOnly._hasCloseIcon:hover [class*="iconContainer"]{visibility:hidden!important}',
+    '.wbs-selection-quote-btn{position:fixed;z-index:1000;display:none;align-items:center;justify-content:center;min-width:64px;height:30px;box-sizing:border-box;padding:0 10px;border:1px solid var(--wb-border-subtle,rgba(20,24,32,.18));border-radius:8px;background:color-mix(in srgb,var(--wb-bg-popover,#fff) 72%,transparent);color:var(--wb-color-text-primary,#1f1f1f);box-shadow:0 7px 18px rgba(20,24,32,.2),inset 0 1px 0 rgba(255,255,255,.45);backdrop-filter:blur(12px) saturate(1.2);-webkit-backdrop-filter:blur(12px) saturate(1.2);cursor:pointer;outline:none;font:inherit;font-size:12px;line-height:1;white-space:nowrap;transition:background .15s,border-color .15s,box-shadow .15s;color-scheme:light}',
+    '.wbs-selection-quote-btn:hover,.wbs-selection-quote-btn:focus-visible{background:color-mix(in srgb,var(--wb-bg-hover,#f3f3f3) 86%,transparent);border-color:var(--wb-border-default,#d5d5d5);box-shadow:0 8px 20px rgba(20,24,32,.2),inset 0 1px 0 rgba(255,255,255,.35)}',
+    'html.cb-dark .wbs-selection-quote-btn,html[data-theme="dark"] .wbs-selection-quote-btn,body[data-vscode-theme-name*="dark" i] .wbs-selection-quote-btn{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 70%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.16));color:var(--wb-color-text-primary,#f2f3f5);box-shadow:0 8px 22px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.08);color-scheme:dark}',
+    'html.cb-dark .wbs-selection-quote-btn:hover,html.cb-dark .wbs-selection-quote-btn:focus-visible,html[data-theme="dark"] .wbs-selection-quote-btn:hover,html[data-theme="dark"] .wbs-selection-quote-btn:focus-visible,body[data-vscode-theme-name*="dark" i] .wbs-selection-quote-btn:hover,body[data-vscode-theme-name*="dark" i] .wbs-selection-quote-btn:focus-visible{background:color-mix(in srgb,var(--wb-bg-hover,#303238) 84%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.2));box-shadow:0 9px 24px rgba(0,0,0,.38),inset 0 1px 0 rgba(255,255,255,.08)}',
     'html.cb-dark .wbs-message-nav-rail,html[data-theme="dark"] .wbs-message-nav-rail,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-rail{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 14%,transparent);border-color:transparent;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none}',
     'html.cb-dark .wbs-message-nav-rail:hover,html.cb-dark .wbs-message-nav-rail:focus-within,html[data-theme="dark"] .wbs-message-nav-rail:hover,html[data-theme="dark"] .wbs-message-nav-rail:focus-within,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-rail:hover,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-rail:focus-within{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 44%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.12));box-shadow:0 6px 20px rgba(0,0,0,.28);backdrop-filter:blur(14px) saturate(1.12);-webkit-backdrop-filter:blur(14px) saturate(1.12)}',
     'html.cb-dark .wbs-message-nav-tooltip,html[data-theme="dark"] .wbs-message-nav-tooltip,body[data-vscode-theme-name*="dark" i] .wbs-message-nav-tooltip{background:color-mix(in srgb,var(--wb-bg-popover,#202126) 70%,transparent);border-color:var(--wb-border-subtle,rgba(255,255,255,.14));color:var(--wb-color-text-primary,#f2f3f5);box-shadow:0 14px 38px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08)}',

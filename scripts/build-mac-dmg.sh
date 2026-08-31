@@ -32,7 +32,6 @@ case "$PROFILE" in
   workbuddy-ai) PACKAGE_APP_NAME="WorkDaddy AI"; OUT="release/macos/WorkDaddy-AI-${VERSION}.dmg" ;;
   *) PROFILE="workbuddy-cn"; PACKAGE_APP_NAME="WorkDaddy"; OUT="release/macos/WorkDaddy-${VERSION}.dmg" ;;
 esac
-VERSION_CODE="$(printf '%s' "$VERSION" | tr -d '.')"
 
 echo "==> profile: ${PROFILE}"
 echo "==> 版本: ${VERSION}"
@@ -139,7 +138,8 @@ source = source.replace('  echo "[$(date -u +%FT%TZ)] manual inject result: ${IN
 with open(path, 'w', encoding='utf-8', newline='') as f:
     f.write(source)
 PY
-perl -0pi -e "s/<string>1\\.0\\.8<\\/string>/<string>${VERSION}<\\/string>/g; s/<string>108<\\/string>/<string>${VERSION_CODE}<\\/string>/g" "$PACKAGE_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$PACKAGE_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" "$PACKAGE_APP/Contents/Info.plist"
 # 无论源码壳当前版本如何，每次产物都必须让 daemon 版本与安装包版本一致。
 perl -0pi -e "s/(const DAEMON_VERSION = ')[^']+(';)/\${1}${VERSION}\${2}/" \
   "$PACKAGE_APP/Contents/Resources/scripts/daemon.js"

@@ -6,6 +6,7 @@ const { EventEmitter } = require('node:events');
 const path = require('node:path');
 const test = require('node:test');
 const { launchWindowsInstaller } = require('../scripts/windows-installer-launch.js');
+const { strictPowerShellLines } = require('../scripts/win-launcher.js');
 
 const root = path.join(__dirname, '..');
 const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
@@ -128,4 +129,68 @@ test('native lifecycle cleanup accepts a PID that exits during exact inspection'
   const mismatch = source.indexOf('return false, exitIdentityMismatch', missingPath);
   assert.ok(missingPath >= 0 && exitedCheck > missingPath && mismatch > exitedCheck);
   assert.match(source.slice(exitedCheck, mismatch), /waitResult == waitObject0[\s\S]*return false, 0, nil/);
+});
+
+test('installer lifecycle cleanup releases only the exact installed native launcher', () => {
+  const source = read('scripts/windows-native/main.go');
+  const stopStart = source.indexOf('func stopInstalledLauncher(appDir string) int');
+  const stopEnd = source.indexOf('\nfunc uniqueRunningWorkBuddyPath(', stopStart);
+  assert.ok(stopStart >= 0 && stopEnd > stopStart);
+  const stop = source.slice(stopStart, stopEnd);
+  assert.match(stop, /filepath\.Join\(appDir, "WorkDaddyLauncher\.exe"\)/);
+  assert.match(stop, /enumerateProcesses\(\)/);
+  assert.match(stop, /samePath\(record\.Path, expectedLauncher\)/);
+  assert.match(stop, /len\(matches\) > 1[\s\S]*exitIdentityMismatch/);
+  assert.match(stop, /terminateExactProcess\(int\(matches\[0\]\.PID\), expectedLauncher, "launcher"\)/);
+});
+
+test('native startup retains portable and registered WorkBuddy discovery without CIM', () => {
+  const launcher = read('scripts/win-launcher.js');
+  const nativeFinderStart = launcher.indexOf('function findWorkBuddyNative()');
+  const nativeFinderEnd = launcher.indexOf('\nfunction nativeDaemonStatusMatches', nativeFinderStart);
+  assert.ok(nativeFinderStart >= 0 && nativeFinderEnd > nativeFinderStart);
+  const nativeFinder = launcher.slice(nativeFinderStart, nativeFinderEnd);
+  assert.match(nativeFinder, /--list-workbuddy/);
+  assert.match(nativeFinder, /WBSWITCH_WORKBUDDY_DIR/);
+  assert.match(nativeFinder, /App Paths/);
+  assert.match(nativeFinder, /CurrentVersion\\\\Uninstall/);
+  assert.match(nativeFinder, /Get-ChildItem[\s\S]*-Depth 5/);
+  assert.doesNotMatch(nativeFinder, /Get-CimInstance/);
+});
+
+test('PowerShell discovery preserves non-ASCII installation paths', { skip: process.platform !== 'win32' }, () => {
+  const expected = 'D:\\沃克巴迪\\WorkBuddyAI\\WorkBuddyAI.exe';
+  assert.deepEqual(strictPowerShellLines(`Write-Output '${expected}'`), [expected]);
+});
+
+test('native upgrade stops a managed-Node lifecycle only through the verified JS boundary', () => {
+  const launcher = read('scripts/win-launcher.js');
+  assert.match(launcher, /async function stopVerifiedLegacyManagedLifecycle\(bundledNode\)/);
+  const cleanupStart = launcher.indexOf('async function stopVerifiedLegacyManagedLifecycle(bundledNode)');
+  const cleanupEnd = launcher.indexOf('\nfunction nativeDaemonStatusMatches', cleanupStart);
+  const cleanup = launcher.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanup, /findNode\(\)/);
+  assert.match(cleanup, /sameWindowsPath\(legacyNode, bundledNode\)/);
+  assert.match(cleanup, /await stopDaemonByPort\(legacyNode\)/);
+  assert.doesNotMatch(cleanup, /taskkill|terminateExactNode/);
+  const ensureStart = launcher.indexOf('async function ensureDaemonNative(nodeBin)');
+  const ensureEnd = launcher.indexOf('\nasync function waitForWorkBuddyCdpNative', ensureStart);
+  const ensure = launcher.slice(ensureStart, ensureEnd);
+  assert.ok(
+    ensure.indexOf('stopVerifiedLegacyManagedLifecycle(nodeBin)') < ensure.indexOf('stopNativeLifecycle()'),
+    'verified legacy cleanup must run before the bundled-node-only native helper'
+  );
+});
+
+test('native startup failures report one structured diagnostic event', () => {
+  const launcher = read('scripts/win-launcher.js');
+  const nativeMainStart = launcher.indexOf('async function nativeStartupMain()');
+  const nativeMainEnd = launcher.indexOf('\n// ---------- legacy script entry', nativeMainStart);
+  const nativeMain = launcher.slice(nativeMainStart, nativeMainEnd);
+  assert.match(nativeMain, /nativeWorkBuddyDiscoverySummary\(\)/);
+  assert.match(nativeMain, /nativeCdpDiagnostics/);
+  assert.doesNotMatch(nativeMain, /captureMessage\('未找到 WorkBuddy\.exe'/);
+  assert.match(launcher, /error\.sentryStage/);
+  assert.match(launcher, /error\.sentryExtra/);
+  assert.match(launcher, /nativeDaemonDiagnostics/);
 });

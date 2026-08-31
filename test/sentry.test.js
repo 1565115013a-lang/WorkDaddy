@@ -14,29 +14,87 @@ const reporterSource = fs.readFileSync(reporter, 'utf8');
 const daemonSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'daemon.js'), 'utf8');
 const injectSource = fs.readFileSync(path.join(repoRoot, 'scripts', 'inject.js'), 'utf8');
 
-function dryRun(profile) {
+function dryRun(profile, sharedDataDir) {
   const result = childProcess.spawnSync(process.execPath, [reporter, '--dry-run', '--stage', 'test', '--message', 'profile test'], {
     cwd: repoRoot,
-    env: { ...process.env, WBSWITCH_PROFILE: profile, WORKDADDY_TELEMETRY: '0' },
+    env: {
+      ...process.env,
+      WBSWITCH_PROFILE: profile,
+      WBSWITCH_SHARED_DATA_DIR: sharedDataDir,
+      WORKDADDY_TELEMETRY: '0',
+    },
     encoding: 'utf8',
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
 
-test('Sentry events identify WorkBuddy CN and WorkBuddy AI without account data', () => {
-  const cn = dryRun('workbuddy-cn');
-  assert.equal(cn.tags.client, 'workbuddy');
-  assert.equal(cn.tags.client_name, 'WorkBuddy');
-  assert.equal(cn.tags.workbuddy_variant, 'workbuddy');
-  assert.deepEqual(cn.contexts.client, { name: 'WorkBuddy', profile: 'workbuddy-cn', variant: 'workbuddy' });
+function dryRunAsync(profile, sharedDataDir) {
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(process.execPath, [reporter, '--dry-run', '--stage', 'test', '--message', 'profile test'], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        WBSWITCH_PROFILE: profile,
+        WBSWITCH_SHARED_DATA_DIR: sharedDataDir,
+        WORKDADDY_TELEMETRY: '0',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code !== 0) reject(new Error(stderr || `Sentry dry run exited ${code}`));
+      else {
+        try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
+      }
+    });
+  });
+}
 
-  const ai = dryRun('workbuddy-ai');
-  assert.equal(ai.tags.client, 'workbuddy-ai');
-  assert.equal(ai.tags.client_name, 'WorkBuddy AI');
-  assert.equal(ai.tags.workbuddy_variant, 'workbuddy-ai');
-  assert.deepEqual(ai.contexts.client, { name: 'WorkBuddy AI', profile: 'workbuddy-ai', variant: 'workbuddy-ai' });
-  assert.doesNotMatch(JSON.stringify(ai), /accessToken|refreshToken|cookie|password/i);
+test('Sentry events identify WorkBuddy CN and WorkBuddy AI without account data', () => {
+  const sharedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-sentry-identity-'));
+  try {
+    const cn = dryRun('workbuddy-cn', sharedDataDir);
+    assert.equal(cn.tags.client, 'workbuddy');
+    assert.equal(cn.tags.client_name, 'WorkBuddy');
+    assert.equal(cn.tags.workbuddy_variant, 'workbuddy');
+    assert.deepEqual(cn.contexts.client, { name: 'WorkBuddy', profile: 'workbuddy-cn', variant: 'workbuddy' });
+
+    const ai = dryRun('workbuddy-ai', sharedDataDir);
+    assert.equal(ai.tags.client, 'workbuddy-ai');
+    assert.equal(ai.tags.client_name, 'WorkBuddy AI');
+    assert.equal(ai.tags.workbuddy_variant, 'workbuddy-ai');
+    assert.deepEqual(ai.contexts.client, { name: 'WorkBuddy AI', profile: 'workbuddy-ai', variant: 'workbuddy-ai' });
+    assert.match(cn.user.id, /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+    assert.equal(ai.user.id, cn.user.id, 'CN and AI profiles must share one anonymous installation id');
+    assert.equal(fs.readFileSync(path.join(sharedDataDir, 'installation-id'), 'utf8').trim(), cn.user.id);
+    assert.doesNotMatch(JSON.stringify(ai), /accessToken|refreshToken|cookie|password/i);
+  } finally {
+    fs.rmSync(sharedDataDir, { recursive: true, force: true });
+  }
+});
+
+test('concurrent first-run reporters publish one complete installation id', async () => {
+  const sharedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workdaddy-sentry-concurrent-'));
+  try {
+    const events = await Promise.all(Array.from({ length: 12 }, (_, index) =>
+      dryRunAsync(index % 2 ? 'workbuddy-ai' : 'workbuddy-cn', sharedDataDir)));
+    const ids = new Set(events.map((event) => event.user && event.user.id));
+    assert.equal(ids.size, 1);
+    const [id] = ids;
+    assert.match(id, /^[0-9a-f]{8}-[0-9a-f-]{27}$/);
+    assert.equal(fs.readFileSync(path.join(sharedDataDir, 'installation-id'), 'utf8').trim(), id);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(path.join(sharedDataDir, 'installation-id')).mode & 0o777, 0o600);
+      assert.equal(fs.statSync(sharedDataDir).mode & 0o777, 0o700);
+    }
+  } finally {
+    fs.rmSync(sharedDataDir, { recursive: true, force: true });
+  }
 });
 
 test('diagnostic telemetry defaults on and respects explicit overrides', () => {

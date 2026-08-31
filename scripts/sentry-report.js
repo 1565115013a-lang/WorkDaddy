@@ -23,11 +23,12 @@ const CLIENT_VARIANT = PROFILE_ID === 'workbuddy-ai' ? 'workbuddy-ai'
 const CLIENT_NAME = CLIENT_VARIANT === 'workbuddy-ai' ? 'WorkBuddy AI'
   : CLIENT_VARIANT === 'codebuddy-cn' ? 'CodeBuddy CN'
     : CLIENT_VARIANT === 'codebuddy-intl' ? 'CodeBuddy' : 'WorkBuddy';
-const SHARED_DATA_DIR = IS_WIN
+const SHARED_DATA_DIR = process.env.WBSWITCH_SHARED_DATA_DIR || (IS_WIN
   ? path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'WorkDaddy')
-  : path.join(HOME, 'Library', 'Application Support', 'WorkDaddy');
+  : path.join(HOME, 'Library', 'Application Support', 'WorkDaddy'));
 const DATA_DIR = process.env.WBSWITCH_DATA_DIR || (PROFILE_ID === 'workbuddy-cn'
   ? SHARED_DATA_DIR : path.join(SHARED_DATA_DIR, 'profiles', PROFILE_ID));
+const INSTALLATION_ID_FILE = path.join(SHARED_DATA_DIR, 'installation-id');
 const OUTBOX_DIR = path.join(DATA_DIR, 'telemetry', 'outbox');
 const TELEMETRY_SETTINGS_FILE = path.join(DATA_DIR, 'telemetry-settings.json');
 const MAX_OUTBOX_FILES = 50;
@@ -36,6 +37,47 @@ const REQUEST_TIMEOUT_MS = 3000;
 const MAX_TEXT = 6000;
 const FORCE_SEND_ATTEMPTS = 6;
 const FORCE_SEND_DELAYS_MS = [250, 500, 1000, 2000, 3000];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+let processInstallationId = null;
+
+function installationId() {
+  if (processInstallationId) return processInstallationId;
+  const readPersisted = () => {
+    const value = fs.readFileSync(INSTALLATION_ID_FILE, 'utf8').trim();
+    if (!UUID_PATTERN.test(value)) throw new Error('invalid installation id');
+    try { fs.chmodSync(INSTALLATION_ID_FILE, 0o600); } catch (_) {}
+    return value.toLowerCase();
+  };
+  try {
+    processInstallationId = readPersisted();
+    return processInstallationId;
+  } catch (_) {}
+
+  const generated = crypto.randomUUID().toLowerCase();
+  let temp = '';
+  try {
+    fs.mkdirSync(SHARED_DATA_DIR, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(SHARED_DATA_DIR, 0o700); } catch (_) {}
+    temp = `${INSTALLATION_ID_FILE}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+    fs.writeFileSync(temp, generated + '\n', { flag: 'wx', mode: 0o600 });
+    try {
+      // Publish a fully-written inode atomically. Concurrent CN/AI starts either
+      // create this link or read the winner; neither can observe a partial ID.
+      fs.linkSync(temp, INSTALLATION_ID_FILE);
+      try { fs.chmodSync(INSTALLATION_ID_FILE, 0o600); } catch (_) {}
+      processInstallationId = generated;
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error;
+      processInstallationId = readPersisted();
+    }
+  } catch (_) {
+    // Identity is diagnostic only. Never make startup depend on persistence.
+    processInstallationId = generated;
+  } finally {
+    if (temp) try { fs.unlinkSync(temp); } catch (_) {}
+  }
+  return processInstallationId;
+}
 
 function telemetrySettingsPath(env = process.env) {
   const dataDir = String(env.WBSWITCH_DATA_DIR || DATA_DIR);
@@ -218,6 +260,7 @@ function makeEvent({ stage, message, level = 'error', tags = {}, extra = {}, exc
     message: redactText(message || 'WorkDaddy telemetry event'),
     logger: 'workdaddy',
     release: `workdaddy@${version}`,
+    user: { id: installationId() },
     tags: sanitize({
       source: 'workdaddy',
       stage: stage || 'unknown',

@@ -357,7 +357,8 @@ async function configureCdpPort() {
 }
 
 function strictPowerShellLines(cmd) {
-  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd], {
+  const utf8Command = '$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ' + cmd;
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', utf8Command], {
     encoding: 'utf8', timeout: 10000, windowsHide: true,
   });
   if (result.error) throw result.error;
@@ -1112,9 +1113,17 @@ function launchWorkBuddy(wb) {
   const child = spawn(wb, [args], {
     cwd: path.dirname(wb), detached: true, stdio: 'ignore', windowsHide: true,
   });
-  child.on('error', (e) => { log('启动 WorkBuddy 失败: ' + e.message); });
+  const state = { method: 'node-spawn', pid: Number.isSafeInteger(child.pid) ? child.pid : null, errorCode: null, exitCode: null, signal: null };
+  child.on('error', (e) => {
+    state.errorCode = String(e && e.code || 'spawn-error').slice(0, 80);
+    log('启动 WorkBuddy 失败: ' + e.message);
+  });
+  child.on('exit', (code, signal) => {
+    state.exitCode = Number.isInteger(code) ? code : null;
+    state.signal = signal ? String(signal).slice(0, 32) : null;
+  });
   child.unref();
-  return { method: 'node-spawn', pid: child.pid };
+  return state;
 }
 
 async function waitForWorkBuddyCdp(binary) {
@@ -1249,6 +1258,37 @@ function runNativeHelper(args, options = {}) {
   return result;
 }
 
+let nativeDiscoveryState = null;
+let nativeWatchdogAttempts = [];
+let nativeLaunchState = null;
+
+function nativeWorkBuddyProcessSummary() {
+  const summary = { queryStatus: null, count: 0, withPath: 0, uniquePathCount: 0 };
+  try {
+    const result = runNativeHelper(['--list-workbuddy', '--profile', PROFILE.id]);
+    summary.queryStatus = result.status;
+    if (result.status !== 0) return summary;
+    const rows = JSON.parse(String(result.stdout || '[]'));
+    if (!Array.isArray(rows)) return summary;
+    const paths = [];
+    summary.count = rows.length;
+    for (const row of rows) {
+      const value = String(row && row.path || '').trim();
+      if (!value) continue;
+      summary.withPath += 1;
+      if (!paths.some((item) => sameWindowsPath(item, value))) paths.push(value);
+    }
+    summary.uniquePathCount = paths.length;
+  } catch (error) {
+    summary.errorCode = String(error && error.code || 'query-failed').slice(0, 80);
+  }
+  return summary;
+}
+
+function nativeWorkBuddyDiscoverySummary() {
+  return nativeDiscoveryState ? { ...nativeDiscoveryState } : { completed: false };
+}
+
 function nativeWorkBuddyRunning() {
   const result = runNativeHelper(['--check-workbuddy', '--profile', PROFILE.id]);
   if (result.status === 10) return true;
@@ -1258,35 +1298,167 @@ function nativeWorkBuddyRunning() {
 
 function findWorkBuddyNative() {
   const candidates = [];
-  const add = (value) => {
-    const candidate = String(value || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
-    if (candidate && !candidates.some((item) => sameWindowsPath(item, candidate))) candidates.push(candidate);
+  const summary = {
+    completed: false,
+    nativeProcessCount: 0,
+    explicitCandidateCount: 0,
+    registeredCandidateCount: 0,
+    portableCandidateCount: 0,
+    scannedCandidateCount: 0,
+    validCandidateCount: 0,
   };
-  add(process.env.WBSWITCH_WORKBUDDY_BIN);
-  add(PROFILE.appPath);
+  nativeDiscoveryState = summary;
+  const add = (value, source) => {
+    const candidate = String(value || '').trim().replace(/^"(.*)"(?:,\d+)?$/, '$1').replace(/,\d+$/, '');
+    if (!candidate || candidates.some((item) => sameWindowsPath(item.path, candidate))) return;
+    candidates.push({ path: candidate, source });
+    const key = source + 'CandidateCount';
+    if (Object.hasOwn(summary, key)) summary[key] += 1;
+  };
+  try {
+    const result = runNativeHelper(['--list-workbuddy', '--profile', PROFILE.id]);
+    summary.nativeProcessQueryStatus = result.status;
+    if (result.status === 0) {
+      const rows = JSON.parse(String(result.stdout || '[]'));
+      if (Array.isArray(rows)) {
+        summary.nativeProcessCount = rows.length;
+        for (const row of rows) add(row && row.path, 'explicit');
+      }
+    }
+  } catch (error) {
+    summary.nativeProcessQueryError = String(error && error.code || 'query-failed').slice(0, 80);
+  }
+  add(process.env.WBSWITCH_WORKBUDDY_BIN, 'explicit');
+  add(PROFILE.appPath, 'explicit');
   const local = process.env.LOCALAPPDATA || '';
   const programFiles = process.env.ProgramFiles || '';
   const programFilesX86 = process.env['ProgramFiles(x86)'] || '';
-  if (PROFILE.id === 'workbuddy-ai') {
-    add(path.join(local, 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'));
-    add(path.join(local, 'Programs', 'WorkBuddy AI', 'WorkBuddyAI.exe'));
-    add(path.join(programFiles, 'WorkBuddyAI', 'WorkBuddyAI.exe'));
-    add(path.join(programFiles, 'WorkBuddy AI', 'WorkBuddyAI.exe'));
-    add(path.join(programFilesX86, 'WorkBuddyAI', 'WorkBuddyAI.exe'));
-    add(path.join(programFilesX86, 'WorkBuddy AI', 'WorkBuddyAI.exe'));
-  } else {
-    add(path.join(local, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'));
-    add(path.join(programFiles, 'WorkBuddy', 'WorkBuddy.exe'));
-    add(path.join(programFilesX86, 'WorkBuddy', 'WorkBuddy.exe'));
+  const expectedName = PROFILE.id === 'workbuddy-ai' ? 'WorkBuddyAI.exe' : 'WorkBuddy.exe';
+  if (process.env.WBSWITCH_WORKBUDDY_DIR) {
+    add(path.join(process.env.WBSWITCH_WORKBUDDY_DIR, expectedName), 'explicit');
   }
-  for (const candidate of candidates) {
+  const appPathNames = PROFILE.id === 'workbuddy-ai' ? ['WorkBuddyAI.exe'] : ['WorkBuddy.exe'];
+  const appPathKeys = [];
+  for (const name of appPathNames) {
+    appPathKeys.push(`HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${name}`);
+    appPathKeys.push(`HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${name}`);
+  }
+  const appPathCommand = "$k=@(" + appPathKeys.map(powershellLiteral).join(',') + "); Get-ItemProperty $k -ErrorAction SilentlyContinue | ForEach-Object { if ($_.'(default)') { $_.'(default)' } elseif ($_.Path) { Join-Path $_.Path " + powershellLiteral(expectedName) + " } }";
+  for (const candidate of bestEffortPowerShellLines(appPathCommand, 'App Paths')) add(candidate, 'registered');
+  const uninstallCommand = "$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy' } | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation " + powershellLiteral(expectedName) + " } }";
+  for (const candidate of bestEffortPowerShellLines(uninstallCommand, '卸载注册表')) add(candidate, 'registered');
+  if (PROFILE.id === 'workbuddy-ai') {
+    add(path.join(local, 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'), 'portable');
+    add(path.join(local, 'Programs', 'WorkBuddy AI', 'WorkBuddyAI.exe'), 'portable');
+    add(path.join(programFiles, 'WorkBuddyAI', 'WorkBuddyAI.exe'), 'portable');
+    add(path.join(programFiles, 'WorkBuddy AI', 'WorkBuddyAI.exe'), 'portable');
+    add(path.join(programFilesX86, 'WorkBuddyAI', 'WorkBuddyAI.exe'), 'portable');
+    add(path.join(programFilesX86, 'WorkBuddy AI', 'WorkBuddyAI.exe'), 'portable');
+  } else {
+    add(path.join(local, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'), 'portable');
+    add(path.join(programFiles, 'WorkBuddy', 'WorkBuddy.exe'), 'portable');
+    add(path.join(programFilesX86, 'WorkBuddy', 'WorkBuddy.exe'), 'portable');
+  }
+  const driveRoots = bestEffortPowerShellLines('(Get-PSDrive -PSProvider FileSystem).Root', '磁盘根目录');
+  for (const root of driveRoots) {
+    add(path.join(root, 'Software', PROFILE.id === 'workbuddy-ai' ? 'workbuddy-ai' : 'workbuddy', expectedName), 'portable');
+    add(path.join(root, PROFILE.id === 'workbuddy-ai' ? 'WorkBuddyAI' : 'WorkBuddy', expectedName), 'portable');
+  }
+  const scanDirs = PROFILE.id === 'workbuddy-ai'
+    ? [path.join(local, 'Programs', 'WorkBuddyAI'), path.join(local, 'Programs', 'WorkBuddy AI'), path.join(local, 'WorkBuddyAI')]
+    : [path.join(local, 'Programs', 'WorkBuddy'), path.join(local, 'WorkBuddy'), path.join(process.env.APPDATA || '', 'WorkBuddy')];
+  const scanCommand = [
+    '$roots=@(' + scanDirs.map(powershellLiteral).join(',') + ')',
+    'foreach($root in $roots){',
+    'if(-not (Test-Path -LiteralPath $root -PathType Container)){continue}',
+    'Get-ChildItem -LiteralPath $root -File -Recurse -Depth 5 -ErrorAction SilentlyContinue | Where-Object { $_.Name -ieq ' + powershellLiteral(expectedName) + ' } | Select-Object -ExpandProperty FullName',
+    '}',
+  ].join('; ');
+  for (const candidate of bestEffortPowerShellLines(scanCommand, '安装目录扫描')) add(candidate, 'scanned');
+  for (const item of candidates) {
     try {
-      if (!fs.statSync(candidate).isFile()) continue;
-      const expectedName = PROFILE.id === 'workbuddy-ai' ? 'workbuddyai.exe' : 'workbuddy.exe';
-      if (path.win32.basename(candidate).toLowerCase() === expectedName) return fs.realpathSync.native(candidate);
+      if (!fs.statSync(item.path).isFile()) continue;
+      if (path.win32.basename(item.path).toLowerCase() !== expectedName.toLowerCase()) continue;
+      summary.validCandidateCount += 1;
+      summary.selectedSource = item.source;
+      summary.completed = true;
+      return fs.realpathSync.native(item.path);
     } catch (_) {}
   }
+  summary.completed = true;
   return null;
+}
+
+async function stopVerifiedLegacyManagedLifecycle(bundledNode) {
+  const legacyNode = findNode();
+  if (!legacyNode || sameWindowsPath(legacyNode, bundledNode)) return false;
+  await stopDaemonByPort(legacyNode);
+  log('已通过验证边界停止旧托管 Node 的当前 profile 生命周期');
+  return true;
+}
+
+async function nativeDaemonDiagnostics() {
+  const result = {
+    uiPort: UI_PORT,
+    watchdogAttempts: nativeWatchdogAttempts.map((item) => ({ ...item })),
+    watchdogPidFile: { present: false, valid: false, pid: null },
+    daemonLockFile: { present: false },
+  };
+  try {
+    result.listeners = listenerPids(UI_PORT);
+  } catch (error) {
+    result.listenerErrorCode = String(error && error.code || 'query-failed').slice(0, 80);
+  }
+  try {
+    const pid = readWatchdogPid();
+    result.watchdogPidFile = { present: pid !== null, valid: pid !== null, pid };
+  } catch (_) {
+    result.watchdogPidFile = { present: true, valid: false, pid: null };
+  }
+  try { result.daemonLockFile.present = fs.existsSync(path.join(DATA_DIR, '.daemon.lock')); } catch (_) {}
+  try {
+    const status = await readStatus();
+    const identity = readDaemonIdentity();
+    result.status = status ? {
+      reachable: true,
+      ok: status.ok === true,
+      pid: Number.isSafeInteger(status.pid) ? status.pid : null,
+      profileMatches: Boolean(status.profile && status.profile.id === PROFILE.id),
+      dataDirMatches: Boolean(status.dataDir && sameWindowsPath(status.dataDir, DATA_DIR)),
+      versionMatches: status.version === identity.version,
+      buildMatches: status.buildId === identity.buildId,
+      privilege: String(status.privilege || 'unknown').slice(0, 32),
+    } : { reachable: false };
+    result.statusPidMatchesListener = Boolean(status && Array.isArray(result.listeners) && result.listeners.length === 1 && status.pid === result.listeners[0]);
+  } catch (error) {
+    result.status = { reachable: false, errorCode: String(error && error.code || 'invalid-response').slice(0, 80) };
+  }
+  return result;
+}
+
+async function nativeCdpDiagnostics() {
+  const ports = await Promise.all(cdpPortCandidates().map(async (port) => {
+    const [version, targets] = await Promise.all([httpGet(port, '/json/version'), httpGet(port, '/json/list')]);
+    let targetCount = null;
+    let profileTarget = false;
+    if (targets && targets.status === 200) {
+      try {
+        const rows = JSON.parse(targets.body || '[]');
+        if (Array.isArray(rows)) {
+          targetCount = rows.length;
+          profileTarget = rows.some((target) => isTargetForProfile(target, PROFILE));
+        }
+      } catch (_) {}
+    }
+    return {
+      port,
+      versionStatus: version ? version.status : null,
+      targetsStatus: targets ? targets.status : null,
+      targetCount,
+      profileTarget,
+    };
+  }));
+  return { ports, launch: nativeLaunchState ? { ...nativeLaunchState } : null };
 }
 
 function nativeDaemonStatusMatches(status) {
@@ -1328,14 +1500,23 @@ async function ensureDaemonNative(nodeBin) {
     return true;
   }
   if (status) {
-    log('daemon 身份或版本不匹配，使用原生 helper 停止当前 profile 生命周期');
+    log('daemon 身份或版本不匹配，先检查旧托管 Node 生命周期');
+    await stopVerifiedLegacyManagedLifecycle(nodeBin);
     stopNativeLifecycle();
     await sleep(800);
   }
 
   const startWatchdog = () => {
     log('通过内置 Node 启动无 CIM watchdog: ' + nodeBin);
+    const attempt = { attempt: nativeWatchdogAttempts.length + 1, pid: null, errorCode: null, exitCode: null, signal: null };
+    nativeWatchdogAttempts.push(attempt);
     const child = spawn(nodeBin, [WATCHDOG_SCRIPT], { detached: true, stdio: 'ignore', windowsHide: true, env: process.env });
+    attempt.pid = Number.isSafeInteger(child.pid) ? child.pid : null;
+    child.once('error', (error) => { attempt.errorCode = String(error && error.code || 'spawn-error').slice(0, 80); });
+    child.once('exit', (code, signal) => {
+      attempt.exitCode = Number.isInteger(code) ? code : null;
+      attempt.signal = signal ? String(signal).slice(0, 32) : null;
+    });
     child.unref();
   };
   startWatchdog();
@@ -1345,16 +1526,21 @@ async function ensureDaemonNative(nodeBin) {
   // A previous watchdog may own the OS lock while its daemon is unhealthy.
   // Stop only the PID whose executable path is the bundled node, then retry once.
   log('首次等待 daemon 超时，原生 helper 清理精确 lifecycle 后重试');
+  await stopVerifiedLegacyManagedLifecycle(nodeBin);
   stopNativeLifecycle();
   await sleep(800);
   startWatchdog();
   status = await waitForNativeDaemon();
   if (status) return true;
-  throw new Error('等待 WorkDaddy 后台服务启动超时');
+  const error = new Error('等待 WorkDaddy 后台服务启动超时');
+  error.sentryStage = 'windows-native-launcher-daemon-timeout';
+  error.sentryExtra = { daemon: await nativeDaemonDiagnostics() };
+  throw error;
 }
 
 async function waitForWorkBuddyCdpNative(binary) {
   const launched = launchWorkBuddy(binary);
+  nativeLaunchState = launched;
   log('WorkBuddy 启动请求已派发 method=' + launched.method + ' expectedPort=' + CDP_PORT +
     (launched.pid ? ' pid=' + launched.pid : ''));
   const deadline = Date.now() + CDP_STARTUP_TIMEOUT_MS;
@@ -1390,8 +1576,13 @@ async function nativeStartupMain() {
 
   const wb = findWorkBuddyNative();
   if (!wb) {
-    await captureMessage('未找到 WorkBuddy.exe', { stage: 'windows-native-launcher-workbuddy-path' }).catch(() => {});
-    throw new Error('未找到 WorkBuddy，请先安装对应客户端');
+    const error = new Error('未找到 WorkBuddy，请先安装对应客户端');
+    error.sentryStage = 'windows-native-launcher-workbuddy-path';
+    error.sentryExtra = {
+      discovery: nativeWorkBuddyDiscoverySummary(),
+      processes: nativeWorkBuddyProcessSummary(),
+    };
+    throw error;
   }
   if (nativeWorkBuddyRunning()) {
     log('WorkBuddy 已运行但没有 CDP，交给原生启动器提示用户手动退出');
@@ -1401,7 +1592,14 @@ async function nativeStartupMain() {
   const ok = await waitForWorkBuddyCdpNative(wb);
   if (!ok) {
     await captureMessage('等待 WorkBuddy CDP 端口超时', {
-      stage: 'windows-native-launcher-cdp-timeout', extra: { cdpPort: CDP_PORT, timeoutMs: CDP_STARTUP_TIMEOUT_MS },
+      stage: 'windows-native-launcher-cdp-timeout',
+      extra: {
+        cdpPort: CDP_PORT,
+        timeoutMs: CDP_STARTUP_TIMEOUT_MS,
+        cdp: await nativeCdpDiagnostics(),
+        processes: nativeWorkBuddyProcessSummary(),
+        discovery: nativeWorkBuddyDiscoverySummary(),
+      },
     }).catch(() => {});
     return 3;
   }
@@ -1418,7 +1616,10 @@ if (require.main === module && process.env.WBSWITCH_NATIVE_LAUNCHER === '1') {
   nativeStartupMain().then((code) => process.exit(code)).catch((error) => {
     log('原生启动路径异常: ' + (error && error.stack || error));
     console.error(error && error.message || error);
-    captureException(error, { stage: 'windows-native-launcher-uncaught' })
+    captureException(error, {
+      stage: error && error.sentryStage || 'windows-native-launcher-uncaught',
+      extra: error && error.sentryExtra || {},
+    })
       .catch(() => {}).finally(() => process.exit(4));
   });
 } else if (require.main === module) (async () => {
@@ -1496,6 +1697,7 @@ if (require.main === module && process.env.WBSWITCH_NATIVE_LAUNCHER === '1') {
 });
 
 module.exports = {
+  strictPowerShellLines,
   getWorkBuddyProcesses,
   workBuddyProcesses,
   requireWorkBuddyClosedBeforeLaunch,

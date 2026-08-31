@@ -325,6 +325,18 @@ test('Windows launcher gives cold-start instances time before changing CDP ports
   assert.doesNotMatch(launcher, /diagnostics\.every\(\(p\) => p\.hasCommandLine\)/);
 });
 
+test('session module read remains usable when first-run seed persistence fails', () => {
+  const daemon = fs.readFileSync(path.join(repoRoot, 'scripts', 'daemon.js'), 'utf8');
+  const start = daemon.indexOf('function readSessionState()');
+  const end = daemon.indexOf('\nfunction writeSessionState', start);
+  assert.ok(start >= 0 && end > start);
+  const reader = daemon.slice(start, end);
+  assert.match(reader, /try\s*\{[\s\S]*writeWorkbuddySettings\(s\)/);
+  assert.match(reader, /catch \(error\)/);
+  assert.match(reader, /session-seed-persist/);
+  assert.match(reader, /return sessBuild\(st, phrases\)/);
+});
+
 test('macOS updater validates a cached/downloaded DMG before mounting it', () => {
   const daemon = read('daemon.js');
   assert.match(daemon, /hdiutil['"],\s*\['imageinfo'/);
@@ -383,6 +395,9 @@ test('release scripts synchronize daemon version and build id', () => {
   assert.match(win, /staged daemon\.js DAEMON_BUILD_ID/);
   assert.match(mac, /const DAEMON_BUILD_ID = 'release-/);
   assert.match(mac, /产物 daemon\.js 的版本或 Build ID/);
+  assert.match(mac, /PlistBuddy[^\n]+Set :CFBundleShortVersionString \$\{VERSION\}/);
+  assert.match(mac, /PlistBuddy[^\n]+Set :CFBundleVersion \$\{VERSION\}/);
+  assert.doesNotMatch(mac, /VERSION_CODE/);
 });
 
 test('daemon settings writes tolerate transient Windows file locks', () => {

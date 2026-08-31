@@ -228,8 +228,10 @@ const DATA_DIR = defaultDataDir();
 // 1.1.16：元素检查器改为 WorkDaddy 插件内弹窗，支持 DOM 树、悬停高亮和重叠元素浏览，不再提供独立页面。
 // 1.1.24：6 号官方壁纸替换为新默认图；消息导航与机器人瞳孔改为悬浮毛玻璃。
 // 1.1.25：内置官方壁纸更新时刷新数据目录旧副本；新 profile 默认启用 WorkDaddy 壁纸主题。
-const DAEMON_VERSION = '1.1.25';
-const DAEMON_BUILD_ID = 'release-1.1.25-20260830-unread-dot-theme';
+// 1.1.26：daemon 启动 30 秒后补签，并将全账号签到兜底周期缩短为 1 小时。
+// 1.1.27：修复 Windows 原生启动路径发现、旧托管 Node 升级和首次会话播种失败；补充脱敏启动诊断与匿名安装 ID。
+const DAEMON_VERSION = '1.1.27';
+const DAEMON_BUILD_ID = 'release-1.1.27-20260831-windows-sentry-diagnostics';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -2206,6 +2208,8 @@ const CHECKIN_ENDPOINTS = profileCheckinEndpoints();
 const CHECKIN_CACHE_FILE = path.join(DATA_DIR, 'checkin-cache.json');
 const CHECKIN_REQUEST_TIMEOUT_MS = 12000;
 const CHECKIN_QUEUE_DELAY_MS = 250;
+const CHECKIN_STARTUP_DELAY_MS = 30 * 1000;
+const CHECKIN_INTERVAL_MS = 60 * 60 * 1000;
 let claimInFlight = false;
 let checkinState = { running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0 };
 
@@ -3732,6 +3736,7 @@ const SESS_NS = 'session';
 const SESS_SWITCHES = ['stashEnabled', 'phraseEnabled'];
 // 首次使用时播种的默认快捷短语（仅一次；用户删除后不再补——seeded 标志已置位，删除即永久生效）
 const SESS_DEFAULT_PHRASES = ['继续执行'];
+let sessionSeedPersistReported = false;
 
 function sessBuild(st, phrases) {
   return {
@@ -3754,7 +3759,24 @@ function readSessionState() {
     }
     if (!s.wbs || typeof s.wbs !== 'object') s.wbs = {};
     s.wbs[SESS_NS] = { state: st, phrases, seeded: true };
-    writeWorkbuddySettings(s);
+    try {
+      writeWorkbuddySettings(s);
+    } catch (error) {
+      if (!sessionSeedPersistReported) {
+        sessionSeedPersistReported = true;
+        const reportError = new Error('首次会话播种持久化失败');
+        captureException(reportError, {
+          stage: 'session-seed-persist',
+          extra: {
+            platform: process.platform,
+            settingsWrite: 'first-run-session-seed',
+            errorName: String(error && error.name || 'Error').slice(0, 80),
+            errorCode: String(error && error.code || 'unknown').slice(0, 80),
+            syscall: String(error && error.syscall || 'unknown').slice(0, 80),
+          },
+        }).catch(() => {});
+      }
+    }
   }
   return sessBuild(st, phrases);
 }
@@ -7208,8 +7230,15 @@ updateDebug('daemon-start', { authFile: AUTH_FILE, dataDir: DATA_DIR, appPath: I
 restoreSleepMode();
 startServer();
 cdpLoop();
-// 每天多次兜底自动签到（面板打开也会触发），带每日缓存不会重复领
-setInterval(() => { claimDailyForAll().catch((e) => log('[checkin] 定时签到失败: ' + e.message)); }, 3 * 60 * 60 * 1000);
+// 启动后给网络和本地存储留出就绪时间，再补一轮；之后每小时兜底。
+const startupCheckinTimer = setTimeout(() => {
+  claimDailyForAll().catch((e) => log('[checkin] 启动签到失败: ' + e.message));
+}, CHECKIN_STARTUP_DELAY_MS);
+startupCheckinTimer.unref && startupCheckinTimer.unref();
+const periodicCheckinTimer = setInterval(() => {
+  claimDailyForAll().catch((e) => log('[checkin] 定时签到失败: ' + e.message));
+}, CHECKIN_INTERVAL_MS);
+periodicCheckinTimer.unref && periodicCheckinTimer.unref();
 // 自动更新：启动时检查一次（延迟 8s 等网络就绪），之后每 6 小时一次
 setTimeout(() => { checkUpdate(true).catch(() => {}); }, 8000);
 updateTimer = setInterval(() => { checkUpdate(false).catch(() => {}); }, UPDATE_CHECK_INTERVAL);
