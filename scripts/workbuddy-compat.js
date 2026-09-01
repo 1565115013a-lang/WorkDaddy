@@ -247,6 +247,41 @@
     }
   }
 
+  // Discover every mounted ConversationController by capability shape rather
+  // than volatile component/class names. Shared fibers are de-duplicated so a
+  // large conversation tree is walked once per fiber, not once per element.
+  function findConversationControllers(doc) {
+    if (!doc || typeof doc.querySelector !== 'function') return [];
+    var root = doc.querySelector('#root > div') || doc.querySelector('#root');
+    if (!root) return [];
+    var found = Object.create(null);
+    var fibers = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+    var stack = [root];
+    var visitedElements = 0;
+    while (stack.length && visitedElements++ < 1400) {
+      var element = stack.pop();
+      var fiber = reactFiber(element);
+      var seen = 0;
+      while (fiber && seen++ < 800) {
+        if (!fibers || !fibers.has(fiber)) {
+          if (fibers) fibers.add(fiber);
+          var props = fiber.memoizedProps;
+          var candidates = props && [props.value, props.controller, props.adapter];
+          for (var i = 0; candidates && i < candidates.length; i++) {
+            var candidate = candidates[i];
+            if (!isConversationController(candidate)) continue;
+            var id = String(candidate.conversationId || '').trim();
+            if (id && !found[id]) found[id] = candidate;
+          }
+        }
+        fiber = fiber.return;
+      }
+      var children = element && element.children || [];
+      for (var ci = 0; ci < children.length; ci++) stack.push(children[ci]);
+    }
+    return Object.keys(found).map(function (id) { return found[id]; });
+  }
+
   function findModernQueueAdapter(doc) {
     if (!doc || typeof doc.querySelector !== 'function') return null;
     try {
@@ -303,6 +338,41 @@
     return findModernQueueAdapter(doc) || findLegacyQueueAdapter(doc);
   }
 
+  function isSessionsResource(value) {
+    return !!value && typeof value === 'object' &&
+      typeof value.on === 'function' && typeof value.off === 'function' &&
+      (typeof value.list === 'function' || typeof value.getByIds === 'function');
+  }
+
+  // The facade publishes sessionUpdated/sessionsChanged for background sessions
+  // even after their ConversationController has left the mounted React tree.
+  function findSessionsResource(doc) {
+    var found = findQueueAdapter(doc);
+    var resource = found && found.adapter && found.adapter.sessionsResource;
+    return isSessionsResource(resource) ? resource : null;
+  }
+
+  // Sidebar records are an initial/reconciliation snapshot only. Live updates
+  // come from sessionsResource; this narrow fiber walk avoids scanning the page.
+  function findConversationListRecords(doc) {
+    if (!doc || typeof doc.querySelector !== 'function') return [];
+    try {
+      var element = doc.querySelector('.conversation-list .conversation-item') ||
+        doc.querySelector('.conversation-list');
+      var fiber = reactFiber(element);
+      var seen = 0;
+      while (fiber && seen++ < 80) {
+        var props = fiber.memoizedProps;
+        var records = props && props.allConversations;
+        if (Array.isArray(records) && records.some(function (item) {
+          return item && item.id && typeof item.status === 'string';
+        })) return records;
+        fiber = fiber.return;
+      }
+    } catch (_) {}
+    return [];
+  }
+
   function hasModernQueueSurface(doc) {
     if (!doc || typeof doc.querySelector !== 'function') return false;
     return !!findModernQueueAdapter(doc) || !!doc.querySelector(
@@ -352,8 +422,11 @@
     findLegacyQueueAdapter: findLegacyQueueAdapter,
     findModernQueueAdapter: findModernQueueAdapter,
     findQueueAdapter: findQueueAdapter,
+    findSessionsResource: findSessionsResource,
+    findConversationListRecords: findConversationListRecords,
     findMessageNavigationAdapter: findMessageNavigationAdapter,
     findMessageNavigationSurface: findMessageNavigationSurface,
+    findConversationControllers: findConversationControllers,
     getSelectedConversationId: getSelectedConversationId,
     hasModernQueueSurface: hasModernQueueSurface,
     isComposerStore: isComposerStore,

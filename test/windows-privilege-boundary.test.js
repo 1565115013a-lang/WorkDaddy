@@ -69,6 +69,20 @@ test('profile process selection rejects multiple roots and ignores other CodeBud
   );
 });
 
+test('enterprise process aliases are accepted only in the selected install directory', () => {
+  const selected = 'C:\\Company\\WorkBuddy\\workbuddy-ent.exe';
+  const names = new Set(['workbuddy-ent.exe', 'workbuddyent.exe']);
+  const rows = [
+    { ProcessId: 111, Name: 'WorkBuddyEnt.exe', ExecutablePath: 'C:\\Company\\WorkBuddy\\WorkBuddyEnt.exe' },
+    { ProcessId: 112, Name: 'WorkBuddyEnt.exe', ExecutablePath: 'D:\\Other\\WorkBuddyEnt.exe' },
+    { ProcessId: 113, Name: 'Unrelated.exe', ExecutablePath: 'C:\\Company\\WorkBuddy\\Unrelated.exe' },
+  ];
+  assert.deepEqual(
+    boundary.filterVerifiedWindowsProcesses(selected, rows, resolveWindows, names).map((row) => row.ProcessId),
+    [111]
+  );
+});
+
 test('node process identity requires exact executable, PID, and script argument', () => {
   const expectedNode = 'C:\\Node\\node.exe';
   const expectedScript = 'C:\\WorkDaddy\\scripts\\daemon.js';
@@ -233,6 +247,16 @@ test('native lifecycle stop validates the bundled node path before termination',
   assert.match(nativeSource, /exitAccessDenied/);
   assert.match(nativeSource, /exitIdentityMismatch/);
   assert.match(nativeSource, /if elevated \{[\s\S]*return true, exitAccessDenied/);
+});
+
+test('native termination maps TerminateProcess access denial to the permission exit code', () => {
+  const start = nativeSource.indexOf('result, _, callErr := procTerminateProcess.Call');
+  const end = nativeSource.indexOf('\n\twaitResult, _, callErr := procWaitForSingleObject.Call', start);
+  assert.ok(start >= 0 && end > start);
+  const branch = nativeSource.slice(start, end);
+  assert.match(branch, /if result == 0/);
+  assert.match(branch, /errors\.Is\(callErr, syscall\.ERROR_ACCESS_DENIED\)/);
+  assert.match(branch, /return false, exitAccessDenied/);
 });
 
 test('packaged scripts contain no WorkBuddy image-name kill or stale elevation helper', () => {

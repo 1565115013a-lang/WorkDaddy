@@ -412,6 +412,7 @@ test('daemon settings writes tolerate transient Windows file locks', () => {
   const settingsEnd = daemon.indexOf('\n}\n\nfunction buildAskRuleBlock', settingsStart);
   const appStart = daemon.indexOf('function writeAppConfig(');
   const appEnd = daemon.indexOf('\n}\nfunction acBlock', appStart);
+  assert.match(daemon.slice(settingsStart, settingsEnd), /mkdirSync\(path\.dirname\(file\),\s*\{\s*recursive:\s*true\s*\}\)/);
   assert.match(daemon.slice(settingsStart, settingsEnd), /replaceFileWithRetry\(file/);
   assert.match(daemon.slice(appStart, appEnd), /replaceFileWithRetry\(file/);
   assert.doesNotMatch(daemon.slice(settingsStart, settingsEnd), /file \+ '\\.wbs-tmp'/);
@@ -1020,6 +1021,9 @@ test('automatic session copy includes workspace-only rules when the initial plan
   assert.match(daemon, /hasSourceAutoCopyRules/);
   assert.match(daemon, /hasPendingAutoCopyTo\(uid\)/);
   assert.match(daemon, /startAutoCopyJob\(sourceUid, uid, autoCopyPlan\)/);
+  assert.match(daemon, /syncAutoCopyLineage\(src\.lineageId, targetUid\)/);
+  assert.match(daemon, /selectLatestAutoCopyMember\(live\)/);
+  assert.match(daemon, /lineageId = ensureAutoCopySession\(DATA_DIR, source, row\.id\)/);
   assert.match(inject, /data-auto-kind="' \+ kind \+ '"/);
   assert.match(inject, /autoCopyButton\('workspace'/);
   assert.match(inject, /autoCopyButton\('session'/);

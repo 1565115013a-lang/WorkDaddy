@@ -78,6 +78,8 @@ const {
   setAutoCopyRule,
   getAutoCopySession,
   getAutoCopySessionMembers,
+  getAutoCopySessionMemberRecords,
+  selectLatestAutoCopyMember,
   ensureAutoCopySession,
   addAutoCopySessionMember,
   moveAutoCopySession,
@@ -230,8 +232,11 @@ const DATA_DIR = defaultDataDir();
 // 1.1.25：内置官方壁纸更新时刷新数据目录旧副本；新 profile 默认启用 WorkDaddy 壁纸主题。
 // 1.1.26：daemon 启动 30 秒后补签，并将全账号签到兜底周期缩短为 1 小时。
 // 1.1.27：修复 Windows 原生启动路径发现、旧托管 Node 升级和首次会话播种失败；补充脱敏启动诊断与匿名安装 ID。
-const DAEMON_VERSION = '1.1.27';
-const DAEMON_BUILD_ID = 'release-1.1.27-20260831-windows-sentry-diagnostics';
+// 1.1.28：Windows 安装向导支持选择并锁定 WorkBuddy 客户端，企业版使用进程级环境变量 CDP。
+// 1.1.28：修复首次会话播种的 profile 目录缺失，以及 native lifecycle helper 误计自身进程。
+// 1.1.29：自动复制会话按 lineage 内最新消息文件做双向全成员同步，避免跨账号往返后历史分叉。
+const DAEMON_VERSION = '1.1.29';
+const DAEMON_BUILD_ID = 'release-1.1.29-20260831-merged-release';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -243,7 +248,7 @@ let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（可能回退到当前 pr
 const PROFILE_CDP_PORT = { 'workbuddy-cn': 9222, 'workbuddy-ai': 9223, 'codebuddy-cn': 9224, 'codebuddy-intl': 9225 };
 const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
   ? parseInt(process.env.WBSWITCH_CDP_PORT, 10)
-  : (PROFILE_CDP_PORT[PROFILE.id] || null);
+  : (Number(PROFILE.cdp && PROFILE.cdp.port) || PROFILE_CDP_PORT[PROFILE.id] || null);
 const CDP_PORT_FILE = path.join(DATA_DIR, 'cdp-port.json');
 const UI_PORT_FILE = path.join(DATA_DIR, 'ui-port.json');
 const API_TOKEN_FILE = path.join(DATA_DIR, '.api-token');
@@ -1730,10 +1735,10 @@ const WORKBUDDY_APP_NAME = path.basename(WORKBUDDY_APP).replace(/\.app$/i, '');
 // Windows：解析 WorkBuddy 可执行文件真实路径（安装盘可自定义，必须动态查）
 // 优先级：WBSWITCH_WORKBUDDY_BIN > 运行进程 Path > 注册表卸载项 > 常见路径
 let wbBinaryCache = null;
-const PROFILE_BINARY_NAMES = new Set(
-  PROFILE.id === 'workbuddy-ai' ? ['workbuddyai.exe'] :
-    PROFILE.id === 'workbuddy-cn' ? ['workbuddy.exe'] : ['codebuddy.exe']
-);
+const PROFILE_BINARY_NAMES = new Set((
+  PROFILE.binaryNames || (PROFILE.id === 'workbuddy-ai' ? ['workbuddyai.exe'] :
+    PROFILE.id === 'workbuddy-cn' ? ['workbuddy.exe'] : ['codebuddy.exe'])
+).map((name) => String(name).toLowerCase()));
 function queryWindowsWorkBuddyProcesses() {
   const names = [...PROFILE_BINARY_NAMES].map((name) => `\"${name}\"`).join(',');
   const helper = path.join(__dirname, 'windows-process-boundary.ps1');
@@ -1782,7 +1787,9 @@ function resolveWorkBuddyBinary() {
     return (wbBinaryCache = envBin);
   }
   if (configuredBin) {
-    if (runningBin && !sameWindowsPath(runningBin, configuredBin)) {
+    const sameConfiguredInstall = runningBin && PROFILE_BINARY_NAMES.has(path.win32.basename(runningBin).toLowerCase()) &&
+      sameWindowsPath(path.win32.dirname(runningBin), path.win32.dirname(configuredBin));
+    if (runningBin && !sameConfiguredInstall) {
       throw new Error('检测到当前 profile 正从另一安装目录运行，登录信息未修改');
     }
     return (wbBinaryCache = configuredBin);
@@ -1914,7 +1921,9 @@ async function restoreWorkBuddyWindow(pid) {
 function verifiedWindowsWorkBuddyProcesses(binary) {
   if (!binary) throw new Error('未找到 WorkBuddy 可执行文件，无法验证运行中的进程');
   const processes = queryWindowsWorkBuddyProcesses();
-  const verified = filterVerifiedWindowsProcesses(binary, processes);
+  const verified = filterVerifiedWindowsProcesses(
+    binary, processes, fs.realpathSync.native, PROFILE.customTarget ? PROFILE_BINARY_NAMES : null
+  );
   if (processes.length !== verified.length) {
     throw new Error('存在当前 profile 进程，但没有进程属于已验证安装目录；登录信息未修改');
   }
@@ -2022,8 +2031,12 @@ function relaunchWorkBuddy() {
     if (IS_WIN) {
       const bin = resolveWorkBuddyBinary();
       if (!bin) throw new Error('未找到 WorkBuddy.exe（可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定）');
-      log(`[logout] 以 --remote-debugging-port=${port} 重启 WorkBuddy: ${bin}`);
-      const child = spawn(bin, [`--remote-debugging-port=${port}`], { detached: true, stdio: 'ignore', windowsHide: true });
+      const environmentMode = !!(PROFILE.cdp && PROFILE.cdp.mode === 'environment');
+      log(`[logout] 以 ${environmentMode ? '环境变量' : '命令行参数'} CDP=${port} 重启 WorkBuddy: ${bin}`);
+      const child = spawn(bin, environmentMode ? [] : [`--remote-debugging-port=${port}`], {
+        detached: true, stdio: 'ignore', windowsHide: true,
+        env: environmentMode ? { ...process.env, WORKBUDDY_REMOTE_DEBUGGING_PORT: String(port) } : process.env,
+      });
       await new Promise((resolve, reject) => {
         child.once('error', reject);
         child.once('spawn', resolve);
@@ -2756,6 +2769,87 @@ function copySessionFiles(wbHome, oldId, newId) {
   return result;
 }
 
+function sessionContentMtime(wbHome, sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) return 0;
+  let latest = 0;
+  const visit = (target) => {
+    let stat;
+    try { stat = fs.lstatSync(target); } catch (_) { return; }
+    if (stat.isSymbolicLink()) return;
+    if (stat.isFile()) { latest = Math.max(latest, Number(stat.mtimeMs || 0)); return; }
+    if (!stat.isDirectory()) return;
+    let entries;
+    try { entries = fs.readdirSync(target, { withFileTypes: true }); } catch (_) { return; }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      visit(path.join(target, entry.name));
+    }
+  };
+  const projects = path.join(wbHome, 'projects');
+  try {
+    for (const entry of fs.readdirSync(projects, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      visit(path.join(projects, entry.name, id + '.jsonl'));
+      visit(path.join(projects, entry.name, id));
+    }
+  } catch (_) {}
+  for (const target of [
+    path.join(wbHome, 'workspace', 'sessions', id),
+    path.join(wbHome, 'tasks', id),
+    path.join(wbHome, 'file-history', id),
+    path.join(wbHome, 'artifact-index', id + '.json'),
+  ]) visit(target);
+  return latest;
+}
+
+// Reconcile every live member of a shared lineage.  A switch can arrive after
+// either account has received new messages, so the active account is not a
+// reliable source of truth; choose the freshest on-disk snapshot first.
+async function syncAutoCopyLineage(lineageId, targetUid) {
+  if (!lineageId || PROFILE.kind !== 'workbuddy') return { members: 0, synced: 0, failedFiles: 0, targetIds: [], targetPresent: false };
+  const records = getAutoCopySessionMemberRecords(DATA_DIR, lineageId);
+  if (!records.length) return { members: 0, synced: 0, failedFiles: 0, targetIds: [], targetPresent: false };
+  const live = [];
+  for (const member of records) {
+    const rows = await sqliteQuery(
+      'SELECT ' + SESSION_COPY_COLUMNS.join(',') + ' FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1;',
+      [member.id, member.uid]
+    );
+    if (!rows.length) continue;
+    live.push(Object.assign({}, member, {
+      row: rows[0],
+      contentMtime: sessionContentMtime(PROFILE.dataRoot, member.id),
+      updatedAt: Number(rows[0].updated_at || rows[0].last_activity_at || rows[0].created_at || 0),
+    }));
+  }
+  const targetIds = live.map((member) => member.id);
+  const targetPresent = targetUid === undefined || live.some((member) => member.uid === String(targetUid || '').trim());
+  if (live.length < 2) return { members: live.length, synced: 0, failedFiles: 0, targetIds, targetPresent };
+  const latest = selectLatestAutoCopyMember(live);
+  if (!latest) return { members: live.length, synced: 0, failedFiles: 0, targetIds, targetPresent };
+  const sourceRow = latest.row;
+  let synced = 0;
+  let failedFiles = 0;
+  for (const target of live) {
+    if (target.id === latest.id) continue;
+    const files = copySessionFiles(PROFILE.dataRoot, latest.id, target.id);
+    synced++;
+    failedFiles += files.failed;
+    try {
+      await sqliteRun(
+        'UPDATE sessions SET title = ?, custom_title = ?, status = ?, updated_at = ?, last_activity_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL;',
+        [sourceRow.title || '', sourceRow.custom_title || '', sourceRow.status || 'Pending',
+          Number(sourceRow.updated_at || Date.now()), Number(sourceRow.last_activity_at || sourceRow.updated_at || Date.now()),
+          target.id, target.uid]
+      );
+    } catch (error) {
+      log(`[sessions-auto-copy] 同步会话元数据失败 ${target.uid}/${target.id}: ${error.message}`);
+    }
+  }
+  return { members: live.length, synced, failedFiles, sourceId: latest.id, targetIds, targetPresent };
+}
+
 const MAX_SESSION_EXPORT_BYTES = 256 * 1024 * 1024;
 const MAX_SESSION_EXPORT_FILES = 20000;
 
@@ -3069,7 +3163,16 @@ async function buildAutoCopyPlan(sourceUid, targetUid) {
   const workspaceSet = new Set(rules.workspaces.map(canonicalWorkspace));
   return rows
     .filter((row) => sessionSet.has(String(row.id)) || workspaceSet.has(canonicalWorkspace(row.cwd)))
-    .map((row) => Object.assign({}, row, { lineageId: rules.lineages[String(row.id)] || null }));
+    .map((row) => {
+      let lineageId = rules.lineages[String(row.id)] || null;
+      // Workspace rules also represent shared sessions.  Give each matching
+      // row a lineage so later switches reuse one target and reconcile its
+      // newest snapshot instead of inserting a duplicate every time.
+      if (!lineageId && workspaceSet.has(canonicalWorkspace(row.cwd))) {
+        lineageId = ensureAutoCopySession(DATA_DIR, source, row.id);
+      }
+      return Object.assign({}, row, { lineageId });
+    });
 }
 
 const autoCopyJobs = new Map();
@@ -3142,11 +3245,27 @@ function startAutoCopyJob(sourceUid, targetUid, plan) {
     job.total = job.plan.length;
     for (const src of job.plan) {
       try {
-        const result = await copySessionRecord(src, targetUid, {
-          sourceUid,
-          lineageId: src.lineageId || undefined,
-          auto: true,
-        });
+        let result;
+        if (src.lineageId) {
+          // If the target already belongs to this lineage, reconcile all
+          // members before/after the switch instead of blindly overwriting it
+          // from the account that happened to be active most recently.
+          const synced = await syncAutoCopyLineage(src.lineageId, targetUid);
+          if (synced.targetPresent) {
+            result = { status: synced.failedFiles ? 'partial' : 'skipped', failedFiles: synced.failedFiles };
+          } else {
+            result = await copySessionRecord(src, targetUid, {
+              sourceUid,
+              lineageId: src.lineageId,
+              auto: true,
+            });
+            const synced = await syncAutoCopyLineage(src.lineageId, targetUid);
+            result.failedFiles = (result.failedFiles || 0) + synced.failedFiles;
+            if (synced.failedFiles) result.status = 'partial';
+          }
+        } else {
+          result = await copySessionRecord(src, targetUid, { sourceUid, auto: true });
+        }
         if (result.status === 'skipped') job.skipped++;
         else if (result.status === 'partial') job.partial++;
         else job.copied++;
@@ -3324,8 +3443,10 @@ function isAllowedApiOrigin(origin) {
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
     const host = String(u.hostname || '').toLowerCase();
     // WorkBuddy 的 renderer 可能是官方网页来源，也可能是 loopback DevTools 页面。
-    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' ||
-      host === 'workbuddy.cn' || host.endsWith('.workbuddy.cn') ||
+    const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+    if (loopback) return true;
+    if (PROFILE.customTarget) return !!PROFILE.apiHost && u.origin === PROFILE.apiHost;
+    return host === 'workbuddy.cn' || host.endsWith('.workbuddy.cn') ||
       host === 'workbuddy.ai' || host.endsWith('.workbuddy.ai') ||
       host === 'codebuddy.cn' || host.endsWith('.codebuddy.cn') ||
       host === 'codebuddy.ai' || host.endsWith('.codebuddy.ai');
@@ -3411,6 +3532,7 @@ function readWorkbuddySettings() {
 
 function writeWorkbuddySettings(settings) {
   const file = workbuddySettingsPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   replaceFileWithRetry(file, JSON.stringify(settings, null, 2) + '\n');
 }
 
