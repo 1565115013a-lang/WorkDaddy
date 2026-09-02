@@ -107,6 +107,7 @@ const { fetchUsageSinceAnchor, startOfLocalDay } = require('./credit-request-usa
 const { createCreditUsageStore } = require('./credit-usage-store.js');
 const { classifyCheckinResult } = require('./checkin-result.js');
 const { fetchGrowthTodayActive } = require('./growth-active.js');
+const { fetchTravelConfig, fetchTravelStatus, departTravel } = require('./growth-travel.js');
 const {
   captureException,
   captureMessage,
@@ -237,8 +238,10 @@ const DATA_DIR = defaultDataDir();
 // 1.1.28：修复首次会话播种的 profile 目录缺失，以及 native lifecycle helper 误计自身进程。
 // 1.1.29：自动复制会话按 lineage 内最新消息文件做双向全成员同步，避免跨账号往返后历史分叉。
 // 1.1.30：新增「今日活跃」查询接口（成长中心热力墙 is_active），复用签到 Bearer 鉴权与 profile 归属域名。
-const DAEMON_VERSION = '1.1.30';
-const DAEMON_BUILD_ID = 'release-1.1.30-20260901-growth-active';
+// 1.1.31：账号卡片新增「今日活跃」标签与「派猫猫旅行」标签；新增「一键活跃」（新建会话+对话+删除会话）
+//         与「自动派猫猫旅行」（签到结束后多账号依次 depart，报错跳过）。
+const DAEMON_VERSION = '1.1.33';
+const DAEMON_BUILD_ID = 'release-1.1.33-20260902-generation-done-fix';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -1727,6 +1730,32 @@ async function reloadWorkBuddyPage() {
   await cdpSend('Page.reload', { ignoreCache: false });
 }
 
+/** 切换账号专用刷新：清掉 URL 里的 accountSnapshot（旧账号登录快照）再导航，强制渲染器重新从磁盘 auth 文件读登录态。
+ *  根因：Page.reload 保留启动时注入的 accountSnapshot（含旧 uid），与 switchTo 写盘的新 auth 文件冲突，
+ *  触发 [Router] resetRouterToHome 导航错误，严重时渲染器闪退。 */
+async function reloadWorkBuddyPageForSwitch() {
+  if (!cdp.connected) throw new Error('CDP 未连接，无法自动刷新窗口');
+  const r = await cdpSend('Runtime.evaluate', {
+    expression: `(function(){return location.href;})()`,
+    returnByValue: true,
+  });
+  const href = r && r.result && r.result.value ? String(r.result.value) : '';
+  let clean = href;
+  try {
+    const u = new URL(href);
+    u.searchParams.delete('accountSnapshot');
+    clean = u.href;
+  } catch (_) {
+    // href 非法时回退到去掉查询串里 accountSnapshot 的朴素处理
+    clean = href.replace(/([?&])accountSnapshot=[^&]*/i, '$1').replace(/[?&]$/, '');
+  }
+  if (clean && clean !== href) {
+    await cdpSend('Page.navigate', { url: clean });
+  } else {
+    await cdpSend('Page.reload', { ignoreCache: true });
+  }
+}
+
 const WORKBUDDY_TARGET = IS_WIN ? null : readWorkBuddyTarget({ dataDir: DATA_DIR, profileId: PROFILE.id });
 const WORKBUDDY_APP = IS_WIN ? '' : (WORKBUDDY_TARGET.binary
   ? path.resolve(WORKBUDDY_TARGET.binary, '../../..')
@@ -2369,11 +2398,471 @@ async function claimDailyForAll() {
       if (i < list.length - 1 && !result.skipped) await sleep(CHECKIN_QUEUE_DELAY_MS);
     }
     log('[checkin] 本轮回检 ' + results.length + ' 个账号');
+    // 自动签到结束后，自动派猫猫旅行（多账号依次进行，报错跳过；带每日缓存，幂等）
+    departTravelForAll().catch((e) => log('[travel] 自动派猫猫旅行失败: ' + e.message));
     return { total: results.length, results };
   } finally {
     checkinState.running = false;
     checkinState.finishedAt = Date.now();
     claimInFlight = false;
+  }
+}
+
+/* ================= 成长中心：派猫猫旅行 & 一键活跃 ================= */
+
+// 成长中心仅国内 WorkBuddy 开放（国际版无 growth-center）；region==='cn' 时才启用。
+const GROWTH_CN = PROFILE.region === 'cn';
+
+// ---- 派猫猫旅行状态机（面板轮询用）：idle | running ----
+const TRAVEL_CACHE_FILE = path.join(DATA_DIR, 'travel-cache.json');
+const TRAVEL_QUEUE_DELAY_MS = 300;
+let travelInFlight = false;
+let travelState = { running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0, results: [] };
+
+function travelSnapshot() {
+  return Object.assign({}, travelState, { running: !!travelInFlight });
+}
+
+function loadTravelCache() {
+  try {
+    return JSON.parse(fs.readFileSync(TRAVEL_CACHE_FILE, 'utf8')) || {};
+  } catch (_) {
+    return {};
+  }
+}
+function saveTravelCache(cache) {
+  try {
+    fs.writeFileSync(TRAVEL_CACHE_FILE, JSON.stringify(cache, null, 2));
+  } catch (e) {
+    log('[travel] 写入缓存失败: ' + e.message);
+  }
+}
+
+/** 今日旅行状态展示值（用于 /api/accounts 回显账号卡片标签） */
+function travelDisplayValue(cache, uid, today) {
+  if (!cache || cache.date !== today) return null;
+  const r = cache.results && cache.results[String(uid)];
+  if (!r) return null;
+  return { ok: !!r.ok, already: !!r.already, skip: r.skip || null, state: r.state || null, message: r.message || '' };
+}
+
+function readAccountToken(uid) {
+  const file = path.join(DATA_DIR, 'accounts', uid + '.info');
+  if (!fs.existsSync(file)) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return j.auth && j.auth.accessToken ? String(j.auth.accessToken) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** 对单个账号派猫猫旅行：取 config 第一个地点 -> depart。报错分类处理（返回而非抛错）。 */
+async function departTravelForUid(uid) {
+  const tk = readAccountToken(uid);
+  if (!tk) return { uid, ok: false, skip: 'no-accessToken', message: '无 accessToken' };
+  try {
+    const cfg = await fetchTravelConfig(tk, { apiHost: PROFILE.apiHost });
+    if (!cfg.enabled || !cfg.locations.length) {
+      return { uid, ok: false, skip: 'no-location', message: '无旅行地点' };
+    }
+    const locationId = cfg.locations[0].id;
+    const r = await departTravel(tk, locationId, { apiHost: PROFILE.apiHost });
+    return { uid, ok: true, already: false, state: r.state, locationId, message: '', at: Date.now() };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/already traveling/i.test(msg)) {
+      return { uid, ok: true, already: true, state: 'traveling', message: '已在旅行中', at: Date.now() };
+    }
+    if (/daily limit/i.test(msg) || (e && e.httpStatus === 429)) {
+      return { uid, ok: true, already: true, skip: 'daily-limit', message: '今日已派', at: Date.now() };
+    }
+    if (/no active buddy/i.test(msg)) {
+      return { uid, ok: false, skip: 'no-buddy', message: '无 Buddy' };
+    }
+    if (/location not available/i.test(msg)) {
+      return { uid, ok: false, skip: 'location-unavailable', message: '地点不可用' };
+    }
+    return { uid, ok: false, skip: 'error', message: msg.slice(0, 80) };
+  }
+}
+
+/** 对所有账号依次派猫猫旅行（报错跳过；每日缓存幂等）。 */
+async function departTravelForAll() {
+  if (!GROWTH_CN) return { skipped: true, reason: 'profile-not-cn' };
+  if (!PROFILE.capabilities.accounts) return { skipped: true, reason: 'profile-no-account-files' };
+  if (travelInFlight) return { skipped: true, reason: 'in-flight' };
+  const today = todayStr();
+  const cache = loadTravelCache();
+  if (cache.date === today && cache.completed) {
+    return { skipped: true, reason: 'already-today', results: Object.values(cache.results || {}) };
+  }
+  travelInFlight = true;
+  try {
+    const list = listAccounts(DATA_DIR).map((a) => a.uid);
+    travelState = { running: true, total: list.length, done: 0, startedAt: Date.now(), finishedAt: 0, results: [] };
+    const results = [];
+    for (let i = 0; i < list.length; i++) {
+      const uid = list[i];
+      let result;
+      try {
+        result = await departTravelForUid(uid);
+      } catch (e) {
+        result = { uid, ok: false, skip: 'error', message: e.message };
+      }
+      results.push(result);
+      travelState.done = i + 1;
+      travelState.results = results.slice();
+      if (i < list.length - 1) await sleep(TRAVEL_QUEUE_DELAY_MS);
+    }
+    const byUid = {};
+    results.forEach((r) => { byUid[r.uid] = r; });
+    saveTravelCache({ date: today, completed: true, results: byUid });
+    log('[travel] 本轮派猫猫旅行 ' + results.length + ' 个账号');
+    return { total: results.length, results };
+  } finally {
+    travelState.running = false;
+    travelState.finishedAt = Date.now();
+    travelInFlight = false;
+  }
+}
+
+// ---- 一键活跃状态机（面板轮询用） ----
+const ACTIVATE_QUEUE_DELAY_MS = 1200;
+let activateInFlight = false;
+let activateState = { running: false, total: 0, done: 0, currentUid: null, startedAt: 0, finishedAt: 0, results: [] };
+
+function activateSnapshot() {
+  return Object.assign({}, activateState, { running: !!activateInFlight });
+}
+
+/** 通过 CDP 读取当前激活会话的 conversationId（adapter 优先，其次 URL 参数 / active 的 data-conversation-id） */
+async function cdpCurrentConversationId() {
+  if (!cdp.connected) return null;
+  const expr = `(function(){
+    try {
+      var a = window.__wbsAdapter && window.__wbsAdapter.currentActiveSessionId;
+      if (a) return String(a);
+      var m = location.search.match(/[?&](?:conversationId|conversation_id)=([^&]+)/i);
+      if (m) return decodeURIComponent(m[1]);
+      var el = document.querySelector('[data-conversation-id].active,[data-conversation-id][aria-selected="true"],[class*="conversation"][class*="active"]');
+      if (el) return el.getAttribute('data-conversation-id') || null;
+      return null;
+    } catch (e) { return null; }
+  })()`;
+  const r = await cdpSend('Runtime.evaluate', { expression: expr, returnByValue: true });
+  const v = r && r.result && r.result.value;
+  return v ? String(v) : null;
+}
+
+/** 通过 CDP 判断当前是否正在生成。
+ *  双信号：①「停止/停止生成」类按钮可见；② 最后一条 assistant 消息仍处于 streaming/loading/generating 状态。
+ *  两个信号都消失才视为已结束。 */
+/** 等待 composer（输入框）出现并稳定，避免 Page.reload 后 SPA 尚未挂载就发 CDP 操作导致渲染器异常/闪退 */
+async function waitForComposerReady(timeoutMs = 15000) {
+  if (!cdp.connected) return false;
+  const start = Date.now();
+  let lastSeen = 0;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const r = await cdpSend('Runtime.evaluate', {
+        expression: `(function(){var ce=document.querySelector('.chat-container [contenteditable="true"]')||document.querySelector('[contenteditable="true"]');if(!ce)return false;var b=ce.getBoundingClientRect();return b.width>0&&b.height>0;})()`,
+        returnByValue: true,
+      });
+      if (r && r.result && r.result.value) {
+        if (lastSeen && Date.now() - lastSeen >= 600) return true; // 连续可见 600ms 视为稳定
+        if (!lastSeen) lastSeen = Date.now();
+      } else {
+        lastSeen = 0;
+      }
+    } catch (_) {
+      lastSeen = 0;
+    }
+    await sleep(200);
+  }
+  return false;
+}
+
+/** 通过 CDP 新建一个空会话（best-effort：尝试常见「新建对话」按钮文案） */
+async function cdpNewConversation() {
+  if (!cdp.connected) return;
+  const texts = ['新建对话', '新对话', '新建会话', '开始新对话', '新建任务'];
+  for (const text of texts) {
+    try {
+      await clickByText(text, { exact: false });
+      return;
+    } catch (_) {
+      /* 尝试下一个文案 */
+    }
+  }
+}
+
+/** 通过 CDP 选择对话模型：点开 .cr-model-selector__trigger，在弹出层点匹配的 .cr-model-selector__item。
+ *  返回 true/false（选择成功与否），失败不影响对话流程但会记录日志。 */
+async function cdpSelectModel(model) {
+  if (!cdp.connected || !model) return false;
+  const name = String(model).trim();
+  if (!name) return false;
+  try {
+    // 1. 打开模型选择器：优先稳定类名，兜底关键词匹配（旧版 DOM）
+    const openRes = await cdpSend('Runtime.evaluate', {
+      expression: `(function(){
+        var el = document.querySelector('.cr-model-selector__trigger') || document.querySelector('.cr-model-selector');
+        if (!el) {
+          var els = document.querySelectorAll('button,[role="button"]');
+          for (var i=0;i<els.length;i++){
+            var e=els[i]; var t=(e.textContent||'').trim();
+            if(!t||t.length>40)continue;
+            if(!/model|模型|deepseek|glm|kimi|claude|gpt|qwen|hunyuan|hy\\d/i.test(t))continue;
+            el=e;break;
+          }
+        }
+        if(!el)return null;
+        var b=el.getBoundingClientRect();
+        if(b.width<=0||b.height<=0)return null;
+        el.scrollIntoView({block:'center'});
+        var b2=el.getBoundingClientRect();
+        return {x:b2.x+b2.width/2,y:b2.y+b2.height/2};
+      })()`,
+      returnByValue: true,
+    });
+    const open = openRes && openRes.result && openRes.result.value;
+    if (!open || !open.x) {
+      log('[growth-activate] 模型选择器按钮未找到，跳过模型选择');
+      return false;
+    }
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x: open.x, y: open.y, button: 'left', clickCount: 1 });
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x: open.x, y: open.y, button: 'left', clickCount: 1 });
+    await sleep(500);
+    // 2. 在弹出层里找目标模型项：优先 item-name 精确匹配（忽略大小写），再 contains。
+    //    精确优先避免「Hy3」误中「Hy4 preview」。
+    const escaped = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const pickRes = await cdpSend('Runtime.evaluate', {
+      expression: `(function(){
+        var want = '${escaped}'.toLowerCase();
+        var items = document.querySelectorAll('.cr-model-selector__item');
+        var hit = null;
+        for (var pass=0; pass<2 && !hit; pass++) {
+          for (var i=0;i<items.length;i++){
+            var it=items[i];
+            var nameEl = it.querySelector('.cr-model-selector__item-name') || it;
+            var t=(nameEl.textContent||'').trim();
+            if(!t)continue;
+            var match = pass===0 ? t.toLowerCase()===want : t.toLowerCase().indexOf(want)>=0;
+            if(!match)continue;
+            hit=it;break;
+          }
+        }
+        if(!hit)return null;
+        try{hit.scrollIntoView({block:'nearest'});}catch(_){}
+        var b=hit.getBoundingClientRect();
+        if(b.width<=0||b.height<=0)return null;
+        var name2=(hit.querySelector('.cr-model-selector__item-name')||hit).textContent.trim();
+        return {x:b.x+b.width/2,y:b.y+b.height/2,name:name2};
+      })()`,
+      returnByValue: true,
+    });
+    const item = pickRes && pickRes.result && pickRes.result.value;
+    if (!item || !item.x) {
+      log('[growth-activate] 模型列表中未找到「' + name + '」，跳过模型选择');
+      // 收起弹出层，避免遮挡后续 composer 操作
+      await cdpSend('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+      await cdpSend('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }).catch(() => {});
+      return false;
+    }
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mouseMoved', x: item.x, y: item.y });
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x: item.x, y: item.y, button: 'left', clickCount: 1 });
+    await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x: item.x, y: item.y, button: 'left', clickCount: 1 });
+    await sleep(400);
+    log('[growth-activate] 已选择模型: ' + item.name);
+    return true;
+  } catch (e) {
+    log('[growth-activate] 模型选择异常（继续用默认模型）: ' + e.message);
+    return false;
+  }
+}
+
+/** 删除一键活跃产生的临时会话：删消息文件 + 删 DB 记录（best-effort） */
+async function deleteGrowthSession(uid, sessionId) {
+  if (!isValidSessionId(sessionId)) return 0;
+  const wbHome = PROFILE.dataRoot;
+  let filesRemoved = 0;
+  try {
+    filesRemoved = deleteSessionFiles(wbHome, sessionId);
+  } catch (e) {
+    log('[growth-activate] 删除会话文件失败 ' + sessionId + ': ' + e.message);
+  }
+  try {
+    await sqliteRun('DELETE FROM sessions WHERE id = ?;', [sessionId]);
+  } catch (_) {
+    /* DB 无记录则忽略 */
+  }
+  return filesRemoved;
+}
+
+/** 单个账号「一键活跃」：未活跃则切换账号 → 新建会话 → 发送对话 → 等待完成 → 校验活跃 → 删除会话 */
+async function activateOneAccount(uid, message, model) {
+  const tk = readAccountToken(uid);
+  if (!tk) return { uid, ok: false, reason: 'no-accessToken', message: '无 accessToken' };
+  // 已活跃直接跳过
+  try {
+    const active = await fetchGrowthTodayActive(tk, { apiHost: PROFILE.apiHost });
+    if (active.is_active) return { uid, ok: true, skipped: true, reason: 'already-active', active: true };
+  } catch (_) {
+    /* 查询失败继续尝试对话，不阻塞 */
+  }
+  if (!cdp.connected) return { uid, ok: false, reason: 'no-cdp', message: 'CDP 未连接' };
+  // 切换账号并刷新
+  switchTo(DATA_DIR, uid, log);
+  await reloadWorkBuddyPageForSwitch();
+  await waitPageLoaded(8000);
+  // 关键：等 composer 就绪，避免 SPA 半初始化时发 CDP 操作导致闪退
+  await waitForComposerReady(15000);
+  await sleep(1500);
+  // 记录新建会话前的会话 id：只有新建成功（前后 id 不同）才在最后删除，避免误删用户已有会话。
+  const beforeSid = await cdpCurrentConversationId().catch(() => null);
+  // 新建会话 + 选模型
+  await cdpNewConversation().catch(() => {});
+  await sleep(900);
+  const modelSelected = await cdpSelectModel(model);
+  await sleep(500);
+  // 发送对话内容（默认「只输出你的名字」）
+  await acSendPhrase(message || '只输出你的名字');
+  // 等待生成完成（连续稳定判定，确保对话真正结束）
+  await waitGenerationDone(120000);
+  // 校验今日活跃
+  let activeNow = false;
+  try {
+    activeNow = (await fetchGrowthTodayActive(tk, { apiHost: PROFILE.apiHost })).is_active;
+  } catch (_) {
+    /* 校验失败按未活跃处理 */
+  }
+  let deleted = 0;
+  if (activeNow) {
+    const sid = await cdpCurrentConversationId().catch(() => null);
+    if (sid && sid !== beforeSid) deleted = await deleteGrowthSession(uid, sid);
+  }
+  return { uid, ok: activeNow, active: activeNow, deleted, model: modelSelected ? model : '默认（未选中 ' + model + '）', message: activeNow ? '已活跃' : '未活跃' };
+}
+
+/** 读取生成状态双信号（一次 evaluate）：停止按钮是否可见 + 最后一条可见 assistant 消息文本长度。
+ *  文本长度是流式输出的直接证据，比 streaming class 稳定。 */
+async function readGenSignals() {
+  if (!cdp.connected) return { stop: true, len: -1 };
+  const expr = `(function(){
+    try {
+      var stop = false;
+      var els = document.querySelectorAll('button,[role="button"]');
+      for (var i = 0; i < els.length; i++) {
+        var t = ((els[i].getAttribute('aria-label') || '') + ' ' + (els[i].textContent || '') + ' ' + (els[i].getAttribute('title') || '')).toLowerCase();
+        if (/停止生成|停止|stop|abort|cancel/i.test(t)) {
+          var b = els[i].getBoundingClientRect();
+          if (b.width > 0 && b.height > 0) { stop = true; break; }
+        }
+      }
+      var len = 0;
+      var sels = ['[data-message-role="assistant"]','[data-role="assistant"]','.cb-markdown','[class*="assistantMessage"]','[class*="assistant-message"]'];
+      outer:
+      for (var s = 0; s < sels.length; s++) {
+        var found = document.querySelectorAll(sels[s]);
+        for (var j = found.length - 1; j >= 0; j--) {
+          var n = found[j];
+          var b2 = n.getBoundingClientRect();
+          if (b2.width <= 0 || b2.height <= 0) continue;
+          len = (n.textContent || '').length;
+          break outer;
+        }
+      }
+      return { stop: stop, len: len };
+    } catch (e) { return { stop: true, len: -1 }; }
+  })()`;
+  const r = await cdpSend('Runtime.evaluate', { expression: expr, returnByValue: true });
+  const v = r && r.result && r.result.value;
+  return v || { stop: true, len: -1 };
+}
+
+/** 等待对话真正结束：两阶段判定。
+ *  阶段一：等响应开始（停止按钮出现或 assistant 回复文本出现，最长 30s）——
+ *          发送到模型开始回复之间有空窗，旧逻辑在此空窗内连续判非生成态会误判「已结束」、提前切账号。
+ *  阶段二：停止按钮消失 且 assistant 文本长度连续 3 轮不变，才判定生成完成（流式输出中文本持续增长）。 */
+async function waitGenerationDone(timeoutMs) {
+  const start = Date.now();
+  await sleep(1500); // 发送后「停止」按钮/首字出现需要短暂时间
+  // 阶段一：等待响应开始
+  let seen = false;
+  while (Date.now() - start < 30000) {
+    const s = await readGenSignals().catch(() => null);
+    if (s && (s.stop || s.len > 0)) { seen = true; break; }
+    await sleep(800);
+  }
+  if (!seen) {
+    log('[growth-activate] 等待响应开始超时（30s 无停止按钮且无回复文本），按已结束处理');
+    return true;
+  }
+  // 阶段二：等生成结束（文本长度稳定 + 无停止按钮）
+  let lastLen = -1;
+  let stableRounds = 0;
+  while (Date.now() - start < timeoutMs) {
+    const s = await readGenSignals().catch(() => null);
+    if (!s || s.stop || s.len < 0) {
+      stableRounds = 0; // 查询失败或仍在生成
+    } else if (s.len !== lastLen) {
+      stableRounds = 0;
+      lastLen = s.len;
+    } else {
+      stableRounds++;
+      if (stableRounds >= 3) return true; // 约 4.5s 文本无变化且无停止按钮
+    }
+    await sleep(1500);
+  }
+  return false;
+}
+
+/** 一键活跃：依次处理未活跃账号（切换→新建会话→对话→校验→删会话），结束后恢复原账号 */
+async function runGrowthActivate(options = {}) {
+  if (!GROWTH_CN) return { skipped: true, reason: 'profile-not-cn' };
+  if (!PROFILE.capabilities.accounts) return { skipped: true, reason: 'profile-no-account-files' };
+  if (activateInFlight) return { skipped: true, reason: 'in-flight' };
+  const message = String((options && options.content) || '').trim() || '只输出你的名字';
+  const model = String((options && options.model) || '').trim() || 'Hy3';
+  activateInFlight = true;
+  const originalUid = String((currentAccount() || {}).uid || '').trim();
+  const list = listAccounts(DATA_DIR).map((a) => a.uid);
+  activateState = { running: true, total: list.length, done: 0, currentUid: null, startedAt: Date.now(), finishedAt: 0, results: [] };
+  const results = [];
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const uid = list[i];
+      activateState.currentUid = uid;
+      let result;
+      try {
+        result = await activateOneAccount(uid, message, model);
+      } catch (e) {
+        result = { uid, ok: false, reason: 'error', message: e.message };
+      }
+      results.push(result);
+      activateState.results = results.slice();
+      activateState.done = i + 1;
+      if (i < list.length - 1) await sleep(ACTIVATE_QUEUE_DELAY_MS);
+    }
+    // 恢复原账号：仅当当前实际登录账号已不是原账号时才切回，避免一键活跃把用户留在最后一个账号。
+    const curUid = String((currentAccount() || {}).uid || '').trim();
+    if (originalUid && curUid && curUid !== originalUid) {
+      try {
+        switchTo(DATA_DIR, originalUid, log);
+        await reloadWorkBuddyPageForSwitch();
+        await waitPageLoaded(8000);
+      } catch (e) {
+        log('[growth-activate] 恢复原账号失败: ' + e.message);
+      }
+    }
+    log('[growth-activate] 一键活跃完成 ' + results.length + ' 个账号');
+    return { total: results.length, results };
+  } finally {
+    activateState.running = false;
+    activateState.finishedAt = Date.now();
+    activateState.currentUid = null;
+    activateInFlight = false;
   }
 }
 
@@ -5841,6 +6330,7 @@ function handleApi(req, res) {
         return {};
       })
       .then((dbCheckins) => {
+        const travelCache = GROWTH_CN ? loadTravelCache() : {};
         const enriched = accounts.map((a) => {
           const c = dbCheckins[a.uid] || cache[a.uid];
           const checked = c && c.ok && (c.verified === true || classifyCheckinResult({ httpOk: true, code: c.code, message: c.message }).ok)
@@ -5848,6 +6338,7 @@ function handleApi(req, res) {
             : null;
           return Object.assign({}, a, {
             checkin: checkinDisplayValue(checked, today, checkinPending),
+            travel: GROWTH_CN ? travelDisplayValue(travelCache, a.uid, today) : null,
           });
         });
         return listDailyUsage(enriched, today)
@@ -5926,6 +6417,34 @@ function handleApi(req, res) {
         log(`[growth] 查询 ${uid} 今日活跃失败: ${e.message}`);
         return json(res, 500, { ok: false, error: e.message });
       }
+    });
+  }
+
+  // 派猫猫旅行状态（面板轮询用）：GET /api/growth/travel/status
+  if (req.method === 'GET' && p === '/api/growth/travel/status') {
+    return json(res, 200, { ok: true, travel: travelSnapshot() });
+  }
+
+  // 手动触发派猫猫旅行：POST /api/growth/travel/depart-all（多账号依次，报错跳过；每日缓存幂等）
+  if (req.method === 'POST' && p === '/api/growth/travel/depart-all') {
+    departTravelForAll().catch((e) => log('[travel] 手动派猫猫旅行失败: ' + e.message));
+    return json(res, 200, { ok: true, travel: travelSnapshot() });
+  }
+
+  // 一键活跃状态（面板轮询用）：GET /api/growth/activate/status
+  if (req.method === 'GET' && p === '/api/growth/activate/status') {
+    return json(res, 200, { ok: true, activate: activateSnapshot() });
+  }
+
+  // 一键活跃：POST /api/growth/activate { content?, model? }（异步执行，状态走 /api/growth/activate/status）
+  if (req.method === 'POST' && p === '/api/growth/activate') {
+    return readBody(req).then((body) => {
+      if (!GROWTH_CN) return json(res, 400, { ok: false, error: '当前客户端不支持成长计划' });
+      if (activateInFlight) return json(res, 409, { ok: false, error: '一键活跃正在执行中' });
+      const content = String((body && body.content) || '').trim();
+      const model = String((body && body.model) || '').trim();
+      runGrowthActivate({ content, model }).catch((e) => log('[growth-activate] 一键活跃失败: ' + e.message));
+      return json(res, 200, { ok: true, activate: activateSnapshot() });
     });
   }
 
@@ -7042,7 +7561,7 @@ function handleApi(req, res) {
         let reloaded = false;
         if (body.reload) {
           try {
-            await reloadWorkBuddyPage();
+            await reloadWorkBuddyPageForSwitch();
             reloaded = true;
             log('[switch] 已通过 CDP 刷新 WorkBuddy 窗口');
             // 切换后通过接口自动签到（带每日缓存，幂等）

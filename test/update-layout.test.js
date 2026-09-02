@@ -161,7 +161,7 @@ test('account switching refreshes WorkBuddy after replacing auth without restart
   const route = script.slice(routeStart, routeStart + 2600);
   const copy = route.indexOf('switchTo(DATA_DIR, uid, log)');
   assert.notEqual(copy, -1);
-  assert.match(route, /await reloadWorkBuddyPage\(\)/);
+  assert.match(route, /await reloadWorkBuddyPageForSwitch\(\)/);
   assert.doesNotMatch(route, /await quitWorkBuddy\(\)/);
   assert.doesNotMatch(route, /await relaunchWorkBuddy\(\)/);
   assert.match(lib, /function retireLogoutMarker/);
