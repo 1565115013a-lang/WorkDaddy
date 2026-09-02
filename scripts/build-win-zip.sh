@@ -73,8 +73,10 @@ if ! command -v "$GO_BIN" >/dev/null 2>&1 && [ ! -x "$GO_BIN" ]; then
 fi
 NATIVE_LAUNCHER="$NODE_CACHE/WorkDaddyLauncher.exe"
 echo "==> 编译原生 Windows 启动器"
+# go.exe 是 Windows 原生程序，不会解析 MSYS 的 /d/... 挂载路径，-o 必须用 winpath 转成 D:\...；
+# 否则产物会被写到 D:\d\code\... 之类的错误位置，后续 test -s 失败。
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 "$GO_BIN" build -trimpath \
-  -ldflags '-s -w -H=windowsgui' -o "$NATIVE_LAUNCHER" ./scripts/windows-native/main.go
+  -ldflags '-s -w -H=windowsgui' -o "$(winpath "$NATIVE_LAUNCHER")" ./scripts/windows-native/main.go
 test -s "$NATIVE_LAUNCHER"
 NODE_ARCHIVE_PATH="${WORKDADDY_NODE_ARCHIVE:-$NODE_CACHE/$NODE_ARCHIVE}"
 if [ ! -f "$NODE_ARCHIVE_PATH" ]; then
