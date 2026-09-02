@@ -689,6 +689,26 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     return '<span class="wbs-ck wbs-checkin-tag fail">' + esc(msg) + '</span>';
   }
 
+  // 今日活跃状态（成长中心热力墙 is_active）：在「今日已签到」右侧并列展示
+  function growthActiveHtml(a) {
+    if (PROFILE_ID === 'workbuddy-ai') return '';
+    var g = a && a.growthActive;
+    if (g === undefined) return ''; // 尚未查询，不占位
+    if (g === null) return '<span class="wbs-ck wbs-growth-tag pending" title="今日活跃查询失败">活跃?</span>';
+    if (g === true) return '<span class="wbs-ck wbs-growth-tag ok">已活跃</span>';
+    return '<span class="wbs-ck wbs-growth-tag pending">未活跃</span>';
+  }
+
+  // 派猫猫旅行状态：在「今日已签到」最右侧并列展示
+  function travelHtml(a) {
+    if (PROFILE_ID === 'workbuddy-ai') return '';
+    var t = a && a.travel;
+    if (!t) return '';
+    if (t.ok) return '<span class="wbs-ck wbs-travel-tag ok">已派猫</span>';
+    if (t.skip === 'no-buddy' || t.skip === 'no-location') return '<span class="wbs-ck wbs-travel-tag pending">无 Buddy</span>';
+    return '<span class="wbs-ck wbs-travel-tag fail" title="' + escAttr(t.message || '派送失败') + '">派送失败</span>';
+  }
+
   function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -3569,6 +3589,18 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<button class="wbs-acct-io" type="button" data-act="import" title="从加密导出文件导入账号备份">' + IMPORT_ICON + '<span>导入</span></button>' +
         '</div>' +
         '</div>' +
+        (PROFILE_ID === 'workbuddy-ai' ? '' :
+        '<div class="wbs-growth-row">' +
+        '<div class="wbs-growth-options" id="wbs-growth-options">' +
+        '<input class="wbs-growth-input" id="wbs-growth-content" type="text" placeholder="对话内容" value="只输出你的名字">' +
+        '<input class="wbs-growth-input" id="wbs-growth-model" type="text" placeholder="模型" value="Hy3">' +
+        '</div>' +
+        '<button class="wbs-growth-toggle" type="button" id="wbs-growth-toggle" title="展开/收起一键活跃设置" aria-expanded="false">' +
+        '<svg class="wbs-growth-toggle-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>' +
+        '</button>' +
+        '<button class="wbs-growth-btn" type="button" id="wbs-growth-activate" title="为未活跃账号依次新建会话并对话，完成后自动删除临时会话">一键活跃</button>' +
+        '</div>' +
+        '<div class="wbs-growth-status" id="wbs-growth-status"></div>') +
         '<div class="wbs-acct-list"></div>' +
         '<button class="wbs-logout-btn" type="button" data-act="logout">' + LOGOUT_SVG + '<span>登录新账号</span></button>' +
         '<input type="file" id="wbs-import-file" accept=".json,application/json" style="display:none">';
@@ -3578,6 +3610,41 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         root.querySelector('#wbs-import-file').click();
       });
       root.querySelector('#wbs-import-file').addEventListener('change', onImportFile);
+      // 一键活跃 + 派猫猫旅行状态（成长中心，仅国内版）
+      var growthActivateBtn = root.querySelector('#wbs-growth-activate');
+      var growthStatusEl = root.querySelector('#wbs-growth-status');
+      var growthContentInput = root.querySelector('#wbs-growth-content');
+      var growthModelInput = root.querySelector('#wbs-growth-model');
+      var growthPollId = null;
+      var growthToggleBtn = root.querySelector('#wbs-growth-toggle');
+      var growthOptionsEl = root.querySelector('#wbs-growth-options');
+      if (growthToggleBtn && growthOptionsEl) {
+        growthToggleBtn.addEventListener('click', function () {
+          var expanded = growthOptionsEl.classList.toggle('wbs-growth-options-open');
+          growthToggleBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        });
+      }
+      if (growthActivateBtn) {
+        growthActivateBtn.addEventListener('click', function () {
+          if (growthActivateBtn.disabled) return;
+          var content = (growthContentInput && growthContentInput.value) || '';
+          var model = (growthModelInput && growthModelInput.value) || '';
+          growthActivateBtn.disabled = true;
+          api('/api/growth/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: content, model: model }),
+          }).then(function (r) {
+            if (!r || !r.ok) { toast('一键活跃启动失败: ' + ((r && r.error) || '未知错误'), true, root); return; }
+            toast('一键活跃已开始', false, root);
+            watchGrowthJobs();
+          }).catch(function (e) {
+            toast('一键活跃失败: ' + (e.message || e), true, root);
+          }).finally(function () {
+            growthActivateBtn.disabled = false;
+          });
+        });
+      }
     }
 
     function closeSecureTransferModal(mask) {
@@ -8581,8 +8648,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 
     function checkinBadgeHtml(a) {
-      var tag = checkinHtml(a);
-      return tag ? '<span class="wbs-checkin-slot">' + tag + '</span>' : '';
+      var parts = [];
+      var ck = checkinHtml(a);
+      if (ck) parts.push(ck);
+      var ga = growthActiveHtml(a);
+      if (ga) parts.push(ga);
+      var tv = travelHtml(a);
+      if (tv) parts.push(tv);
+      return parts.length ? '<span class="wbs-checkin-slot">' + parts.join('') + '</span>' : '';
     }
 
     function creditBlockHtml(credits, segments, account) {
@@ -8834,6 +8907,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           render(data);
           watchCheckin(data.checkin);
           fetchCreditsForAccounts();
+          fetchGrowthActiveForAccounts();
+          watchGrowthJobs();
         })
         .catch(function (e) {
           var msg = '<div class="wbs-empty">无法连接本地服务: ' + esc(e.message || e) + '<br>请确认守护进程已运行</div>';
@@ -9034,6 +9109,99 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var hidden = isIdentityExpired(account);
       elCredit.classList.toggle('wbs-credit-hidden', hidden);
       elCredit.innerHTML = hidden ? '' : creditBlockHtml(credits, segments || [], account);
+    }
+
+    // ===== 今日活跃（成长中心热力墙）懒查询：按 300ms 节奏逐个发起，避免阻塞 =====
+    function fetchGrowthActiveForAccounts() {
+      if (!state.open || !state.accounts || !state.accounts.length) return;
+      state.accounts.forEach(function (a, idx) {
+        setBuildTimeout(function () {
+          api('/api/growth/today-active', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uid: a.uid }),
+          })
+            .then(function (r) {
+              var active = r && typeof r.is_active === 'boolean' ? r.is_active : null;
+              setGrowthActive(a.uid, active);
+            })
+            .catch(function () { setGrowthActive(a.uid, null); });
+        }, idx * 300);
+      });
+    }
+
+    function setGrowthActive(uid, active) {
+      for (var i = 0; i < state.accounts.length; i++) {
+        if (state.accounts[i].uid === uid) { state.accounts[i].growthActive = active; break; }
+      }
+      updateBadgesCell(uid);
+    }
+
+    function updateBadgesCell(uid) {
+      var cards = accountsPane.querySelectorAll('.wbs-card');
+      for (var i = 0; i < cards.length; i++) {
+        if (cards[i].getAttribute('data-uid') !== uid) continue;
+        var nameGroup = cards[i].querySelector('.wbs-name-group');
+        if (!nameGroup) return;
+        var slot = nameGroup.querySelector('.wbs-checkin-slot');
+        var account = null;
+        for (var j = 0; j < state.accounts.length; j++) {
+          if (state.accounts[j].uid === uid) { account = state.accounts[j]; break; }
+        }
+        var html = checkinBadgeHtml(account);
+        if (slot) { if (html) slot.outerHTML = html; else slot.remove(); }
+        else if (html) nameGroup.insertAdjacentHTML('beforeend', html);
+        return;
+      }
+    }
+
+    // ===== 一键活跃 + 派猫猫旅行 状态轮询与展示 =====
+    function renderGrowthStatus(activate, travel) {
+      if (!growthStatusEl) return;
+      var lines = [];
+      if (travel && travel.running) lines.push('派猫猫旅行中 ' + travel.done + '/' + travel.total);
+      if (activate && activate.running) lines.push('一键活跃中 ' + activate.done + '/' + activate.total);
+      growthStatusEl.textContent = lines.join(' · ');
+      growthStatusEl.style.display = lines.length ? '' : 'none';
+    }
+
+    function stopGrowthPolling() {
+      if (growthPollId !== null) {
+        clearTimeout(growthPollId);
+        growthPollId = null;
+      }
+    }
+
+    function watchGrowthJobs() {
+      if (!growthStatusEl) return;
+      stopGrowthPolling();
+      var sawRunning = false;
+      var fails = 0;
+      function poll() {
+        growthPollId = null;
+        if (!state.open) return;
+        Promise.all([api('/api/growth/activate/status'), api('/api/growth/travel/status')])
+          .then(function (rs) {
+            if (!state.open) return;
+            fails = 0;
+            var activate = rs[0] && rs[0].activate;
+            var travel = rs[1] && rs[1].travel;
+            renderGrowthStatus(activate, travel);
+            var running = (activate && activate.running) || (travel && travel.running);
+            if (running) {
+              sawRunning = true;
+              growthPollId = setBuildTimeout(poll, 1000);
+            } else if (sawRunning) {
+              // 刚结束：刷新一次账号卡片，回读最新活跃/旅行标签
+              refresh();
+            }
+          })
+          .catch(function () {
+            fails++;
+            if (state.open && fails <= 5) growthPollId = setBuildTimeout(poll, 1500);
+          });
+      }
+      growthPollId = setBuildTimeout(poll, 300);
     }
 
     // ===== 调试：暴露内部状态到 window.__wbsDiag（控制台可调） =====
@@ -9397,6 +9565,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-checkin-tag.ok{background:#edf9ef;border:1px solid #b9e8c0;color:#28753a;box-shadow:inset 0 0 0 1px rgba(255,255,255,.55)}',
     'html.cb-dark .wbs-checkin-tag.ok{background:rgba(19,24,33,.78);border-color:rgba(214,220,232,.24);color:#f3f5fa;box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}',
     '.wbs-checkin-tag.fail{background:rgba(239,68,68,.1);color:#dc2626}',
+    '.wbs-checkin-slot{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0}',
+    '.wbs-growth-tag{display:inline-flex;align-items:center;min-height:18px;padding:1px 7px;border-radius:999px;white-space:nowrap}',
+    '.wbs-growth-tag.pending{background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-growth-tag.ok{background:#edf9ef;border:1px solid #b9e8c0;color:#28753a;box-shadow:inset 0 0 0 1px rgba(255,255,255,.55)}',
+    'html.cb-dark .wbs-growth-tag.ok{background:rgba(19,24,33,.78);border-color:rgba(214,220,232,.24);color:#f3f5fa}',
+    '.wbs-travel-tag{display:inline-flex;align-items:center;min-height:18px;padding:1px 7px;border-radius:999px;white-space:nowrap}',
+    '.wbs-travel-tag.pending{background:var(--wb-bg-tertiary,#f0f0f0);color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-travel-tag.ok{background:#edf1fc;border:1px solid #c6d3f2;color:#33509e;box-shadow:inset 0 0 0 1px rgba(255,255,255,.55)}',
+    'html.cb-dark .wbs-travel-tag.ok{background:rgba(19,24,33,.78);border-color:rgba(214,220,232,.24);color:#dbe6ff}',
+    '.wbs-travel-tag.fail{background:rgba(239,68,68,.1);color:#dc2626}',
     '.wbs-ck.ok{color:var(--wb-color-text-primary,#1f1f1f)}',
     '.wbs-ck.pending{color:var(--wb-icon-tertiary,#999)}',
     '.wbs-ck.fail{color:#f53f3f}',
@@ -9870,6 +10048,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-acct-io:hover{background:var(--wb-bg-hover,#f0f0f0);border-color:var(--wb-border-default,#d5d5d5)}',
     '.wbs-acct-io svg{flex-shrink:0}',
     '.wbs-acct-io span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.wbs-growth-row{display:flex;align-items:center;gap:6px;padding:8px 14px 0;flex-shrink:0;justify-content:flex-end}',
+    '.wbs-growth-options{display:flex;flex:0 0 0;min-width:0;gap:6px;width:0;opacity:0;overflow:hidden;transition:flex-basis .18s ease,opacity .18s ease}',
+    '.wbs-growth-options.wbs-growth-options-open{flex:1 1 auto;width:auto;opacity:1}',
+    '.wbs-growth-toggle{flex-shrink:0;display:flex;align-items:center;justify-content:center;width:24px;height:26px;padding:0;border:1px solid var(--wb-border-subtle,#e6e6e6);border-radius:7px;background:var(--wb-bg-tertiary,#fafafa);color:var(--wb-icon-secondary,#666);cursor:pointer}',
+    '.wbs-growth-toggle:hover{color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-growth-toggle-icon{transition:transform .18s}',
+    '.wbs-growth-toggle[aria-expanded="true"] .wbs-growth-toggle-icon{transform:rotate(180deg)}',
+    '.wbs-growth-input{flex:1;min-width:0;height:26px;padding:0 8px;border:1px solid var(--wb-border-subtle,#e6e6e6);border-radius:7px;background:var(--wb-bg-tertiary,#fafafa);color:var(--wb-color-text-primary,#1f1f1f);font-size:11px;outline:none;font-family:inherit;line-height:1.2}',
+    '.wbs-growth-input:focus{border-color:var(--wb-accent-blue,#4f86ff)}',
+    '.wbs-growth-input::placeholder{color:var(--wb-icon-tertiary,#999)}',
+    '.wbs-growth-btn{flex-shrink:0;height:26px;padding:0 10px;border:none;border-radius:7px;background:var(--wb-button-primary-bg,#1f1f1f);color:var(--wb-button-primary-fg,#fff);font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:inherit;line-height:1}',
+    '.wbs-growth-btn:hover{filter:brightness(1.08)}',
+    '.wbs-growth-btn:disabled{opacity:.5;cursor:not-allowed}',
+    '.wbs-growth-status{display:none;padding:6px 14px 0;font-size:11px;color:var(--wb-icon-tertiary,#999)}',
     '.wbs-acct-list{flex:1;min-height:0;overflow-y:auto;padding-right:2px}',
     '.wbs-logout-btn{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;margin-top:10px;padding:10px 0;border:1px solid var(--wb-border-default,#e5e5e5);border-radius:12px;background:transparent;color:var(--wb-icon-secondary,#666);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit;flex-shrink:0}',
     '.wbs-logout-btn:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f);border-color:var(--wb-border-default,#d5d5d5)}',
